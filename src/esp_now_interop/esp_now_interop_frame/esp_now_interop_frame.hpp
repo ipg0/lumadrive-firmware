@@ -8,6 +8,8 @@ enum class esp_now_interop_frame_type {
   DISCOVER_REPLY = 0x02,
   SUBSCRIBE = 0x03,
   SUBSCRIBE_REPLY = 0x04,
+  HEARTBEAT = 0x05,
+  HEARTBEAT_REPLY = 0x06,
 };
 
 enum class esp_now_interop_subscribe_status {
@@ -167,6 +169,59 @@ public:
       esp_now_interop_subscribe_status status);
   virtual esp_now_interop_frame_type type() const override {
     return esp_now_interop_frame_type::SUBSCRIBE_REPLY;
+  }
+  virtual esp_err_t handle() const override;
+};
+
+template <>
+class esp_now_interop_frame<esp_now_interop_frame_type::HEARTBEAT>
+    : public esp_now_interop_frame_base {
+  friend class esp_now_interop_frame_base;
+
+private:
+  int64_t master_timestamp;
+  virtual void apply_payload(const uint8_t *payload,
+                             size_t payload_size) override;
+
+protected:
+  esp_now_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN], const bool is_send,
+                        const uint16_t id)
+      : esp_now_interop_frame_base(mac, is_send, id) {}
+  virtual serialized_frame_t *serialize_payload() const override;
+
+public:
+  esp_now_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN]);
+
+  virtual esp_now_interop_frame_type type() const override {
+    return esp_now_interop_frame_type::HEARTBEAT;
+  }
+  virtual esp_err_t handle() const override;
+};
+
+template <>
+class esp_now_interop_frame<esp_now_interop_frame_type::HEARTBEAT_REPLY>
+    : public esp_now_interop_frame_base {
+  friend class esp_now_interop_frame_base;
+
+private:
+  int64_t heartbeat_frame_id;
+  virtual void apply_payload(const uint8_t *payload,
+                             size_t payload_size) override;
+
+protected:
+  esp_now_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN], const bool is_send,
+                        const uint16_t id)
+      : esp_now_interop_frame_base(mac, is_send, id) {}
+  virtual serialized_frame_t *serialize_payload() const override;
+  esp_now_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN]);
+
+public:
+  esp_now_interop_frame(
+      const esp_now_interop_frame<esp_now_interop_frame_type::HEARTBEAT>
+          *heartbeat_frame);
+
+  virtual esp_now_interop_frame_type type() const override {
+    return esp_now_interop_frame_type::HEARTBEAT_REPLY;
   }
   virtual esp_err_t handle() const override;
 };

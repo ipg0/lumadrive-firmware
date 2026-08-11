@@ -225,7 +225,16 @@ void esp_now_interop::broadcast_heartbeat() {
   for (size_t i = 0; i < this->state.nodes_count; i++) {
     const auto &slave_node = this->state.nodes[i];
 
-    // TODO: send heartbeat frame to slave node
+    esp_now_interop_frame<esp_now_interop_frame_type::HEARTBEAT>
+        heartbeat_frame(slave_node.mac);
+    esp_err_t send_err = heartbeat_frame.send();
+    if (send_err != ESP_OK) {
+      ESP_LOGE("esp_now_interop",
+               "Failed to send heartbeat frame to slave node %u: %s", i,
+               esp_err_to_name(send_err));
+    }
+
+    // TODO: reply timeouts & track missing nodes
   }
 }
 
@@ -310,7 +319,7 @@ esp_now_interop::register_slave_node(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
     return ESP_ERR_NO_MEM;
   }
 
-  if (this->slave_node_exists_impl(mac)) {
+  if (this->find_slave_node_index(mac) != SIZE_MAX) {
     ESP_LOGW("esp_now_interop",
              "Attempted to register a slave node that already exists");
     return ESP_OK;
@@ -327,25 +336,63 @@ esp_now_interop::register_slave_node(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
   return ESP_OK;
 }
 
-bool esp_now_interop::slave_node_exists_impl(
+bool esp_now_interop::master_node_matches_impl(
     const uint8_t mac[ESP_NOW_ETH_ALEN]) {
-  if (!global_config::instance().is_master_node()) {
+  if (global_config::instance().is_master_node()) {
     ESP_LOGE("esp_now_interop",
-             "Cannot check for slave node existence on a non-master node");
+             "Cannot check for master node match on a master node");
     return false;
   }
 
-  for (size_t i = 0; i < this->state.nodes_count; i++) {
-    if (memcmp(this->state.nodes[i].mac, mac, ESP_NOW_ETH_ALEN) == 0) {
-      return true;
-    }
-  }
-  return false;
+  return memcmp(this->state.nodes[0].mac, mac, ESP_NOW_ETH_ALEN) == 0;
 }
 
 bool esp_now_interop::slave_node_exists(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
   std::lock_guard<std::mutex> lock(this->state_mutex);
-  return this->slave_node_exists_impl(mac);
+  return this->find_slave_node_index(mac) != SIZE_MAX;
+}
+
+size_t
+esp_now_interop::find_slave_node_index(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
+  if (!global_config::instance().is_master_node()) {
+    ESP_LOGE("esp_now_interop",
+             "Cannot check for slave node existence on a non-master node");
+    return SIZE_MAX;
+  }
+
+  for (size_t i = 0; i < this->state.nodes_count; i++) {
+    if (memcmp(this->state.nodes[i].mac, mac, ESP_NOW_ETH_ALEN) == 0) {
+      return i;
+    }
+  }
+  return SIZE_MAX; // not found
+}
+
+esp_err_t
+esp_now_interop::sync_slave_node(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
+  std::lock_guard<std::mutex> lock(this->state_mutex);
+  if (!global_config::instance().is_master_node()) {
+    ESP_LOGE("esp_now_interop", "Cannot sync slave node on a slave node");
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  size_t slave_node_index = this->find_slave_node_index(mac);
+
+  if (slave_node_index == SIZE_MAX) {
+    ESP_LOGE("esp_now_interop",
+             "Cannot sync slave node that is not registered as a slave node");
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  this->node_last_synced_at[slave_node_index] = esp_timer_get_time();
+  ESP_LOGI("esp_now_interop", "Synced slave node %02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return ESP_OK;
+}
+
+bool esp_now_interop::master_node_matches(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
+  std::lock_guard<std::mutex> lock(this->state_mutex);
+  return this->master_node_matches_impl(mac);
 }
 
 esp_err_t esp_now_interop::load_state() {
@@ -388,6 +435,10 @@ esp_err_t esp_now_interop::load_state() {
              global_config::instance().is_master_node() ? "master" : "slave",
              this->state.is_master_state ? "master" : "slave");
     return ESP_ERR_INVALID_STATE;
+  }
+
+  for (size_t i = 0; i < ESP_NOW_INTEROP_SLAVE_NODES_MAX; i++) {
+    this->node_last_synced_at[i] = 0;
   }
 
   return this->add_all_state_nodes_as_peers();
@@ -461,6 +512,10 @@ void esp_now_interop::init_state() {
   this->state.is_configured = false;
   this->state.is_master_state = global_config::instance().is_master_node();
   this->state.nodes_count = 0;
+
+  for (size_t i = 0; i < ESP_NOW_INTEROP_SLAVE_NODES_MAX; i++) {
+    this->node_last_synced_at[i] = 0;
+  }
 }
 
 esp_err_t esp_now_interop::add_all_state_nodes_as_peers() {

@@ -32,6 +32,8 @@ public:
   esp_err_t register_slave_node(const uint8_t[ESP_NOW_ETH_ALEN]);
   esp_err_t subscribe_to_master_node(const uint8_t[ESP_NOW_ETH_ALEN]);
   bool slave_node_exists(const uint8_t[ESP_NOW_ETH_ALEN]);
+  bool master_node_matches(const uint8_t[ESP_NOW_ETH_ALEN]);
+  esp_err_t sync_slave_node(const uint8_t[ESP_NOW_ETH_ALEN]);
 
 private:
   typedef struct __attribute__((packed)) {
@@ -49,6 +51,7 @@ private:
   std::mutex state_mutex;
   bool discovery_mode;
   esp_now_interop_state_t state;
+  int64_t node_last_synced_at[ESP_NOW_INTEROP_SLAVE_NODES_MAX];
 
   void broadcast_discover();
   void broadcast_heartbeat();
@@ -58,7 +61,8 @@ private:
   esp_err_t clear_saved_state();
   void init_state();
   esp_err_t add_all_state_nodes_as_peers();
-  bool slave_node_exists_impl(const uint8_t mac[ESP_NOW_ETH_ALEN]);
+  size_t find_slave_node_index(const uint8_t mac[ESP_NOW_ETH_ALEN]);
+  bool master_node_matches_impl(const uint8_t mac[ESP_NOW_ETH_ALEN]);
   esp_err_t start_discovery_impl();
   esp_err_t finish_discovery_impl();
   static void heartbeat_timer_cb(void *);

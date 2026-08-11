@@ -58,6 +58,12 @@ esp_now_interop_frame_base::instantiate_received_frame(
   case esp_now_interop_frame_type::SUBSCRIBE_REPLY:
     return new esp_now_interop_frame<
         esp_now_interop_frame_type::SUBSCRIBE_REPLY>(mac, false, frame_id);
+  case esp_now_interop_frame_type::HEARTBEAT:
+    return new esp_now_interop_frame<esp_now_interop_frame_type::HEARTBEAT>(
+        mac, false, frame_id);
+  case esp_now_interop_frame_type::HEARTBEAT_REPLY:
+    return new esp_now_interop_frame<
+        esp_now_interop_frame_type::HEARTBEAT_REPLY>(mac, false, frame_id);
   default:
     return nullptr;
   }
