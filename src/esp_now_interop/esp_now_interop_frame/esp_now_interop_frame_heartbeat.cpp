@@ -1,4 +1,5 @@
 #include "../../global_config/global_config.hpp"
+#include "../../master_clock_manager/master_clock_manager.hpp"
 #include "../esp_now_interop.hpp"
 #include "esp_now_interop_frame.hpp"
 #include <esp_log.h>
@@ -19,7 +20,7 @@ esp_now_interop_frame<esp_now_interop_frame_type::HEARTBEAT>::handle() const {
     return ESP_OK;
   }
 
-  // TODO: sync master clock or something
+  master_clock_manager::instance().synchronize(this->master_timestamp);
 
   const auto *heartbeat_reply_frame =
       new esp_now_interop_frame<esp_now_interop_frame_type::HEARTBEAT_REPLY>(
