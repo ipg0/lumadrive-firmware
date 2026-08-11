@@ -3,6 +3,7 @@
 #include "esp_now_interop_frame/esp_now_interop_frame.hpp"
 #include <esp_log.h>
 #include <esp_wifi.h>
+#include <nvs.h>
 
 void esp_now_interop::handle_esp_now_recv(
     const esp_now_recv_info_t *esp_now_info, const uint8_t *data,
@@ -50,25 +51,58 @@ esp_now_interop::esp_now_interop() {
       esp_now_register_recv_cb(&esp_now_interop::handle_esp_now_recv));
 
   // add broadcast MAC as peer by default
-  esp_now_peer_info_t broadcast_peer_info = {};
-  memset(&broadcast_peer_info, 0, sizeof(broadcast_peer_info));
-  broadcast_peer_info.channel = 6;
-  broadcast_peer_info.encrypt = false;
-  memcpy(broadcast_peer_info.peer_addr, "\xFF\xFF\xFF\xFF\xFF\xFF",
-         ESP_NOW_ETH_ALEN);
+  if (global_config::instance().is_master_node()) {
+    esp_now_peer_info_t broadcast_peer_info = {};
+    memset(&broadcast_peer_info, 0, sizeof(broadcast_peer_info));
+    broadcast_peer_info.channel = 6;
+    broadcast_peer_info.encrypt = false;
+    memcpy(broadcast_peer_info.peer_addr, "\xFF\xFF\xFF\xFF\xFF\xFF",
+           ESP_NOW_ETH_ALEN);
 
-  ESP_ERROR_CHECK(esp_now_add_peer(&broadcast_peer_info));
+    ESP_ERROR_CHECK(esp_now_add_peer(&broadcast_peer_info));
+  }
 
-  // defaults
-  this->state.nodes_count = 0;
-  this->state.is_configured = false;
-  this->state.is_master_state = global_config::instance().is_master_node();
+  gpio_config_t discovery_gpio_conf = {
+      .pin_bit_mask = (1ULL << CONFIG_DISCOVERY_GPIO),
+      .mode = GPIO_MODE_INPUT,
+      .pull_up_en = GPIO_PULLUP_ENABLE,
+      .pull_down_en = GPIO_PULLDOWN_DISABLE,
+      .intr_type = GPIO_INTR_DISABLE,
+  };
 
-  // TODO: get saved state from NVS, check if current master/slave state matches
-  // saved state, if not, reset
+  ESP_ERROR_CHECK(gpio_config(&discovery_gpio_conf));
 
-  if (!this->is_interop_configured()) {
+  bool force_discovery = gpio_get_level(CONFIG_DISCOVERY_GPIO) == 0;
+
+  if (force_discovery) {
+    ESP_LOGW("esp_now_interop",
+             "Discovery GPIO is LOW, forcing discovery mode on boot");
     this->start_discovery_impl();
+  } else {
+    esp_err_t load_state_err = this->load_state();
+
+    if (load_state_err != ESP_OK) {
+      ESP_LOGW("esp_now_interop", "Failed to load state from NVS: %s",
+               esp_err_to_name(load_state_err));
+      this->init_state();
+    }
+
+    if (!this->is_interop_configured()) {
+      this->start_discovery_impl();
+    } else {
+      ESP_LOGI("esp_now_interop", "Interop state loaded, is_configured: %s",
+               this->state.is_configured ? "true" : "false");
+      if (global_config::instance().is_master_node()) {
+        ESP_LOGI("esp_now_interop", "Master node, slave nodes count: %u",
+                 this->state.nodes_count);
+      } else {
+        ESP_LOGI("esp_now_interop",
+                 "Slave node, master node MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+                 this->state.nodes[0].mac[0], this->state.nodes[0].mac[1],
+                 this->state.nodes[0].mac[2], this->state.nodes[0].mac[3],
+                 this->state.nodes[0].mac[4], this->state.nodes[0].mac[5]);
+      }
+    }
   }
 
   if (global_config::instance().is_master_node()) {
@@ -82,18 +116,19 @@ esp_now_interop::esp_now_interop() {
     };
     esp_timer_handle_t heartbeat_timer;
     ESP_ERROR_CHECK(esp_timer_create(&heartbeat_timer_args, &heartbeat_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(heartbeat_timer, 1000000));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(
+        heartbeat_timer, ESP_NOW_INTEROP_HEARTBEAT_INTERVAL_US));
   }
 }
 
 void esp_now_interop::finish_discovery_timer_cb(void *arg) {
-  esp_now_interop::instance().finish_discovery_impl();
+  esp_now_interop::instance().finish_discovery();
 }
 
 esp_err_t esp_now_interop::start_discovery_impl() {
   this->discovery_mode = true;
 
-  // TODO: clear saved peers
+  this->clear_saved_state();
 
   if (global_config::instance().is_master_node()) {
     this->state.is_configured = false;
@@ -109,7 +144,8 @@ esp_err_t esp_now_interop::start_discovery_impl() {
     esp_timer_handle_t finish_discovery_timer;
     ESP_ERROR_CHECK(esp_timer_create(&finish_discovery_timer_args,
                                      &finish_discovery_timer));
-    ESP_ERROR_CHECK(esp_timer_start_once(finish_discovery_timer, 10000000));
+    ESP_ERROR_CHECK(esp_timer_start_once(
+        finish_discovery_timer, ESP_NOW_INTEROP_MASTER_DISCOVERY_TIMEOUT_US));
   } else {
     this->state.is_configured = false;
   }
@@ -119,6 +155,12 @@ esp_err_t esp_now_interop::start_discovery_impl() {
 
 esp_err_t esp_now_interop::start_discovery() {
   std::lock_guard<std::mutex> lock(this->state_mutex);
+
+  if (this->discovery_mode) {
+    ESP_LOGW("esp_now_interop",
+             "start_discovery called while already in discovery mode");
+    return ESP_OK;
+  }
   return this->start_discovery_impl();
 }
 
@@ -145,13 +187,24 @@ esp_err_t esp_now_interop::finish_discovery_impl() {
              this->state.nodes[0].mac[4], this->state.nodes[0].mac[5]);
   }
 
-  // TODO: save discovered peers/master to NVS
+  if (this->state.is_configured) {
+    ESP_LOGI("esp_now_interop", "Interop is configured, saving state to NVS");
+    this->save_state();
+  } else {
+    ESP_LOGW("esp_now_interop",
+             "Interop is not configured, not saving state in NVS, reboot!");
+  }
 
   return ESP_OK;
 }
 
 esp_err_t esp_now_interop::finish_discovery() {
   std::lock_guard<std::mutex> lock(this->state_mutex);
+  if (!this->discovery_mode) {
+    ESP_LOGW("esp_now_interop",
+             "finish_discovery called while not in discovery mode");
+    return ESP_OK;
+  }
   return this->finish_discovery_impl();
 }
 
@@ -266,9 +319,7 @@ esp_now_interop::register_slave_node(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
   // add slave as permanent peer
   add_peer_unless_exists(mac);
 
-  memcpy(
-      this->state.nodes[this->state.nodes_count].mac,
-      mac, ESP_NOW_ETH_ALEN);
+  memcpy(this->state.nodes[this->state.nodes_count].mac, mac, ESP_NOW_ETH_ALEN);
   this->state.nodes_count++;
   // at least one slave node is registered, mark interop as configured, but
   // keep discovery on
@@ -285,8 +336,7 @@ bool esp_now_interop::slave_node_exists_impl(
   }
 
   for (size_t i = 0; i < this->state.nodes_count; i++) {
-    if (memcmp(this->state.nodes[i].mac, mac, ESP_NOW_ETH_ALEN) ==
-        0) {
+    if (memcmp(this->state.nodes[i].mac, mac, ESP_NOW_ETH_ALEN) == 0) {
       return true;
     }
   }
@@ -296,4 +346,138 @@ bool esp_now_interop::slave_node_exists_impl(
 bool esp_now_interop::slave_node_exists(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
   std::lock_guard<std::mutex> lock(this->state_mutex);
   return this->slave_node_exists_impl(mac);
+}
+
+esp_err_t esp_now_interop::load_state() {
+  nvs_handle_t nvs_handle;
+  esp_err_t nvs_err = nvs_open("esp_now_interop", NVS_READONLY, &nvs_handle);
+  if (nvs_err != ESP_OK) {
+    ESP_LOGE("esp_now_interop", "Failed to open NVS namespace: %s",
+             esp_err_to_name(nvs_err));
+    return nvs_err;
+  }
+
+  size_t size = sizeof(this->state);
+  nvs_err = nvs_get_blob(nvs_handle, "state", &this->state, &size);
+  nvs_close(nvs_handle);
+
+  if (nvs_err != ESP_OK) {
+    ESP_LOGE("esp_now_interop", "Failed to read state from NVS: %s",
+             esp_err_to_name(nvs_err));
+    return nvs_err;
+  }
+
+  if (size != sizeof(this->state)) {
+    ESP_LOGE("esp_now_interop", "State size mismatch, expected %zu, got %zu",
+             sizeof(this->state), size);
+    return ESP_ERR_INVALID_SIZE;
+  }
+
+  if (this->state.magic != esp_now_interop::ESP_NOW_INTEROP_NVS_MAGIC) {
+    ESP_LOGE("esp_now_interop",
+             "State magic mismatch, expected 0x%08X, got "
+             "0x%08X",
+             esp_now_interop::ESP_NOW_INTEROP_NVS_MAGIC, this->state.magic);
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  if (this->state.is_master_state !=
+      global_config::instance().is_master_node()) {
+    ESP_LOGE("esp_now_interop",
+             "State master/slave mismatch, expected %s, got %s",
+             global_config::instance().is_master_node() ? "master" : "slave",
+             this->state.is_master_state ? "master" : "slave");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  return this->add_all_state_nodes_as_peers();
+}
+
+esp_err_t esp_now_interop::save_state() {
+  nvs_handle_t nvs_handle;
+  esp_err_t nvs_err = nvs_open("esp_now_interop", NVS_READWRITE, &nvs_handle);
+  if (nvs_err != ESP_OK) {
+    ESP_LOGE("esp_now_interop", "Failed to open NVS namespace: %s",
+             esp_err_to_name(nvs_err));
+    return nvs_err;
+  }
+
+  this->state.magic = esp_now_interop::ESP_NOW_INTEROP_NVS_MAGIC;
+
+  nvs_err =
+      nvs_set_blob(nvs_handle, "state", &this->state, sizeof(this->state));
+  if (nvs_err != ESP_OK) {
+    ESP_LOGE("esp_now_interop", "Failed to write state to NVS: %s",
+             esp_err_to_name(nvs_err));
+    nvs_close(nvs_handle);
+    return nvs_err;
+  }
+
+  nvs_err = nvs_commit(nvs_handle);
+  if (nvs_err != ESP_OK) {
+    ESP_LOGE("esp_now_interop", "Failed to commit state to NVS: %s",
+             esp_err_to_name(nvs_err));
+    nvs_close(nvs_handle);
+    return nvs_err;
+  }
+
+  nvs_close(nvs_handle);
+  return ESP_OK;
+}
+
+esp_err_t esp_now_interop::clear_saved_state() {
+  nvs_handle_t nvs_handle;
+  esp_err_t nvs_err = nvs_open("esp_now_interop", NVS_READWRITE, &nvs_handle);
+  if (nvs_err != ESP_OK) {
+    ESP_LOGE("esp_now_interop", "Failed to open NVS namespace: %s",
+             esp_err_to_name(nvs_err));
+    return nvs_err;
+  }
+
+  nvs_err = nvs_erase_key(nvs_handle, "state");
+  if (nvs_err != ESP_OK) {
+    ESP_LOGE("esp_now_interop", "Failed to erase state from NVS: %s",
+             esp_err_to_name(nvs_err));
+    nvs_close(nvs_handle);
+    return nvs_err;
+  }
+
+  nvs_err = nvs_commit(nvs_handle);
+  if (nvs_err != ESP_OK) {
+    ESP_LOGE("esp_now_interop", "Failed to commit erase state to NVS: %s",
+             esp_err_to_name(nvs_err));
+    nvs_close(nvs_handle);
+    return nvs_err;
+  }
+
+  nvs_close(nvs_handle);
+
+  init_state();
+  return ESP_OK;
+}
+
+void esp_now_interop::init_state() {
+  this->state.magic = esp_now_interop::ESP_NOW_INTEROP_NVS_MAGIC;
+  this->state.is_configured = false;
+  this->state.is_master_state = global_config::instance().is_master_node();
+  this->state.nodes_count = 0;
+}
+
+esp_err_t esp_now_interop::add_all_state_nodes_as_peers() {
+  if (!this->is_interop_configured()) {
+    ESP_LOGE("esp_now_interop",
+             "Cannot add all state nodes as peers, interop is not configured");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  if (global_config::instance().is_master_node()) {
+    for (size_t i = 0; i < this->state.nodes_count; i++) {
+      const auto &slave_node = this->state.nodes[i];
+      this->add_peer_unless_exists(slave_node.mac);
+    }
+  } else {
+    this->add_peer_unless_exists(this->state.nodes[0].mac);
+  }
+
+  return ESP_OK;
 }
