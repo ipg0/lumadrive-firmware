@@ -1,5 +1,5 @@
 #include "esp_now_interop_frame.hpp"
-#include "../esp_now_interop_utils.hpp"
+#include "../esp_now_interop.hpp"
 #include <cstring>
 #include <esp_log.h>
 #include <esp_now.h>
@@ -11,7 +11,7 @@ esp_now_interop_frame_base::serialize_payload() const {
   auto *frame = reinterpret_cast<serialized_frame_t *>(
       new uint8_t[sizeof(serialized_frame_t)]);
   frame->frame_id = this->frame_id;
-  frame->magic = esp_now_interop_utils::ESP_NOW_INTEROP_FRAME_MAGIC;
+  frame->magic = esp_now_interop::ESP_NOW_INTEROP_FRAME_MAGIC;
   frame->frame_type = static_cast<uint8_t>(this->type());
   frame->payload_size = 0;
   return frame;
@@ -44,7 +44,7 @@ esp_now_interop_frame_base::serialize() const {
 esp_now_interop_frame_base *
 esp_now_interop_frame_base::instantiate_received_frame(
     esp_now_interop_frame_type type, const uint16_t frame_id,
-    const uint8_t mac[6]) {
+    const uint8_t mac[ESP_NOW_ETH_ALEN]) {
   switch (type) {
   case esp_now_interop_frame_type::DISCOVER:
     return new esp_now_interop_frame<esp_now_interop_frame_type::DISCOVER>(
@@ -52,6 +52,12 @@ esp_now_interop_frame_base::instantiate_received_frame(
   case esp_now_interop_frame_type::DISCOVER_REPLY:
     return new esp_now_interop_frame<
         esp_now_interop_frame_type::DISCOVER_REPLY>(mac, false, frame_id);
+  case esp_now_interop_frame_type::SUBSCRIBE:
+    return new esp_now_interop_frame<esp_now_interop_frame_type::SUBSCRIBE>(
+        mac, false, frame_id);
+  case esp_now_interop_frame_type::SUBSCRIBE_REPLY:
+    return new esp_now_interop_frame<
+        esp_now_interop_frame_type::SUBSCRIBE_REPLY>(mac, false, frame_id);
   default:
     return nullptr;
   }
@@ -65,17 +71,28 @@ esp_err_t esp_now_interop_frame_base::send() const {
   ESP_LOGI("esp_now_interop", "Sending frame with frame_id: %u",
            this->frame_id);
   esp_now_interop_frame_base::frame_buffer_t *buffer = this->serialize();
+
+  bool peer_created = esp_now_is_peer_exist(this->mac);
+
+  esp_now_interop::instance().add_peer_unless_exists(this->mac);
+
   esp_err_t err =
       esp_now_send(this->mac, (const uint8_t *)buffer->data, buffer->len);
 
   delete[] buffer->data;
   delete buffer;
+
+  if (peer_created) {
+    // clean up if peer added for one time send
+    esp_now_interop::instance().remove_peer(this->mac);
+  }
+
   return err;
 }
 
 esp_now_interop_frame_base *
 esp_now_interop_frame_base::parse(const uint8_t *data, size_t size,
-                                  const uint8_t mac[6]) {
+                                  const uint8_t mac[ESP_NOW_ETH_ALEN]) {
   if (size < sizeof(serialized_frame_t)) {
     ESP_LOGV("esp_now_interop",
              "Received data is too small to be a valid frame");
@@ -85,7 +102,7 @@ esp_now_interop_frame_base::parse(const uint8_t *data, size_t size,
   auto *frame =
       reinterpret_cast<serialized_frame_t *>(const_cast<uint8_t *>(data));
 
-  if (frame->magic != esp_now_interop_utils::ESP_NOW_INTEROP_FRAME_MAGIC) {
+  if (frame->magic != esp_now_interop::ESP_NOW_INTEROP_FRAME_MAGIC) {
     ESP_LOGV("esp_now_interop", "Invalid magic number: 0x%08X, skipping frame",
              frame->magic);
     return nullptr;

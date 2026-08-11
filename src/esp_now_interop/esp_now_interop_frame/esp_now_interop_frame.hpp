@@ -1,10 +1,18 @@
 #include <cstdint>
-#include <esp_err.h>
 #include <cstring>
+#include <esp_err.h>
+#include <esp_now.h>
 
 enum class esp_now_interop_frame_type {
   DISCOVER = 0x01,
-  DISCOVER_REPLY = 0x02
+  DISCOVER_REPLY = 0x02,
+  SUBSCRIBE = 0x03,
+  SUBSCRIBE_REPLY = 0x04,
+};
+
+enum class esp_now_interop_subscribe_status {
+  OK = 0x00,
+  REJECT = 0x01,
 };
 
 class esp_now_interop_frame_base {
@@ -32,28 +40,29 @@ private:
   };
   static esp_now_interop_frame_base *
   instantiate_received_frame(esp_now_interop_frame_type,
-                             const uint16_t frame_id, const uint8_t mac[6]);
+                             const uint16_t frame_id,
+                             const uint8_t mac[ESP_NOW_ETH_ALEN]);
   frame_buffer_t *serialize() const;
 
 protected:
   virtual serialized_frame_t *serialize_payload() const;
-  esp_now_interop_frame_base(const uint8_t mac[6], bool is_send,
+  esp_now_interop_frame_base(const uint8_t mac[ESP_NOW_ETH_ALEN], bool is_send,
                              const uint16_t id)
       : frame_id(id), is_send(is_send) {
-    memcpy(this->mac, mac, 6);
+    memcpy(this->mac, mac, ESP_NOW_ETH_ALEN);
   };
 
 public:
-  uint8_t mac[6];
+  uint8_t mac[ESP_NOW_ETH_ALEN];
   const bool is_send;
-  esp_now_interop_frame_base(const uint8_t mac[6])
+  esp_now_interop_frame_base(const uint8_t mac[ESP_NOW_ETH_ALEN])
       : esp_now_interop_frame_base(mac, true, frame_id_seq++) {};
   virtual ~esp_now_interop_frame_base() = default;
   virtual esp_err_t handle() const = 0;
   esp_err_t send() const;
   virtual esp_now_interop_frame_type type() const = 0;
   static esp_now_interop_frame_base *parse(const uint8_t *, size_t,
-                                           const uint8_t mac[6]);
+                                           const uint8_t mac[ESP_NOW_ETH_ALEN]);
 };
 
 template <esp_now_interop_frame_type type> class esp_now_interop_frame;
@@ -64,10 +73,10 @@ class esp_now_interop_frame<esp_now_interop_frame_type::DISCOVER>
   friend class esp_now_interop_frame_base;
 
 protected:
-  esp_now_interop_frame(const uint8_t mac[6], const bool is_send,
+  esp_now_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN], const bool is_send,
                         const uint16_t id)
       : esp_now_interop_frame_base(mac, is_send, id) {}
-  esp_now_interop_frame(const uint8_t mac[6])
+  esp_now_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN])
       : esp_now_interop_frame_base(mac) {};
 
 public:
@@ -91,11 +100,11 @@ private:
                              size_t payload_size) override;
 
 protected:
-  esp_now_interop_frame(const uint8_t mac[6], const bool is_send,
+  esp_now_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN], const bool is_send,
                         const uint16_t id)
       : esp_now_interop_frame_base(mac, is_send, id) {}
   virtual serialized_frame_t *serialize_payload() const override;
-  esp_now_interop_frame(const uint8_t mac[6])
+  esp_now_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN])
       : esp_now_interop_frame_base(mac) {};
 
 public:
@@ -104,6 +113,60 @@ public:
           *discover_frame);
   virtual esp_now_interop_frame_type type() const override {
     return esp_now_interop_frame_type::DISCOVER_REPLY;
+  }
+  virtual esp_err_t handle() const override;
+};
+
+template <>
+class esp_now_interop_frame<esp_now_interop_frame_type::SUBSCRIBE>
+    : public esp_now_interop_frame_base {
+  friend class esp_now_interop_frame_base;
+
+protected:
+  esp_now_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN], const bool is_send,
+                        const uint16_t id)
+      : esp_now_interop_frame_base(mac, is_send, id) {};
+
+public:
+  esp_now_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN])
+      : esp_now_interop_frame_base(mac) {}
+  virtual esp_now_interop_frame_type type() const override {
+    return esp_now_interop_frame_type::SUBSCRIBE;
+  }
+  virtual esp_err_t handle() const override;
+};
+
+template <>
+class esp_now_interop_frame<esp_now_interop_frame_type::SUBSCRIBE_REPLY>
+    : public esp_now_interop_frame_base {
+  friend class esp_now_interop_frame_base;
+
+private:
+  uint16_t subscribe_frame_id;
+  esp_now_interop_subscribe_status subscribe_status;
+  virtual void apply_payload(const uint8_t *payload,
+                             size_t payload_size) override;
+
+protected:
+  esp_now_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN], const bool is_send,
+                        const uint16_t id)
+      : esp_now_interop_frame_base(mac, is_send, id) {}
+  virtual serialized_frame_t *serialize_payload() const override;
+  esp_now_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN])
+      : esp_now_interop_frame_base(mac) {};
+
+public:
+  typedef struct __attribute__((packed)) {
+    uint16_t subscribe_frame_id;
+    esp_now_interop_subscribe_status subscribe_status;
+  } subscribe_reply_payload_t;
+
+  esp_now_interop_frame(
+      const esp_now_interop_frame<esp_now_interop_frame_type::SUBSCRIBE>
+          *subscribe_frame,
+      esp_now_interop_subscribe_status status);
+  virtual esp_now_interop_frame_type type() const override {
+    return esp_now_interop_frame_type::SUBSCRIBE_REPLY;
   }
   virtual esp_err_t handle() const override;
 };

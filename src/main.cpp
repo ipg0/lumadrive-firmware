@@ -1,4 +1,5 @@
 #include "esp_now_interop/esp_now_interop.hpp"
+#include "global_config/global_config.hpp"
 #include <esp_event.h>
 #include <esp_log.h>
 #include <esp_netif.h>
@@ -18,11 +19,11 @@ void app_main() {
 
   ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-  esp_now_interop::init();
+  global_config::instance();
+  esp_now_interop::instance();
 
   for (;;) {
-    esp_now_interop::broadcast_discover();
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
 }

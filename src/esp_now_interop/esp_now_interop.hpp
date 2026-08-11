@@ -1,6 +1,58 @@
 #include <esp_now.h>
+#include <esp_timer.h>
+#include <mutex>
 
-namespace esp_now_interop {
-  void init();
+class esp_now_interop {
+
+public:
+  static constexpr uint32_t ESP_NOW_INTEROP_FRAME_MAGIC = 0xFAB17000;
+  static constexpr uint8_t ESP_NOW_CHANNEL = 6;
+  static constexpr uint8_t ESP_NOW_INTEROP_SLAVE_NODES_MAX = 16;
+
+  static esp_now_interop &instance() {
+    static esp_now_interop instance;
+    return instance;
+  }
+
+  esp_err_t start_discovery();
+  esp_err_t finish_discovery();
+  bool is_discovery_mode() {
+    std::lock_guard<std::mutex> lock(this->state_mutex);
+    return this->discovery_mode;
+  }
+  bool add_peer_unless_exists(const uint8_t[ESP_NOW_ETH_ALEN]);
+  void remove_peer(const uint8_t[ESP_NOW_ETH_ALEN]);
+  esp_err_t register_slave_node(const uint8_t[ESP_NOW_ETH_ALEN]);
+  esp_err_t subscribe_to_master_node(const uint8_t[ESP_NOW_ETH_ALEN]);
+  bool slave_node_exists(const uint8_t[ESP_NOW_ETH_ALEN]);
+
+private:
+  typedef struct __attribute__((packed)) {
+    uint8_t mac[ESP_NOW_ETH_ALEN];
+  } esp_now_interop_node_t;
+
+  typedef struct __attribute__((packed)) {
+    bool is_configured;
+    bool is_master_state;
+    uint8_t nodes_count;
+    esp_now_interop_node_t nodes[ESP_NOW_INTEROP_SLAVE_NODES_MAX];
+  } esp_now_interop_state_t;
+
+  std::mutex state_mutex;
+  bool discovery_mode;
+  esp_now_interop_state_t state;
+
   void broadcast_discover();
-} // namespace esp_now_interop
+  void broadcast_heartbeat();
+  bool is_interop_configured();
+  bool slave_node_exists_impl(const uint8_t mac[ESP_NOW_ETH_ALEN]);
+  esp_err_t start_discovery_impl();
+  esp_err_t finish_discovery_impl();
+  static void heartbeat_timer_cb(void *);
+  static void finish_discovery_timer_cb(void *);
+  static void handle_esp_now_recv(const esp_now_recv_info_t *, const uint8_t *,
+                                  int);
+
+  esp_now_interop();
+  ~esp_now_interop() = default;
+};
