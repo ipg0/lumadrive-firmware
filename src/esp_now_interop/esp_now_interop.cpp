@@ -32,7 +32,7 @@ void esp_now_interop::heartbeat_timer_cb(void *arg) {
   if (interop.is_discovery_mode()) {
     interop.broadcast_discover();
   } else {
-    interop.broadcast_heartbeat();
+    interop.send_heartbeats();
   }
 }
 
@@ -217,7 +217,7 @@ void esp_now_interop::broadcast_discover() {
   }
 }
 
-void esp_now_interop::broadcast_heartbeat() {
+void esp_now_interop::send_heartbeats() {
   // broadcast heartbeat frame to all peers
   if (!global_config::instance().is_master_node())
     return; // only master node should send heartbeat

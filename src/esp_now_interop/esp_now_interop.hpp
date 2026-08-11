@@ -54,7 +54,7 @@ private:
   int64_t node_last_synced_at[ESP_NOW_INTEROP_SLAVE_NODES_MAX];
 
   void broadcast_discover();
-  void broadcast_heartbeat();
+  void send_heartbeats();
   bool is_interop_configured();
   esp_err_t load_state();
   esp_err_t save_state();
