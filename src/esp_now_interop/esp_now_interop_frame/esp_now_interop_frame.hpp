@@ -1,3 +1,5 @@
+#pragma once
+
 #include <cstdint>
 #include <cstring>
 #include <esp_err.h>

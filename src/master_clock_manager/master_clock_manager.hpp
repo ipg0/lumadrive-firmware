@@ -1,3 +1,5 @@
+#pragma once
+
 #include "../esp_now_interop/esp_now_interop_frame/esp_now_interop_frame.hpp"
 #include <esp_timer.h>
 #include <mutex>

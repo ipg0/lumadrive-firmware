@@ -1,3 +1,4 @@
+#include "ble_interop/ble_interop.hpp"
 #include "esp_now_interop/esp_now_interop.hpp"
 #include "global_config/global_config.hpp"
 #include "master_clock_manager/master_clock_manager.hpp"
@@ -8,6 +9,7 @@ void app_main() {
   global_config::instance();
   master_clock_manager::instance();
   esp_now_interop::instance();
+  ble_interop::instance();
 
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(1000));
