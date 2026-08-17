@@ -10,6 +10,10 @@
 #include "services/gatt/ble_svc_gatt.h"
 #include <nvs.h>
 
+extern "C" {
+  void ble_store_config_init(void);
+}
+
 void ble_interop::nimble_host_task(void *param) {
   nimble_port_run();
   nimble_port_freertos_deinit();
@@ -18,13 +22,41 @@ void ble_interop::nimble_host_task(void *param) {
 int ble_interop::handle_ble_gap_event(struct ble_gap_event *event, void *arg) {
   std::lock_guard<std::mutex> lock(ble_interop::instance().state_mutex);
 
-  ESP_LOGI("ble_interop", "Received BLE GAP event of type %d", event->type);
   switch (event->type) {
   case BLE_GAP_EVENT_CONNECT:
+    ESP_LOGI("ble_interop", "Received BLE GAP event of type CONNECT");
     if (event->connect.status == 0) {
-      ESP_LOGI("ble_interop", "BLE connected, handle=%d",
+      // Only enforce bonding check during bonded advertising mode
+      if (ble_interop::instance().is_bonded_advertising_active) {
+        struct ble_gap_conn_desc desc;
+        int rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
+        if (rc == 0) {
+          // Check if this peer is in the bond store
+          struct ble_store_key_sec key_sec;
+          struct ble_store_value_sec value_sec;
+          memset(&key_sec, 0, sizeof(key_sec));
+          key_sec.peer_addr = desc.peer_id_addr;
+
+          rc = ble_store_read_peer_sec(&key_sec, &value_sec);
+
+          if (rc != 0) {
+            // Peer not bonded; reject connection
+            ESP_LOGW("ble_interop",
+                     "Connection from non-bonded peer rejected: "
+                     "%02x:%02x:%02x:%02x:%02x:%02x",
+                     desc.peer_id_addr.val[5], desc.peer_id_addr.val[4],
+                     desc.peer_id_addr.val[3], desc.peer_id_addr.val[2],
+                     desc.peer_id_addr.val[1], desc.peer_id_addr.val[0]);
+            ble_gap_terminate(event->connect.conn_handle, BLE_ERR_UNSPECIFIED);
+            return 0;
+          }
+        }
+      }
+
+      ESP_LOGI("ble_interop", "BLE connected (bonded), handle=%d",
                event->connect.conn_handle);
       ble_interop::instance().is_connected = true;
+      ble_gap_security_initiate(event->connect.conn_handle);
     } else {
       ESP_LOGW("ble_interop", "BLE connection failed, status=%d",
                event->connect.status);
@@ -34,20 +66,22 @@ int ble_interop::handle_ble_gap_event(struct ble_gap_event *event, void *arg) {
     return 0;
 
   case BLE_GAP_EVENT_DISCONNECT:
+    ESP_LOGI("ble_interop", "Received BLE GAP event of type DISCONNECT");
     ESP_LOGI("ble_interop", "BLE disconnected, reason=%d",
              event->disconnect.reason);
     ble_interop::instance().is_connected = false;
-    ble_interop::instance()
-        .start_advertising(); // resume advertising so phone can reconnect
+    ble_interop::instance().start_bonded_advertising();
     return 0;
 
   case BLE_GAP_EVENT_ENC_CHANGE:
+    ESP_LOGI("ble_interop", "Received BLE GAP event of type ENC_CHANGE");
     // fires after pairing/encryption completes (or fails)
     ESP_LOGI("ble_interop", "Encryption change, status=%d",
              event->enc_change.status);
     return 0;
 
   case BLE_GAP_EVENT_REPEAT_PAIRING: {
+    ESP_LOGI("ble_interop", "Received BLE GAP event of type REPEAT_PAIRING");
     // phone tried to re-pair; typically means it lost its bond info.
     // Delete our stale bond and allow re-pairing.
     struct ble_gap_conn_desc desc;
@@ -57,6 +91,7 @@ int ble_interop::handle_ble_gap_event(struct ble_gap_event *event, void *arg) {
   }
 
   case BLE_GAP_EVENT_SUBSCRIBE:
+    ESP_LOGI("ble_interop", "Received BLE GAP event of type SUBSCRIBE");
     ESP_LOGI("ble_interop", "Subscribe event: attr=%d notify=%d",
              event->subscribe.attr_handle, event->subscribe.cur_notify);
     return 0;
@@ -88,7 +123,21 @@ int ble_interop::handle_ble_gap_command_event(uint16_t conn_handle,
   return 0;
 }
 
-void ble_interop::advertising_timer_cb(void *arg) { ble_gap_adv_stop(); }
+void ble_interop::advertising_timer_cb(void *arg) {
+  ble_interop::instance().stop_advertising();
+  ble_interop::instance().start_bonded_advertising();
+}
+
+void ble_interop::stop_advertising() {
+  if (!ble_gap_adv_active()) {
+    return;
+  }
+
+  int rc = ble_gap_adv_stop();
+  if (rc != 0 && rc != BLE_HS_EALREADY) {
+    ESP_LOGW("ble_interop", "ble_gap_adv_stop failed: %d", rc);
+  }
+}
 
 ble_interop::ble_interop() {
   if (!global_config::instance().is_master_node()) {
@@ -99,6 +148,7 @@ ble_interop::ble_interop() {
   init_ble_device_name();
 
   ESP_ERROR_CHECK(nimble_port_init());
+  ble_store_config_init();
   ble_svc_gap_init();
   ble_svc_gatt_init();
   ble_gatts_count_cfg(this->gatt_service_defs);
@@ -116,7 +166,6 @@ ble_interop::ble_interop() {
   ESP_ERROR_CHECK(
       esp_timer_create(&advertising_timer_args, &this->advertising_timer));
 
-  ble_store_clear(); // TODO: for test consistency, remove later
   nimble_port_freertos_init(&ble_interop::nimble_host_task);
 }
 
@@ -180,20 +229,34 @@ void ble_interop::ble_on_reset(int reason) {
 
 void ble_interop::start_advertising() {
   struct ble_gap_adv_params adv_params;
-  struct ble_hs_adv_fields fields;
+  struct ble_hs_adv_fields adv_fields;
+  struct ble_hs_adv_fields scan_rsp_fields;
 
-  memset(&fields, 0, sizeof(fields));
-  fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-  fields.tx_pwr_lvl_is_present = 1;
-  fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
-  fields.name = (uint8_t *)this->ble_device_name;
-  fields.name_len = strlen(this->ble_device_name);
-  fields.name_is_complete = 1;
+  memset(&adv_fields, 0, sizeof(adv_fields));
+  adv_fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+  adv_fields.tx_pwr_lvl_is_present = 1;
+  adv_fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
+  adv_fields.uuids128 = (ble_uuid128_t *)&BLE_INTEROP_SERVICE_UUID;
+  adv_fields.num_uuids128 = 1;
+  adv_fields.uuids128_is_complete = 1;
 
-  int fields_rc = ble_gap_adv_set_fields(&fields);
+  int fields_rc = ble_gap_adv_set_fields(&adv_fields);
 
   if (fields_rc != 0) {
     ESP_LOGE("ble_interop", "ble_gap_adv_set_fields failed: %d", fields_rc);
+    return;
+  }
+
+  memset(&scan_rsp_fields, 0, sizeof(scan_rsp_fields));
+  scan_rsp_fields.name = (uint8_t *)this->ble_device_name;
+  scan_rsp_fields.name_len = strlen(this->ble_device_name);
+  scan_rsp_fields.name_is_complete = 1;
+
+  int scan_rsp_rc = ble_gap_adv_rsp_set_fields(&scan_rsp_fields);
+  if (scan_rsp_rc != 0) {
+    ESP_LOGE("ble_interop", "ble_gap_adv_rsp_set_fields failed: %d",
+             scan_rsp_rc);
+    return;
   }
 
   memset(&adv_params, 0, sizeof(adv_params));
@@ -203,7 +266,9 @@ void ble_interop::start_advertising() {
   ESP_LOGI("ble_interop", "Starting BLE advertising with name: %s",
            this->ble_device_name);
 
-  int adv_rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, nullptr, BLE_HS_FOREVER,
+  ble_interop::instance().is_bonded_advertising_active = false;
+
+  int adv_rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, nullptr, BLE_HS_FOREVER,
                                  &adv_params, ble_interop::handle_ble_gap_event,
                                  nullptr);
 
@@ -211,7 +276,89 @@ void ble_interop::start_advertising() {
     ESP_LOGE("ble_interop", "ble_gap_adv_start failed: %d", adv_rc);
   }
 
-  esp_timer_start_once(ble_interop::advertising_timer, 60000000); // 10 seconds
+  esp_timer_start_once(ble_interop::advertising_timer,
+                       ble_interop::ADVERTISING_TIMEOUT_US);
+}
+
+void ble_interop::start_bonded_advertising() {
+  ble_addr_t peer_addrs[MYNEWT_VAL(BLE_STORE_MAX_BONDS)];
+  int num_peers = 0;
+
+  if (this->is_connected) {
+    ESP_LOGI("ble_interop",
+             "Skipping bonded advertising start while a connection is active");
+    return;
+  }
+
+  this->stop_advertising();
+
+  int rc = ble_store_util_bonded_peers(peer_addrs, &num_peers,
+                                       MYNEWT_VAL(BLE_STORE_MAX_BONDS));
+
+  if (rc != 0 || num_peers == 0) {
+    ESP_LOGI("ble_interop", "No bonded peers, advertising stopped");
+    return;
+  }
+
+  ESP_LOGI("ble_interop", "Found %d bonded peers, advertising to them",
+           num_peers);
+
+  // Debug: log each peer address and its type
+  for (int i = 0; i < num_peers; i++) {
+    const char *addr_type_str = peer_addrs[i].type == BLE_ADDR_RANDOM ? "RANDOM"
+                                : peer_addrs[i].type == BLE_ADDR_PUBLIC
+                                    ? "PUBLIC"
+                                    : "UNKNOWN";
+    ESP_LOGI("ble_interop",
+             "Peer %d: addr_type=%s addr=%02x:%02x:%02x:%02x:%02x:%02x", i,
+             addr_type_str, peer_addrs[i].val[5], peer_addrs[i].val[4],
+             peer_addrs[i].val[3], peer_addrs[i].val[2], peer_addrs[i].val[1],
+             peer_addrs[i].val[0]);
+  }
+
+  rc = ble_gap_wl_set(peer_addrs, num_peers);
+  if (rc != 0) {
+    // If a controller procedure was still winding down, make one retry.
+    ESP_LOGW("ble_interop", "ble_gap_wl_set failed: %d; retrying once", rc);
+    this->stop_advertising();
+    rc = ble_gap_wl_set(peer_addrs, num_peers);
+    if (rc != 0) {
+      ESP_LOGE("ble_interop", "ble_gap_wl_set failed after retry: %d", rc);
+      return;
+    }
+  }
+
+  ESP_LOGI("ble_interop", "Whitelist successfully set with %d peers",
+           num_peers);
+
+  struct ble_hs_adv_fields adv_fields;
+  memset(&adv_fields, 0, sizeof(adv_fields));
+  // no DISC_GEN flag — not discoverable to new devices
+  adv_fields.flags = BLE_HS_ADV_F_BREDR_UNSUP;
+  adv_fields.tx_pwr_lvl_is_present = 1;
+  adv_fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
+  rc = ble_gap_adv_set_fields(&adv_fields);
+  if (rc != 0) {
+    ESP_LOGE("ble_interop", "ble_gap_adv_set_fields (bonded) failed: %d", rc);
+    return;
+  }
+
+  struct ble_gap_adv_params adv_params;
+  memset(&adv_params, 0, sizeof(adv_params));
+  adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
+  adv_params.disc_mode = BLE_GAP_DISC_MODE_NON;
+  adv_params.filter_policy =
+      BLE_HCI_ADV_FILT_NONE; // whitelist filter for connections only; scans
+                             // pass through
+
+  ble_interop::instance().is_bonded_advertising_active = true;
+
+  rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, nullptr, BLE_HS_FOREVER,
+                         &adv_params, ble_interop::handle_ble_gap_event,
+                         nullptr);
+  if (rc != 0) {
+    ESP_LOGE("ble_interop", "ble_gap_adv_start (bonded) failed: %d", rc);
+  }
 }
 
 bool ble_interop::load_or_generate_ble_address(ble_addr_t *out_addr) {

@@ -10,6 +10,8 @@ class ble_interop {
       "LUMAPROTO %02x-%02x-%02x";
   static constexpr size_t BLE_INTEROP_DEVICE_NAME_MAX_LENGTH = 32;
 
+  static constexpr uint64_t ADVERTISING_TIMEOUT_US = 30 * 1000000; // 30 seconds
+
   static constexpr ble_uuid128_t BLE_INTEROP_SERVICE_UUID =
       BLE_UUID128_INIT(0x14, 0x32, 0x94, 0x32, 0x42, 0xc1, 0x4b, 0x48, 0xad,
                        0xb1, 0xce, 0x73, 0x43, 0xc5, 0x60, 0x71);
@@ -26,6 +28,7 @@ private:
   std::mutex state_mutex;
   bool is_ready = false;
   bool is_connected = false;
+  bool is_bonded_advertising_active = false;
   char ble_device_name[BLE_INTEROP_DEVICE_NAME_MAX_LENGTH];
   esp_timer_handle_t advertising_timer;
 
@@ -46,6 +49,7 @@ private:
   void init_ble_device_name();
   void start_advertising();
   void stop_advertising();
+  void start_bonded_advertising();
   static bool load_or_generate_ble_address(ble_addr_t *out_addr);
 
   ble_interop();
@@ -64,7 +68,9 @@ private:
                   {
                       .uuid = &BLE_INTEROP_STATUS_CHARACTERISTIC_UUID.u,
                       .access_cb = ble_interop::handle_ble_gap_status_event,
-                      .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+                      .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY |
+                               BLE_GATT_CHR_F_READ_ENC |
+                               BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC,
                   },
                   {
                       .uuid = &BLE_INTEROP_COMMAND_CHARACTERISTIC_UUID.u,
