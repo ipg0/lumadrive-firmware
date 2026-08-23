@@ -1,5 +1,6 @@
 #include "ble_interop.hpp"
 #include "../global_config/global_config.hpp"
+#include "../mesh_interop/mesh_interop.hpp"
 #include "esp_mac.h"
 #include "host/ble_hs.h"
 #include "host/ble_uuid.h"
@@ -11,7 +12,7 @@
 #include <nvs.h>
 
 extern "C" {
-  void ble_store_config_init(void);
+void ble_store_config_init(void);
 }
 
 void ble_interop::nimble_host_task(void *param) {
@@ -56,6 +57,7 @@ int ble_interop::handle_ble_gap_event(struct ble_gap_event *event, void *arg) {
       ESP_LOGI("ble_interop", "BLE connected (bonded), handle=%d",
                event->connect.conn_handle);
       ble_interop::instance().is_connected = true;
+      ble_interop::instance().active_conn_handle = event->connect.conn_handle;
       ble_gap_security_initiate(event->connect.conn_handle);
     } else {
       ESP_LOGW("ble_interop", "BLE connection failed, status=%d",
@@ -70,6 +72,7 @@ int ble_interop::handle_ble_gap_event(struct ble_gap_event *event, void *arg) {
     ESP_LOGI("ble_interop", "BLE disconnected, reason=%d",
              event->disconnect.reason);
     ble_interop::instance().is_connected = false;
+    ble_interop::instance().active_conn_handle = BLE_HS_CONN_HANDLE_NONE;
     ble_interop::instance().start_bonded_advertising();
     return 0;
 
@@ -100,26 +103,6 @@ int ble_interop::handle_ble_gap_event(struct ble_gap_event *event, void *arg) {
     return 0;
   }
 
-  return 0;
-}
-
-int ble_interop::handle_ble_gap_status_event(uint16_t conn_handle,
-                                             uint16_t attr_handle,
-                                             struct ble_gatt_access_ctxt *ctxt,
-                                             void *arg) {
-  ESP_LOGI("ble_interop",
-           "Received BLE GAP status event for conn_handle=%d attr_handle=%d",
-           conn_handle, attr_handle);
-  return 0;
-}
-
-int ble_interop::handle_ble_gap_command_event(uint16_t conn_handle,
-                                              uint16_t attr_handle,
-                                              struct ble_gatt_access_ctxt *ctxt,
-                                              void *arg) {
-  ESP_LOGI("ble_interop",
-           "Received BLE GAP command event for conn_handle=%d attr_handle=%d",
-           conn_handle, attr_handle);
   return 0;
 }
 
@@ -155,6 +138,18 @@ ble_interop::ble_interop() {
   ble_gatts_add_svcs(this->gatt_service_defs);
 
   this->ble_hs_configure();
+  this->active_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+
+  static struct ble_npl_event g_mesh_status_event;
+
+  ble_npl_event_init(&g_mesh_status_event, &ble_interop::notify_mesh_status,
+                     NULL);
+
+  mesh_interop::instance().register_mesh_state_cb([]() {
+    if (!ble_npl_event_is_queued(&g_mesh_status_event)) {
+      ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &g_mesh_status_event);
+    }
+  });
 
   const esp_timer_create_args_t advertising_timer_args = {
       .callback = &ble_interop::advertising_timer_cb,
@@ -195,6 +190,8 @@ void ble_interop::ble_hs_configure() {
   ble_hs_cfg.reset_cb = ble_interop::ble_on_reset;
   ble_hs_cfg.store_status_cb =
       ble_store_util_status_rr; // default bond-storage handler
+
+  ble_att_set_preferred_mtu(512);
 }
 
 void ble_interop::ble_on_sync() {

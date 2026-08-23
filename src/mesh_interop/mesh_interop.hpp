@@ -6,20 +6,29 @@
 #include <mutex>
 #define CONFIG_DISCOVERY_GPIO GPIO_NUM_16
 
-class esp_now_interop {
+class mesh_interop {
 
 public:
-  static constexpr uint32_t ESP_NOW_INTEROP_FRAME_MAGIC = 0xFAB17000;
-  static constexpr uint32_t ESP_NOW_INTEROP_NVS_MAGIC =
-      ESP_NOW_INTEROP_FRAME_MAGIC;
+  static constexpr uint32_t mesh_interop_FRAME_MAGIC = 0xFAB17000;
+  static constexpr uint32_t mesh_interop_NVS_MAGIC = mesh_interop_FRAME_MAGIC;
   static constexpr uint8_t ESP_NOW_CHANNEL = 6;
-  static constexpr uint8_t ESP_NOW_INTEROP_SLAVE_NODES_MAX = 16;
-  static constexpr uint32_t ESP_NOW_INTEROP_HEARTBEAT_INTERVAL_US = 1000000;
-  static constexpr uint32_t ESP_NOW_INTEROP_MASTER_DISCOVERY_TIMEOUT_US =
-      20000000;
+  static constexpr uint8_t mesh_interop_SLAVE_NODES_MAX = 16;
+  static constexpr uint32_t mesh_interop_HEARTBEAT_INTERVAL_US = 1000000;
+  static constexpr uint32_t mesh_interop_MASTER_DISCOVERY_TIMEOUT_US = 20000000;
 
-  static esp_now_interop &instance() {
-    static esp_now_interop instance;
+  typedef struct {
+    uint8_t mac[ESP_NOW_ETH_ALEN];
+    uint64_t last_synced_at;
+  } mesh_interop_node_result_t;
+
+  typedef struct {
+    bool is_discovery_mode;
+    uint8_t nodes_count;
+    mesh_interop_node_result_t nodes[mesh_interop_SLAVE_NODES_MAX];
+  } mesh_interop_state_result_t;
+
+  static mesh_interop &instance() {
+    static mesh_interop instance;
     return instance;
   }
 
@@ -36,24 +45,27 @@ public:
   bool slave_node_exists(const uint8_t[ESP_NOW_ETH_ALEN]);
   bool master_node_matches(const uint8_t[ESP_NOW_ETH_ALEN]);
   esp_err_t sync_slave_node(const uint8_t[ESP_NOW_ETH_ALEN]);
+  mesh_interop_state_result_t get_state();
+  void register_mesh_state_cb(void (*cb)());
 
 private:
   typedef struct __attribute__((packed)) {
     uint8_t mac[ESP_NOW_ETH_ALEN];
-  } esp_now_interop_node_t;
+  } mesh_interop_node_t;
 
   typedef struct __attribute__((packed)) {
     uint32_t magic;
     bool is_configured;
     bool is_master_state;
     uint8_t nodes_count;
-    esp_now_interop_node_t nodes[ESP_NOW_INTEROP_SLAVE_NODES_MAX];
-  } esp_now_interop_state_t;
+    mesh_interop_node_t nodes[mesh_interop_SLAVE_NODES_MAX];
+  } mesh_interop_state_t;
 
   std::mutex state_mutex;
   bool discovery_mode;
-  esp_now_interop_state_t state;
-  int64_t node_last_synced_at[ESP_NOW_INTEROP_SLAVE_NODES_MAX];
+  mesh_interop_state_t state;
+  int64_t node_last_synced_at[mesh_interop_SLAVE_NODES_MAX];
+  void (*mesh_state_cb)();
 
   void broadcast_discover();
   void send_heartbeats();
@@ -71,7 +83,8 @@ private:
   static void finish_discovery_timer_cb(void *);
   static void handle_esp_now_recv(const esp_now_recv_info_t *, const uint8_t *,
                                   int);
+  void notify_mesh_state_cb();
 
-  esp_now_interop();
-  ~esp_now_interop() = default;
+  mesh_interop();
+  ~mesh_interop() = default;
 };

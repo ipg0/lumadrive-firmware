@@ -16,13 +16,9 @@ class ble_interop {
       BLE_UUID128_INIT(0x14, 0x32, 0x94, 0x32, 0x42, 0xc1, 0x4b, 0x48, 0xad,
                        0xb1, 0xce, 0x73, 0x43, 0xc5, 0x60, 0x71);
 
-  static constexpr ble_uuid128_t BLE_INTEROP_STATUS_CHARACTERISTIC_UUID =
+  static constexpr ble_uuid128_t BLE_INTEROP_MESH_STATUS_CHARACTERISTIC_UUID =
       BLE_UUID128_INIT(0x39, 0x15, 0x9d, 0x2c, 0x61, 0x5c, 0x41, 0xdc, 0x85,
                        0xbf, 0xd2, 0x57, 0x2d, 0x8b, 0x4b, 0x29);
-
-  static constexpr ble_uuid128_t BLE_INTEROP_COMMAND_CHARACTERISTIC_UUID =
-      BLE_UUID128_INIT(0xa1, 0xf9, 0x23, 0x70, 0xeb, 0x73, 0x44, 0xbe, 0x8d,
-                       0xbe, 0xad, 0xae, 0x8b, 0x12, 0xc9, 0xd8);
 
 private:
   std::mutex state_mutex;
@@ -31,17 +27,10 @@ private:
   bool is_bonded_advertising_active = false;
   char ble_device_name[BLE_INTEROP_DEVICE_NAME_MAX_LENGTH];
   esp_timer_handle_t advertising_timer;
+  uint16_t active_conn_handle;
 
   static void advertising_timer_cb(void *arg);
   static int handle_ble_gap_event(struct ble_gap_event *event, void *arg);
-  static int handle_ble_gap_status_event(uint16_t conn_handle,
-                                         uint16_t attr_handle,
-                                         struct ble_gatt_access_ctxt *ctxt,
-                                         void *arg);
-  static int handle_ble_gap_command_event(uint16_t conn_handle,
-                                          uint16_t attr_handle,
-                                          struct ble_gatt_access_ctxt *ctxt,
-                                          void *arg);
   static void ble_on_sync(void);
   static void ble_on_reset(int reason);
   static void nimble_host_task(void *param);
@@ -55,6 +44,12 @@ private:
   ble_interop();
   ~ble_interop() = default;
 
+  // handlers
+  static int
+  handle_ble_gap_mesh_status_access(uint16_t conn_handle, uint16_t attr_handle,
+                                    struct ble_gatt_access_ctxt *ctxt,
+                                    void *arg);
+
 // unneeded initializers in gatt_service_defs
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
@@ -66,16 +61,12 @@ private:
           .characteristics =
               (struct ble_gatt_chr_def[]){
                   {
-                      .uuid = &BLE_INTEROP_STATUS_CHARACTERISTIC_UUID.u,
-                      .access_cb = ble_interop::handle_ble_gap_status_event,
+                      .uuid = &BLE_INTEROP_MESH_STATUS_CHARACTERISTIC_UUID.u,
+                      .access_cb =
+                          ble_interop::handle_ble_gap_mesh_status_access,
                       .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY |
                                BLE_GATT_CHR_F_READ_ENC |
                                BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC,
-                  },
-                  {
-                      .uuid = &BLE_INTEROP_COMMAND_CHARACTERISTIC_UUID.u,
-                      .access_cb = ble_interop::handle_ble_gap_command_event,
-                      .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC,
                   },
                   {0}, // end of characteristics
               },
@@ -90,4 +81,6 @@ public:
     static ble_interop instance;
     return instance;
   }
+
+  static void notify_mesh_status(struct ble_npl_event *ev);
 };

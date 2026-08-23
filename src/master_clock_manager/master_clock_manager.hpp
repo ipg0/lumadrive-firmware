@@ -1,11 +1,11 @@
 #pragma once
 
-#include "../esp_now_interop/esp_now_interop_frame/esp_now_interop_frame.hpp"
+#include "../mesh_interop/mesh_interop_frame/mesh_interop_frame.hpp"
 #include <esp_timer.h>
 #include <mutex>
 
 class master_clock_manager {
-  friend class esp_now_interop_frame<esp_now_interop_frame_type::HEARTBEAT>;
+  friend class mesh_interop_frame<mesh_interop_frame_type::HEARTBEAT>;
 
 public:
   static master_clock_manager &instance() {
