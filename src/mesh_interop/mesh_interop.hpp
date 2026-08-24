@@ -35,8 +35,8 @@ public:
   esp_err_t start_discovery();
   esp_err_t finish_discovery();
   bool is_discovery_mode() {
-    std::lock_guard<std::mutex> lock(this->state_mutex);
-    return this->discovery_mode;
+    std::lock_guard<std::mutex> lock(this->_state_mutex);
+    return this->_discovery_mode;
   }
   bool add_peer_unless_exists(const uint8_t[ESP_NOW_ETH_ALEN]);
   void remove_peer(const uint8_t[ESP_NOW_ETH_ALEN]);
@@ -61,11 +61,12 @@ private:
     mesh_interop_node_t nodes[mesh_interop_SLAVE_NODES_MAX];
   } mesh_interop_state_t;
 
-  std::mutex state_mutex;
-  bool discovery_mode;
-  mesh_interop_state_t state;
-  int64_t node_last_synced_at[mesh_interop_SLAVE_NODES_MAX];
-  void (*mesh_state_cb)();
+  static constexpr const char *TAG = "mesh_interop";
+  std::mutex _state_mutex;
+  bool _discovery_mode;
+  mesh_interop_state_t _state;
+  int64_t _node_last_synced_at[mesh_interop_SLAVE_NODES_MAX];
+  void (*_mesh_state_cb)();
 
   void broadcast_discover();
   void send_heartbeats();

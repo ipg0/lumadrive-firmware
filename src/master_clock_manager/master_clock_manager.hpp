@@ -20,10 +20,11 @@ protected:
   void synchronize(int64_t);
 
 private:
-  std::mutex clock_mutex;
-  int64_t master_clock_offset_us;
-  int64_t last_sync_absolute_time_us;
-  bool synchronized;
+  static constexpr const char *TAG = "master_clock_manager";
+  std::mutex _clock_mutex;
+  int64_t _master_clock_offset_us;
+  int64_t _last_sync_absolute_time_us;
+  bool _synchronized;
 
-  master_clock_manager() : master_clock_offset_us(0), synchronized(false) {};
+  master_clock_manager() : _master_clock_offset_us(0), _synchronized(false) {};
 };

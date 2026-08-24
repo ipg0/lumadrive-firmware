@@ -2,6 +2,7 @@
 
 #include <esp_err.h>
 #include <mutex>
+#include "esp_mac.h"
 #define CONFIG_ROLE_GPIO GPIO_NUM_4
 
 class global_config {
@@ -11,12 +12,18 @@ public:
     return instance;
   }
   inline bool is_master_node() {
-    return this->master_node;
+    return this->_master_node;
+  }
+  uint8_t *get_mesh_mac() {
+    static uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    return mac;
   }
 
 private:
-  std::mutex state_mutex;
-  bool master_node;
+  static constexpr const char *TAG = "global_config";
+  std::mutex _state_mutex;
+  bool _master_node;
   global_config();
   ~global_config() = default;
 };

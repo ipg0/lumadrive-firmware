@@ -1,10 +1,16 @@
 #include "mesh_interop_frame.hpp"
 #include "../mesh_interop.hpp"
+#include "./impl/mesh_interop_frame_discover.hpp"
+#include "./impl/mesh_interop_frame_discover_reply.hpp"
+#include "./impl/mesh_interop_frame_subscribe.hpp"
+#include "./impl/mesh_interop_frame_subscribe_reply.hpp"
+#include "./impl/mesh_interop_frame_heartbeat.hpp"
+#include "./impl/mesh_interop_frame_heartbeat_reply.hpp"
 #include <cstring>
 #include <esp_log.h>
 #include <esp_now.h>
 
-uint16_t mesh_interop_frame_base::frame_id_seq = 0;
+uint16_t mesh_interop_frame_base::_frame_id_seq = 0;
 
 mesh_interop_frame_base::serialized_frame_t *
 mesh_interop_frame_base::serialize_payload() const {

@@ -18,9 +18,9 @@ global_config::global_config() {
 
   int level = gpio_get_level(CONFIG_ROLE_GPIO);
 
-  this->master_node = (level == 0);
+  this->_master_node = (level == 0);
 
-  if (this->master_node) {
+  if (this->_master_node) {
     ESP_LOGI("global_config", "Booting as MASTER");
   } else {
     ESP_LOGI("global_config", "Booting as SLAVE");

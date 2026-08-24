@@ -38,7 +38,7 @@ public:
   const uint16_t frame_id;
 
 private:
-  static uint16_t frame_id_seq;
+  static uint16_t _frame_id_seq;
   virtual void apply_payload(const uint8_t *, size_t) {
     // no meaningful payload by default
   };
@@ -60,7 +60,7 @@ public:
   uint8_t mac[ESP_NOW_ETH_ALEN];
   const bool is_send;
   mesh_interop_frame_base(const uint8_t mac[ESP_NOW_ETH_ALEN])
-      : mesh_interop_frame_base(mac, true, frame_id_seq++) {};
+      : mesh_interop_frame_base(mac, true, _frame_id_seq++) {};
   virtual ~mesh_interop_frame_base() = default;
   virtual esp_err_t handle() const = 0;
   esp_err_t send() const;
@@ -70,160 +70,3 @@ public:
 };
 
 template <mesh_interop_frame_type type> class mesh_interop_frame;
-
-template <>
-class mesh_interop_frame<mesh_interop_frame_type::DISCOVER>
-    : public mesh_interop_frame_base {
-  friend class mesh_interop_frame_base;
-
-protected:
-  mesh_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN], const bool is_send,
-                        const uint16_t id)
-      : mesh_interop_frame_base(mac, is_send, id) {}
-  mesh_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN])
-      : mesh_interop_frame_base(mac) {};
-
-public:
-  mesh_interop_frame()
-      : mesh_interop_frame(
-            reinterpret_cast<const uint8_t *>("\xFF\xFF\xFF\xFF\xFF\xFF")) {};
-  virtual mesh_interop_frame_type type() const override {
-    return mesh_interop_frame_type::DISCOVER;
-  }
-  virtual esp_err_t handle() const override;
-};
-
-template <>
-class mesh_interop_frame<mesh_interop_frame_type::DISCOVER_REPLY>
-    : public mesh_interop_frame_base {
-  friend class mesh_interop_frame_base;
-
-private:
-  uint16_t discover_frame_id;
-  virtual void apply_payload(const uint8_t *payload,
-                             size_t payload_size) override;
-
-protected:
-  mesh_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN], const bool is_send,
-                        const uint16_t id)
-      : mesh_interop_frame_base(mac, is_send, id) {}
-  virtual serialized_frame_t *serialize_payload() const override;
-  mesh_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN])
-      : mesh_interop_frame_base(mac) {};
-
-public:
-  mesh_interop_frame(
-      const mesh_interop_frame<mesh_interop_frame_type::DISCOVER>
-          *discover_frame);
-  virtual mesh_interop_frame_type type() const override {
-    return mesh_interop_frame_type::DISCOVER_REPLY;
-  }
-  virtual esp_err_t handle() const override;
-};
-
-template <>
-class mesh_interop_frame<mesh_interop_frame_type::SUBSCRIBE>
-    : public mesh_interop_frame_base {
-  friend class mesh_interop_frame_base;
-
-protected:
-  mesh_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN], const bool is_send,
-                        const uint16_t id)
-      : mesh_interop_frame_base(mac, is_send, id) {};
-
-public:
-  mesh_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN])
-      : mesh_interop_frame_base(mac) {}
-  virtual mesh_interop_frame_type type() const override {
-    return mesh_interop_frame_type::SUBSCRIBE;
-  }
-  virtual esp_err_t handle() const override;
-};
-
-template <>
-class mesh_interop_frame<mesh_interop_frame_type::SUBSCRIBE_REPLY>
-    : public mesh_interop_frame_base {
-  friend class mesh_interop_frame_base;
-
-private:
-  uint16_t subscribe_frame_id;
-  mesh_interop_subscribe_status subscribe_status;
-  virtual void apply_payload(const uint8_t *payload,
-                             size_t payload_size) override;
-
-protected:
-  mesh_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN], const bool is_send,
-                        const uint16_t id)
-      : mesh_interop_frame_base(mac, is_send, id) {}
-  virtual serialized_frame_t *serialize_payload() const override;
-  mesh_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN])
-      : mesh_interop_frame_base(mac) {};
-
-public:
-  typedef struct __attribute__((packed)) {
-    uint16_t subscribe_frame_id;
-    mesh_interop_subscribe_status subscribe_status;
-  } subscribe_reply_payload_t;
-
-  mesh_interop_frame(
-      const mesh_interop_frame<mesh_interop_frame_type::SUBSCRIBE>
-          *subscribe_frame,
-      mesh_interop_subscribe_status status);
-  virtual mesh_interop_frame_type type() const override {
-    return mesh_interop_frame_type::SUBSCRIBE_REPLY;
-  }
-  virtual esp_err_t handle() const override;
-};
-
-template <>
-class mesh_interop_frame<mesh_interop_frame_type::HEARTBEAT>
-    : public mesh_interop_frame_base {
-  friend class mesh_interop_frame_base;
-
-private:
-  int64_t master_timestamp;
-  virtual void apply_payload(const uint8_t *payload,
-                             size_t payload_size) override;
-
-protected:
-  mesh_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN], const bool is_send,
-                        const uint16_t id)
-      : mesh_interop_frame_base(mac, is_send, id) {}
-  virtual serialized_frame_t *serialize_payload() const override;
-
-public:
-  mesh_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN]);
-
-  virtual mesh_interop_frame_type type() const override {
-    return mesh_interop_frame_type::HEARTBEAT;
-  }
-  virtual esp_err_t handle() const override;
-};
-
-template <>
-class mesh_interop_frame<mesh_interop_frame_type::HEARTBEAT_REPLY>
-    : public mesh_interop_frame_base {
-  friend class mesh_interop_frame_base;
-
-private:
-  int64_t heartbeat_frame_id;
-  virtual void apply_payload(const uint8_t *payload,
-                             size_t payload_size) override;
-
-protected:
-  mesh_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN], const bool is_send,
-                        const uint16_t id)
-      : mesh_interop_frame_base(mac, is_send, id) {}
-  virtual serialized_frame_t *serialize_payload() const override;
-  mesh_interop_frame(const uint8_t mac[ESP_NOW_ETH_ALEN]);
-
-public:
-  mesh_interop_frame(
-      const mesh_interop_frame<mesh_interop_frame_type::HEARTBEAT>
-          *heartbeat_frame);
-
-  virtual mesh_interop_frame_type type() const override {
-    return mesh_interop_frame_type::HEARTBEAT_REPLY;
-  }
-  virtual esp_err_t handle() const override;
-};

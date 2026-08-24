@@ -1,7 +1,7 @@
-#include "../../generated/mesh.pb.h"
 #include "../../master_clock_manager/master_clock_manager.hpp"
 #include "../../mesh_interop/mesh_interop.hpp"
 #include "../ble_interop.hpp"
+#include <mesh.pb.h>
 #include <pb_encode.h>
 
 namespace {
@@ -23,7 +23,7 @@ esp_err_t write_mesh_interop_dto(pb_ostream_t *stream) {
   }
 
   if (!pb_encode(stream, mesh_interop_MeshInteropState_fields, &mesh_state)) {
-    ESP_LOGE("ble_interop", "Failed to encode mesh state: %s",
+    ESP_LOGE("ble_interop", "Failed to encode mesh _state: %s",
              PB_GET_ERROR(stream));
     return ESP_FAIL;
   }
@@ -50,7 +50,7 @@ int ble_interop::handle_ble_gap_mesh_status_access(
       return BLE_ATT_ERR_INSUFFICIENT_RES;
     }
 
-    ESP_LOGI("ble_interop", "Encoded mesh state with size %zu bytes",
+    ESP_LOGI("ble_interop", "Encoded mesh _state with size %zu bytes",
              stream.bytes_written);
 
     if (os_mbuf_append(ctxt->om, buffer, stream.bytes_written) != 0) {
@@ -70,7 +70,7 @@ int ble_interop::handle_ble_gap_mesh_status_access(
 }
 
 void ble_interop::notify_mesh_status(struct ble_npl_event *ev) {
-  if (!ble_interop::instance().is_connected) {
+  if (!ble_interop::instance()._is_connected) {
     ESP_LOGW("ble_interop",
              "Cannot notify mesh status, no active BLE connection");
     return;
@@ -82,7 +82,7 @@ void ble_interop::notify_mesh_status(struct ble_npl_event *ev) {
   pb_ostream_t stream = pb_ostream_from_buffer(buffer, sizeof(buffer));
 
   if (write_mesh_interop_dto(&stream) != ESP_OK) {
-    ESP_LOGE("ble_interop", "Failed to encode mesh state for notification");
+    ESP_LOGE("ble_interop", "Failed to encode mesh _state for notification");
     return;
   }
 
@@ -93,7 +93,7 @@ void ble_interop::notify_mesh_status(struct ble_npl_event *ev) {
                      &val_handle);
 
   int rc = ble_gattc_notify_custom(
-      ble_interop::instance().active_conn_handle, val_handle,
+      ble_interop::instance()._active_conn_handle, val_handle,
       ble_hs_mbuf_from_flat(buffer, stream.bytes_written));
   if (rc != 0) {
     ESP_LOGE("ble_interop", "Failed to send mesh status notification: %d", rc);

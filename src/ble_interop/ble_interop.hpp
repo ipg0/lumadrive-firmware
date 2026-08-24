@@ -21,13 +21,14 @@ class ble_interop {
                        0xbf, 0xd2, 0x57, 0x2d, 0x8b, 0x4b, 0x29);
 
 private:
-  std::mutex state_mutex;
-  bool is_ready = false;
-  bool is_connected = false;
-  bool is_bonded_advertising_active = false;
-  char ble_device_name[BLE_INTEROP_DEVICE_NAME_MAX_LENGTH];
-  esp_timer_handle_t advertising_timer;
-  uint16_t active_conn_handle;
+  static constexpr const char *TAG = "ble_interop";
+  std::mutex _state_mutex;
+  bool _is_ready = false;
+  bool _is_connected = false;
+  bool _is_bonded_advertising_active = false;
+  char _ble_device_name[BLE_INTEROP_DEVICE_NAME_MAX_LENGTH];
+  esp_timer_handle_t _advertising_timer;
+  uint16_t _active_conn_handle;
 
   static void advertising_timer_cb(void *arg);
   static int handle_ble_gap_event(struct ble_gap_event *event, void *arg);

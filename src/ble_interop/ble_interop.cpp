@@ -21,14 +21,14 @@ void ble_interop::nimble_host_task(void *param) {
 }
 
 int ble_interop::handle_ble_gap_event(struct ble_gap_event *event, void *arg) {
-  std::lock_guard<std::mutex> lock(ble_interop::instance().state_mutex);
+  std::lock_guard<std::mutex> lock(ble_interop::instance()._state_mutex);
 
   switch (event->type) {
   case BLE_GAP_EVENT_CONNECT:
     ESP_LOGI("ble_interop", "Received BLE GAP event of type CONNECT");
     if (event->connect.status == 0) {
       // Only enforce bonding check during bonded advertising mode
-      if (ble_interop::instance().is_bonded_advertising_active) {
+      if (ble_interop::instance()._is_bonded_advertising_active) {
         struct ble_gap_conn_desc desc;
         int rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
         if (rc == 0) {
@@ -56,8 +56,8 @@ int ble_interop::handle_ble_gap_event(struct ble_gap_event *event, void *arg) {
 
       ESP_LOGI("ble_interop", "BLE connected (bonded), handle=%d",
                event->connect.conn_handle);
-      ble_interop::instance().is_connected = true;
-      ble_interop::instance().active_conn_handle = event->connect.conn_handle;
+      ble_interop::instance()._is_connected = true;
+      ble_interop::instance()._active_conn_handle = event->connect.conn_handle;
       ble_gap_security_initiate(event->connect.conn_handle);
     } else {
       ESP_LOGW("ble_interop", "BLE connection failed, status=%d",
@@ -71,8 +71,8 @@ int ble_interop::handle_ble_gap_event(struct ble_gap_event *event, void *arg) {
     ESP_LOGI("ble_interop", "Received BLE GAP event of type DISCONNECT");
     ESP_LOGI("ble_interop", "BLE disconnected, reason=%d",
              event->disconnect.reason);
-    ble_interop::instance().is_connected = false;
-    ble_interop::instance().active_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    ble_interop::instance()._is_connected = false;
+    ble_interop::instance()._active_conn_handle = BLE_HS_CONN_HANDLE_NONE;
     ble_interop::instance().start_bonded_advertising();
     return 0;
 
@@ -138,7 +138,7 @@ ble_interop::ble_interop() {
   ble_gatts_add_svcs(this->gatt_service_defs);
 
   this->ble_hs_configure();
-  this->active_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+  this->_active_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 
   static struct ble_npl_event g_mesh_status_event;
 
@@ -155,11 +155,11 @@ ble_interop::ble_interop() {
       .callback = &ble_interop::advertising_timer_cb,
       .arg = nullptr,
       .dispatch_method = ESP_TIMER_TASK,
-      .name = "advertising_timer",
+      .name = "_advertising_timer",
       .skip_unhandled_events = true,
   };
   ESP_ERROR_CHECK(
-      esp_timer_create(&advertising_timer_args, &this->advertising_timer));
+      esp_timer_create(&advertising_timer_args, &this->_advertising_timer));
 
   nimble_port_freertos_init(&ble_interop::nimble_host_task);
 }
@@ -168,11 +168,11 @@ void ble_interop::init_ble_device_name() {
   uint8_t mac[6];
   esp_read_mac(mac, ESP_MAC_BT);
 
-  snprintf(this->ble_device_name, BLE_INTEROP_DEVICE_NAME_MAX_LENGTH,
+  snprintf(this->_ble_device_name, BLE_INTEROP_DEVICE_NAME_MAX_LENGTH,
            BLE_INTEROP_DEVICE_NAME_TEMPLATE, mac[3], mac[4], mac[5]);
 
   ESP_LOGI("ble_interop", "Initialized BLE device name: %s",
-           this->ble_device_name);
+           this->_ble_device_name);
 }
 
 void ble_interop::ble_hs_configure() {
@@ -195,9 +195,9 @@ void ble_interop::ble_hs_configure() {
 }
 
 void ble_interop::ble_on_sync() {
-  std::lock_guard<std::mutex> lock(ble_interop::instance().state_mutex);
+  std::lock_guard<std::mutex> lock(ble_interop::instance()._state_mutex);
 
-  ESP_LOGI("ble_interop", "BLE host synchronized");
+  ESP_LOGI("ble_interop", "BLE host _synchronized");
 
   ble_addr_t addr;
   if (!load_or_generate_ble_address(&addr)) {
@@ -210,18 +210,18 @@ void ble_interop::ble_on_sync() {
     ESP_LOGE("ble_interop", "Failed to set random address: %d", rc);
     return;
   }
-  ble_svc_gap_device_name_set(ble_interop::instance().ble_device_name);
+  ble_svc_gap_device_name_set(ble_interop::instance()._ble_device_name);
 
   ble_interop::instance().start_advertising();
-  instance().is_ready = true;
+  instance()._is_ready = true;
 }
 
 void ble_interop::ble_on_reset(int reason) {
-  std::lock_guard<std::mutex> lock(ble_interop::instance().state_mutex);
+  std::lock_guard<std::mutex> lock(ble_interop::instance()._state_mutex);
 
   ESP_LOGE("ble_interop", "BLE host reset, reason: %d", reason);
-  instance().is_ready = false;
-  instance().is_connected = false;
+  instance()._is_ready = false;
+  instance()._is_connected = false;
 }
 
 void ble_interop::start_advertising() {
@@ -245,8 +245,8 @@ void ble_interop::start_advertising() {
   }
 
   memset(&scan_rsp_fields, 0, sizeof(scan_rsp_fields));
-  scan_rsp_fields.name = (uint8_t *)this->ble_device_name;
-  scan_rsp_fields.name_len = strlen(this->ble_device_name);
+  scan_rsp_fields.name = (uint8_t *)this->_ble_device_name;
+  scan_rsp_fields.name_len = strlen(this->_ble_device_name);
   scan_rsp_fields.name_is_complete = 1;
 
   int scan_rsp_rc = ble_gap_adv_rsp_set_fields(&scan_rsp_fields);
@@ -261,9 +261,9 @@ void ble_interop::start_advertising() {
   adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
 
   ESP_LOGI("ble_interop", "Starting BLE advertising with name: %s",
-           this->ble_device_name);
+           this->_ble_device_name);
 
-  ble_interop::instance().is_bonded_advertising_active = false;
+  ble_interop::instance()._is_bonded_advertising_active = false;
 
   int adv_rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, nullptr, BLE_HS_FOREVER,
                                  &adv_params, ble_interop::handle_ble_gap_event,
@@ -273,7 +273,7 @@ void ble_interop::start_advertising() {
     ESP_LOGE("ble_interop", "ble_gap_adv_start failed: %d", adv_rc);
   }
 
-  esp_timer_start_once(ble_interop::advertising_timer,
+  esp_timer_start_once(ble_interop::_advertising_timer,
                        ble_interop::ADVERTISING_TIMEOUT_US);
 }
 
@@ -281,7 +281,7 @@ void ble_interop::start_bonded_advertising() {
   ble_addr_t peer_addrs[MYNEWT_VAL(BLE_STORE_MAX_BONDS)];
   int num_peers = 0;
 
-  if (this->is_connected) {
+  if (this->_is_connected) {
     ESP_LOGI("ble_interop",
              "Skipping bonded advertising start while a connection is active");
     return;
@@ -348,7 +348,7 @@ void ble_interop::start_bonded_advertising() {
       BLE_HCI_ADV_FILT_NONE; // whitelist filter for connections only; scans
                              // pass through
 
-  ble_interop::instance().is_bonded_advertising_active = true;
+  ble_interop::instance()._is_bonded_advertising_active = true;
 
   rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, nullptr, BLE_HS_FOREVER,
                          &adv_params, ble_interop::handle_ble_gap_event,

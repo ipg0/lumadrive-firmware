@@ -2,6 +2,8 @@
 #include "../ble_interop/ble_interop.hpp"
 #include "../global_config/global_config.hpp"
 #include "mesh_interop_frame/mesh_interop_frame.hpp"
+#include "mesh_interop_frame/impl/mesh_interop_frame_discover.hpp"
+#include "mesh_interop_frame/impl/mesh_interop_frame_heartbeat.hpp"
 #include <esp_log.h>
 #include <esp_wifi.h>
 #include <nvs.h>
@@ -80,7 +82,7 @@ mesh_interop::mesh_interop() {
     esp_err_t load_state_err = this->load_state();
 
     if (load_state_err != ESP_OK) {
-      ESP_LOGW("mesh_interop", "Failed to load state from NVS: %s",
+      ESP_LOGW("mesh_interop", "Failed to load _state from NVS: %s",
                esp_err_to_name(load_state_err));
       this->init_state();
     }
@@ -88,22 +90,22 @@ mesh_interop::mesh_interop() {
     if (!this->is_interop_configured()) {
       this->start_discovery_impl();
     } else {
-      ESP_LOGI("mesh_interop", "Interop state loaded, is_configured: %s",
-               this->state.is_configured ? "true" : "false");
+      ESP_LOGI("mesh_interop", "Interop _state loaded, is_configured: %s",
+               this->_state.is_configured ? "true" : "false");
       if (global_config::instance().is_master_node()) {
         ESP_LOGI("mesh_interop", "Master node, slave nodes count: %u",
-                 this->state.nodes_count);
+                 this->_state.nodes_count);
       } else {
         ESP_LOGI("mesh_interop",
                  "Slave node, master node MAC: %02X:%02X:%02X:%02X:%02X:%02X",
-                 this->state.nodes[0].mac[0], this->state.nodes[0].mac[1],
-                 this->state.nodes[0].mac[2], this->state.nodes[0].mac[3],
-                 this->state.nodes[0].mac[4], this->state.nodes[0].mac[5]);
+                 this->_state.nodes[0].mac[0], this->_state.nodes[0].mac[1],
+                 this->_state.nodes[0].mac[2], this->_state.nodes[0].mac[3],
+                 this->_state.nodes[0].mac[4], this->_state.nodes[0].mac[5]);
       }
     }
   }
 
-  this->mesh_state_cb = nullptr;
+  this->_mesh_state_cb = nullptr;
 
   if (global_config::instance().is_master_node()) {
     // start heartbeat timer
@@ -126,13 +128,13 @@ void mesh_interop::finish_discovery_timer_cb(void *arg) {
 }
 
 esp_err_t mesh_interop::start_discovery_impl() {
-  this->discovery_mode = true;
+  this->_discovery_mode = true;
 
   this->clear_saved_state();
 
   if (global_config::instance().is_master_node()) {
-    this->state.is_configured = false;
-    this->state.nodes_count = 0;
+    this->_state.is_configured = false;
+    this->_state.nodes_count = 0;
 
     const esp_timer_create_args_t finish_discovery_timer_args = {
         .callback = &mesh_interop::finish_discovery_timer_cb,
@@ -147,7 +149,7 @@ esp_err_t mesh_interop::start_discovery_impl() {
     ESP_ERROR_CHECK(esp_timer_start_once(
         finish_discovery_timer, mesh_interop_MASTER_DISCOVERY_TIMEOUT_US));
   } else {
-    this->state.is_configured = false;
+    this->_state.is_configured = false;
   }
 
   this->notify_mesh_state_cb();
@@ -156,9 +158,9 @@ esp_err_t mesh_interop::start_discovery_impl() {
 }
 
 esp_err_t mesh_interop::start_discovery() {
-  std::lock_guard<std::mutex> lock(this->state_mutex);
+  std::lock_guard<std::mutex> lock(this->_state_mutex);
 
-  if (this->discovery_mode) {
+  if (this->_discovery_mode) {
     ESP_LOGW("mesh_interop",
              "start_discovery called while already in discovery mode");
     return ESP_OK;
@@ -167,14 +169,14 @@ esp_err_t mesh_interop::start_discovery() {
 }
 
 esp_err_t mesh_interop::finish_discovery_impl() {
-  this->discovery_mode = false;
+  this->_discovery_mode = false;
 
   if (global_config::instance().is_master_node()) {
     ESP_LOGI("mesh_interop", "Discovery finished, %u slave nodes registered:",
-             this->state.nodes_count);
+             this->_state.nodes_count);
 
-    for (size_t i = 0; i < this->state.nodes_count; i++) {
-      const auto &slave_node = this->state.nodes[i];
+    for (size_t i = 0; i < this->_state.nodes_count; i++) {
+      const auto &slave_node = this->_state.nodes[i];
       ESP_LOGI("mesh_interop", "Slave node %u: %02X:%02X:%02X:%02X:%02X:%02X",
                i, slave_node.mac[0], slave_node.mac[1], slave_node.mac[2],
                slave_node.mac[3], slave_node.mac[4], slave_node.mac[5]);
@@ -182,17 +184,17 @@ esp_err_t mesh_interop::finish_discovery_impl() {
   } else {
     ESP_LOGI("mesh_interop",
              "Discovery finished, master node: %02X:%02X:%02X:%02X:%02X:%02X",
-             this->state.nodes[0].mac[0], this->state.nodes[0].mac[1],
-             this->state.nodes[0].mac[2], this->state.nodes[0].mac[3],
-             this->state.nodes[0].mac[4], this->state.nodes[0].mac[5]);
+             this->_state.nodes[0].mac[0], this->_state.nodes[0].mac[1],
+             this->_state.nodes[0].mac[2], this->_state.nodes[0].mac[3],
+             this->_state.nodes[0].mac[4], this->_state.nodes[0].mac[5]);
   }
 
-  if (this->state.is_configured) {
-    ESP_LOGI("mesh_interop", "Interop is configured, saving state to NVS");
+  if (this->_state.is_configured) {
+    ESP_LOGI("mesh_interop", "Interop is configured, saving _state to NVS");
     this->save_state();
   } else {
     ESP_LOGW("mesh_interop",
-             "Interop is not configured, not saving state in NVS, reboot!");
+             "Interop is not configured, not saving _state in NVS, reboot!");
   }
 
   this->notify_mesh_state_cb();
@@ -201,8 +203,8 @@ esp_err_t mesh_interop::finish_discovery_impl() {
 }
 
 esp_err_t mesh_interop::finish_discovery() {
-  std::lock_guard<std::mutex> lock(this->state_mutex);
-  if (!this->discovery_mode) {
+  std::lock_guard<std::mutex> lock(this->_state_mutex);
+  if (!this->_discovery_mode) {
     ESP_LOGW("mesh_interop",
              "finish_discovery called while not in discovery mode");
     return ESP_OK;
@@ -224,8 +226,8 @@ void mesh_interop::send_heartbeats() {
   if (!global_config::instance().is_master_node())
     return; // only master node should send heartbeat
 
-  for (size_t i = 0; i < this->state.nodes_count; i++) {
-    const auto &slave_node = this->state.nodes[i];
+  for (size_t i = 0; i < this->_state.nodes_count; i++) {
+    const auto &slave_node = this->_state.nodes[i];
 
     mesh_interop_frame<mesh_interop_frame_type::HEARTBEAT> heartbeat_frame(
         slave_node.mac);
@@ -241,12 +243,12 @@ void mesh_interop::send_heartbeats() {
 }
 
 bool mesh_interop::is_interop_configured() {
-  std::lock_guard<std::mutex> lock(this->state_mutex);
+  std::lock_guard<std::mutex> lock(this->_state_mutex);
 
   if (global_config::instance().is_master_node()) {
-    return this->state.is_configured && this->state.nodes_count > 0;
+    return this->_state.is_configured && this->_state.nodes_count > 0;
   } else {
-    return this->state.is_configured;
+    return this->_state.is_configured;
   }
 }
 
@@ -287,16 +289,16 @@ void mesh_interop::remove_peer(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
 
 esp_err_t
 mesh_interop::subscribe_to_master_node(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
-  std::lock_guard<std::mutex> lock(this->state_mutex);
+  std::lock_guard<std::mutex> lock(this->_state_mutex);
   if (global_config::instance().is_master_node()) {
     ESP_LOGE("mesh_interop",
              "Cannot subscribe to master node on a master node");
     return ESP_ERR_INVALID_ARG;
   }
 
-  this->state.is_configured = true;
-  this->state.nodes_count = 1;
-  memcpy(this->state.nodes[0].mac, mac, ESP_NOW_ETH_ALEN);
+  this->_state.is_configured = true;
+  this->_state.nodes_count = 1;
+  memcpy(this->_state.nodes[0].mac, mac, ESP_NOW_ETH_ALEN);
 
   // add master as permanent peer
   add_peer_unless_exists(mac);
@@ -306,14 +308,14 @@ mesh_interop::subscribe_to_master_node(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
 
 esp_err_t
 mesh_interop::register_slave_node(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
-  std::lock_guard<std::mutex> lock(this->state_mutex);
-  if (!global_config::instance().is_master_node() || !this->discovery_mode) {
+  std::lock_guard<std::mutex> lock(this->_state_mutex);
+  if (!global_config::instance().is_master_node() || !this->_discovery_mode) {
     ESP_LOGE("mesh_interop", "Cannot register slave node on a non-master "
                              "node or when not in discover mode");
     return ESP_ERR_INVALID_ARG;
   }
 
-  if (this->state.nodes_count >= mesh_interop::mesh_interop_SLAVE_NODES_MAX) {
+  if (this->_state.nodes_count >= mesh_interop::mesh_interop_SLAVE_NODES_MAX) {
     ESP_LOGE("mesh_interop", "Cannot register more slave nodes, limit reached");
     return ESP_ERR_NO_MEM;
   }
@@ -327,11 +329,11 @@ mesh_interop::register_slave_node(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
   // add slave as permanent peer
   add_peer_unless_exists(mac);
 
-  memcpy(this->state.nodes[this->state.nodes_count].mac, mac, ESP_NOW_ETH_ALEN);
-  this->state.nodes_count++;
+  memcpy(this->_state.nodes[this->_state.nodes_count].mac, mac, ESP_NOW_ETH_ALEN);
+  this->_state.nodes_count++;
   // at least one slave node is registered, mark interop as configured, but
   // keep discovery on
-  this->state.is_configured = true;
+  this->_state.is_configured = true;
 
   this->notify_mesh_state_cb();
 
@@ -346,11 +348,11 @@ bool mesh_interop::master_node_matches_impl(
     return false;
   }
 
-  return memcmp(this->state.nodes[0].mac, mac, ESP_NOW_ETH_ALEN) == 0;
+  return memcmp(this->_state.nodes[0].mac, mac, ESP_NOW_ETH_ALEN) == 0;
 }
 
 bool mesh_interop::slave_node_exists(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
-  std::lock_guard<std::mutex> lock(this->state_mutex);
+  std::lock_guard<std::mutex> lock(this->_state_mutex);
   return this->find_slave_node_index(mac) != SIZE_MAX;
 }
 
@@ -362,8 +364,8 @@ mesh_interop::find_slave_node_index(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
     return SIZE_MAX;
   }
 
-  for (size_t i = 0; i < this->state.nodes_count; i++) {
-    if (memcmp(this->state.nodes[i].mac, mac, ESP_NOW_ETH_ALEN) == 0) {
+  for (size_t i = 0; i < this->_state.nodes_count; i++) {
+    if (memcmp(this->_state.nodes[i].mac, mac, ESP_NOW_ETH_ALEN) == 0) {
       return i;
     }
   }
@@ -371,7 +373,7 @@ mesh_interop::find_slave_node_index(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
 }
 
 esp_err_t mesh_interop::sync_slave_node(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
-  std::lock_guard<std::mutex> lock(this->state_mutex);
+  std::lock_guard<std::mutex> lock(this->_state_mutex);
   if (!global_config::instance().is_master_node()) {
     ESP_LOGE("mesh_interop", "Cannot sync slave node on a slave node");
     return ESP_ERR_INVALID_ARG;
@@ -385,7 +387,7 @@ esp_err_t mesh_interop::sync_slave_node(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
     return ESP_ERR_INVALID_ARG;
   }
 
-  this->node_last_synced_at[slave_node_index] = esp_timer_get_time();
+  this->_node_last_synced_at[slave_node_index] = esp_timer_get_time();
   ESP_LOGI("mesh_interop", "Synced slave node %02X:%02X:%02X:%02X:%02X:%02X",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
@@ -395,7 +397,7 @@ esp_err_t mesh_interop::sync_slave_node(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
 }
 
 bool mesh_interop::master_node_matches(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
-  std::lock_guard<std::mutex> lock(this->state_mutex);
+  std::lock_guard<std::mutex> lock(this->_state_mutex);
   return this->master_node_matches_impl(mac);
 }
 
@@ -408,40 +410,40 @@ esp_err_t mesh_interop::load_state() {
     return nvs_err;
   }
 
-  size_t size = sizeof(this->state);
-  nvs_err = nvs_get_blob(nvs_handle, "state", &this->state, &size);
+  size_t size = sizeof(this->_state);
+  nvs_err = nvs_get_blob(nvs_handle, "_state", &this->_state, &size);
   nvs_close(nvs_handle);
 
   if (nvs_err != ESP_OK) {
-    ESP_LOGE("mesh_interop", "Failed to read state from NVS: %s",
+    ESP_LOGE("mesh_interop", "Failed to read _state from NVS: %s",
              esp_err_to_name(nvs_err));
     return nvs_err;
   }
 
-  if (size != sizeof(this->state)) {
+  if (size != sizeof(this->_state)) {
     ESP_LOGE("mesh_interop", "State size mismatch, expected %zu, got %zu",
-             sizeof(this->state), size);
+             sizeof(this->_state), size);
     return ESP_ERR_INVALID_SIZE;
   }
 
-  if (this->state.magic != mesh_interop::mesh_interop_NVS_MAGIC) {
+  if (this->_state.magic != mesh_interop::mesh_interop_NVS_MAGIC) {
     ESP_LOGE("mesh_interop",
              "State magic mismatch, expected 0x%08X, got "
              "0x%08X",
-             mesh_interop::mesh_interop_NVS_MAGIC, this->state.magic);
+             mesh_interop::mesh_interop_NVS_MAGIC, this->_state.magic);
     return ESP_ERR_INVALID_STATE;
   }
 
-  if (this->state.is_master_state !=
+  if (this->_state.is_master_state !=
       global_config::instance().is_master_node()) {
     ESP_LOGE("mesh_interop", "State master/slave mismatch, expected %s, got %s",
              global_config::instance().is_master_node() ? "master" : "slave",
-             this->state.is_master_state ? "master" : "slave");
+             this->_state.is_master_state ? "master" : "slave");
     return ESP_ERR_INVALID_STATE;
   }
 
   for (size_t i = 0; i < mesh_interop_SLAVE_NODES_MAX; i++) {
-    this->node_last_synced_at[i] = 0;
+    this->_node_last_synced_at[i] = 0;
   }
 
   return this->add_all_state_nodes_as_peers();
@@ -456,12 +458,12 @@ esp_err_t mesh_interop::save_state() {
     return nvs_err;
   }
 
-  this->state.magic = mesh_interop::mesh_interop_NVS_MAGIC;
+  this->_state.magic = mesh_interop::mesh_interop_NVS_MAGIC;
 
   nvs_err =
-      nvs_set_blob(nvs_handle, "state", &this->state, sizeof(this->state));
+      nvs_set_blob(nvs_handle, "_state", &this->_state, sizeof(this->_state));
   if (nvs_err != ESP_OK) {
-    ESP_LOGE("mesh_interop", "Failed to write state to NVS: %s",
+    ESP_LOGE("mesh_interop", "Failed to write _state to NVS: %s",
              esp_err_to_name(nvs_err));
     nvs_close(nvs_handle);
     return nvs_err;
@@ -469,7 +471,7 @@ esp_err_t mesh_interop::save_state() {
 
   nvs_err = nvs_commit(nvs_handle);
   if (nvs_err != ESP_OK) {
-    ESP_LOGE("mesh_interop", "Failed to commit state to NVS: %s",
+    ESP_LOGE("mesh_interop", "Failed to commit _state to NVS: %s",
              esp_err_to_name(nvs_err));
     nvs_close(nvs_handle);
     return nvs_err;
@@ -488,9 +490,9 @@ esp_err_t mesh_interop::clear_saved_state() {
     return nvs_err;
   }
 
-  nvs_err = nvs_erase_key(nvs_handle, "state");
+  nvs_err = nvs_erase_key(nvs_handle, "_state");
   if (nvs_err != ESP_OK) {
-    ESP_LOGE("mesh_interop", "Failed to erase state from NVS: %s",
+    ESP_LOGE("mesh_interop", "Failed to erase _state from NVS: %s",
              esp_err_to_name(nvs_err));
     nvs_close(nvs_handle);
     return nvs_err;
@@ -498,7 +500,7 @@ esp_err_t mesh_interop::clear_saved_state() {
 
   nvs_err = nvs_commit(nvs_handle);
   if (nvs_err != ESP_OK) {
-    ESP_LOGE("mesh_interop", "Failed to commit erase state to NVS: %s",
+    ESP_LOGE("mesh_interop", "Failed to commit erase _state to NVS: %s",
              esp_err_to_name(nvs_err));
     nvs_close(nvs_handle);
     return nvs_err;
@@ -511,69 +513,69 @@ esp_err_t mesh_interop::clear_saved_state() {
 }
 
 void mesh_interop::init_state() {
-  this->state.magic = mesh_interop::mesh_interop_NVS_MAGIC;
-  this->state.is_configured = false;
-  this->state.is_master_state = global_config::instance().is_master_node();
-  this->state.nodes_count = 0;
+  this->_state.magic = mesh_interop::mesh_interop_NVS_MAGIC;
+  this->_state.is_configured = false;
+  this->_state.is_master_state = global_config::instance().is_master_node();
+  this->_state.nodes_count = 0;
 
   for (size_t i = 0; i < mesh_interop_SLAVE_NODES_MAX; i++) {
-    this->node_last_synced_at[i] = 0;
+    this->_node_last_synced_at[i] = 0;
   }
 }
 
 esp_err_t mesh_interop::add_all_state_nodes_as_peers() {
   if (!this->is_interop_configured()) {
     ESP_LOGE("mesh_interop",
-             "Cannot add all state nodes as peers, interop is not configured");
+             "Cannot add all _state nodes as peers, interop is not configured");
     return ESP_ERR_INVALID_STATE;
   }
 
   if (global_config::instance().is_master_node()) {
-    for (size_t i = 0; i < this->state.nodes_count; i++) {
-      const auto &slave_node = this->state.nodes[i];
+    for (size_t i = 0; i < this->_state.nodes_count; i++) {
+      const auto &slave_node = this->_state.nodes[i];
       this->add_peer_unless_exists(slave_node.mac);
     }
   } else {
-    this->add_peer_unless_exists(this->state.nodes[0].mac);
+    this->add_peer_unless_exists(this->_state.nodes[0].mac);
   }
 
   return ESP_OK;
 }
 
 mesh_interop::mesh_interop_state_result_t mesh_interop::get_state() {
-  std::lock_guard<std::mutex> lock(this->state_mutex);
+  std::lock_guard<std::mutex> lock(this->_state_mutex);
   mesh_interop_state_result_t result;
 
-  result.is_discovery_mode = this->discovery_mode;
+  result.is_discovery_mode = this->_discovery_mode;
 
   if (result.is_discovery_mode) {
     result.nodes_count = 0;
     return result;
   }
 
-  result.nodes_count = this->state.nodes_count;
+  result.nodes_count = this->_state.nodes_count;
 
-  for (size_t i = 0; i < this->state.nodes_count; i++) {
-    const auto &slave_node = this->state.nodes[i];
+  for (size_t i = 0; i < this->_state.nodes_count; i++) {
+    const auto &slave_node = this->_state.nodes[i];
     memcpy(result.nodes[i].mac, slave_node.mac, ESP_NOW_ETH_ALEN);
-    result.nodes[i].last_synced_at = this->node_last_synced_at[i];
+    result.nodes[i].last_synced_at = this->_node_last_synced_at[i];
   }
 
   return result;
 }
 
 void mesh_interop::register_mesh_state_cb(void (*cb)()) {
-  std::lock_guard<std::mutex> lock(this->state_mutex);
+  std::lock_guard<std::mutex> lock(this->_state_mutex);
   if (cb == nullptr) {
-    ESP_LOGE("mesh_interop", "Cannot register null mesh state callback");
+    ESP_LOGE("mesh_interop", "Cannot register null mesh _state callback");
     return;
   }
 
-  this->mesh_state_cb = cb;
+  this->_mesh_state_cb = cb;
 }
 
 void mesh_interop::notify_mesh_state_cb() {
-  if (this->mesh_state_cb != nullptr) {
-    this->mesh_state_cb();
+  if (this->_mesh_state_cb != nullptr) {
+    this->_mesh_state_cb();
   }
 }
