@@ -2,6 +2,7 @@
 // queue, and clock adapters. No production paths are replaced by a model.
 #define main matrix_core_tests_main
 #include "test_main.cpp"
+#include <limits>
 #undef main
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
@@ -115,7 +116,9 @@ void test_deploy_recover_persist() {
   // Reboot the slave: HELLO reports an empty runtime and triggers definitions + snapshot recovery.
   slave.local.reset(); slave.pending_player.reset(); slave.pending_snapshot.reset();
   slave.completed_transfer = 0; slave.radio_rx.reset(); slave.local_sequence = 0;
+  slave.gpio_stream = (uint64_t(esp_random()) << 32) | esp_random();
   std::vector<uint8_t> hello; w::put(hello, 10, 8); w::put(hello, 0, 8); w::put(hello, 0, 4);
+  w::put(hello, slave.gpio_stream, 8); w::put(hello, 0, 1);
   auto raw = w::packet(w::HELLO, hello); packet p{};
   memcpy(p.mac, slave_mac, 6); p.size = raw.size(); memcpy(p.data, raw.data(), raw.size());
   master.handle_radio(p, fake_now); cycles(master, slave, 250);
@@ -159,6 +162,21 @@ void test_callback_queue_limits() {
   delete matrix_service::instance; matrix_service::instance = nullptr;
   delete matrix_service::ble_queue; delete matrix_service::radio_queue;
   delete matrix_service::priority_queue; delete matrix_service::gpio_queue;
+}
+void test_only_current_hello_format() {
+  service master; configure_node(master, true);
+  const auto index = master.find_peer(slave_mac); auto &peer = master.peers[index];
+  peer.ready = true; peer.definitions = true; peer.seen = 123;
+  std::vector<uint8_t> body; w::put(body, master.session, 8); w::put(body, 0, 8); w::put(body, 0, 4);
+  const auto submit = [&] {
+    auto raw = w::packet(w::HELLO, body); packet p{};
+    memcpy(p.mac, slave_mac, 6); p.size = raw.size(); memcpy(p.data, raw.data(), raw.size());
+    master.handle_radio(p, fake_now);
+  };
+  submit(); // Obsolete 20-byte HELLO cannot change readiness or liveness.
+  assert(peer.ready && peer.definitions && peer.seen == 123 && !peer.gpio_stream);
+  w::put(body, 456, 8); w::put(body, 0, 1); submit();
+  assert(peer.ready && peer.seen == fake_now && peer.gpio_stream == 456);
 }
 void test_old_matrix_evaluates_until_shared_boundary() {
   service master, slave; configure_node(master, true); configure_node(slave, false);
@@ -217,6 +235,39 @@ void test_command_retry_gap_and_snapshot_overflow() {
   state = slave.local->snapshot(d, 0, 0);
   assert(state.states[0].started_at_us == command.effective_at_us);
 }
+void test_animated_deployment_and_reconnect() {
+  service master, slave; configure_node(master, true); configure_node(slave, false);
+  auto c = keyframe_fixture();
+  c.sources[0].kind = mesh_interop_MatrixSource_Kind_DEFAULT_STATE;
+  // Include a second independently addressed track to exercise chunking and persistence.
+  auto &e = c.effects[0]; e.keyframes_count = 5;
+  e.keyframes[3] = keyframe(0, 0, 255, 0, 255, mesh_interop_MatrixInterpolation_STEP, 1, 1, 2);
+  e.keyframes[4] = keyframe(1000, 0, 0, 255, 255, mesh_interop_MatrixInterpolation_LINEAR, 1, 5, 1);
+  upload(master, c, 70); cycles(master, slave, 200, true);
+  assert(slave.local && master.peers[0].ready);
+  assert(slave.local->definitions().layers[0].effect.keyframes_count == 5);
+  const auto started = master.activate_at;
+  fake_now = started + ((fake_now - started) / 1000000 + 1) * 1000000 + 250000;
+  master.playback_step(fake_now); slave.playback_step(fake_now);
+  assert(output.shown.r == 128 && output.shown.b == 128);
+  slave.local.reset(); slave.pending_player.reset(); slave.pending_snapshot.reset();
+  slave.completed_transfer = 0; slave.radio_rx.reset(); slave.local_sequence = 0;
+  master.peers[0].ready = false; master.peers[0].definitions = false;
+  cycles(master, slave, 200);
+  assert(master.peers[0].ready && slave.local);
+  auto d = definitions_for(c, slave_mac, 10, 1);
+  auto snapshot = slave.local->snapshot(d, 0, 0);
+  assert(snapshot.states[0].started_at_us == started);
+  fake_now += 250000; slave.playback_step(fake_now); assert(output.shown.b == 255);
+  service restored; configure_node(restored, true); restored.session = 11; restored.load();
+  assert(restored.candidate && restored.candidate->effects[0].keyframes_count == 5);
+  assert(restored.candidate->effects[0].keyframes[3].position == 1);
+  const auto saved = stored;
+  auto invalid = c; invalid.effects[0].keyframes[0].position = std::numeric_limits<float>::quiet_NaN();
+  upload(master, invalid, 71);
+  assert(master.state.stage == mesh_interop_MatrixStatus_Stage_FAILED);
+  assert(master.revision == 1 && master.local && stored == saved);
+}
 void slave_tick(service &slave) {
   fake_mesh_master = false; slave.slave_step(fake_now); fake_mesh_master = true;
 }
@@ -238,8 +289,8 @@ void test_remote_gpio_delivery() {
   service master, slave; configure_node(master, true); configure_node(slave, false);
   auto c = fixture(); memcpy(c.sources[0].node_mac, slave_mac, 6);
   c.effects[0].duration_ms = 1000;
-  auto &entry = c.entries[0]; entry.targets_count = 2; entry.targets[1] = entry.targets[0];
-  memcpy(entry.targets[1].node_mac, master_mac, 6);
+  c.layout_count = 2; c.layout[1] = c.layout[0];
+  memcpy(c.layout[1].node_mac, master_mac, 6);
   upload(master, c, 40); cycles(master, slave, 200);
   assert(slave.local && slave.configured_pins[12] && !master.configured_pins[12]);
   const auto captured_at = fake_now;
@@ -295,7 +346,7 @@ void test_remote_gpio_delivery() {
 void test_remote_gpio_source_only_and_replacement() {
   service master, slave; configure_node(master, true); configure_node(slave, false);
   auto c = fixture(); memcpy(c.sources[0].node_mac, slave_mac, 6);
-  memcpy(c.entries[0].targets[0].node_mac, master_mac, 6);
+  memcpy(c.layout[0].node_mac, master_mac, 6);
   upload(master, c, 50); cycles(master, slave, 200);
   assert(slave.local && !slave.local->definitions().layers_count && slave.configured_pins[12]);
   capture_slave_edge(slave, 12, true); slave_tick(slave);
@@ -383,15 +434,57 @@ void test_remote_gpio_time_queues_and_sessions() {
   assert(slave.gpio_events.empty() && !slave.local && !slave.configured_pins[12]);
   network.clear();
 }
+void test_car_layout_distribution_and_recovery() {
+  service master, slave; configure_node(master, true); configure_node(slave, false);
+  auto c = fixture(); c.effects[0].duration_ms = 5000; c.layout_count = 3;
+  c.layout[0] = layout_row(slave_mac, mesh_interop_MatrixDriver_WS2812, 0, 1);
+  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_HC595, 1, 0);
+  c.layout[2] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 1, 2);
+  upload(master, c, 80); cycles(master, slave, 200, true);
+  assert(master.peers[0].ready && slave.local && master.local);
+  assert(slave.local->definitions().canvas_size == 2 && master.local->definitions().canvas_size == 2);
+  assert(slave.local->definitions().output_mappings_count == 2);
+  matrix_service::gpio_event edge{fake_now, 12, true};
+  assert(xQueueSend(matrix_service::gpio_queue, &edge, 0) == pdTRUE);
+  cycles(master, slave, 12);
+  assert(master.peers[0].sequence == 1); // One command per node, even with two outputs.
+  assert(output.shown.r == 255 && output_secondary.shown.r == 255);
+  slave.local.reset(); slave.pending_player.reset(); slave.pending_snapshot.reset();
+  slave.completed_transfer = 0; slave.radio_rx.reset(); slave.local_sequence = 0;
+  master.peers[0].ready = false; master.peers[0].definitions = false;
+  cycles(master, slave, 150);
+  assert(slave.local && slave.local->definitions().output_mappings[1].from == 1);
+  const auto snapshot = slave.local->snapshot(slave.local->definitions(), 0, 0);
+  assert(snapshot.states[0].started_at_us == edge.at + LEAD_US);
+  c.layout[0].from = 2; c.layout[0].to = 1; upload(master, c, 81);
+  for (unsigned i = 0; !slave.pending_snapshot && i < 100; ++i) cycles(master, slave, 1);
+  assert(slave.pending_snapshot && fake_now < slave.pending_snapshot->activate_at_us);
+  assert(slave.local->definitions().output_mappings[0].from == 0);
+  assert(slave.pending_player->definitions().output_mappings[0].from == 2);
+  cycles(master, slave, 150);
+  assert(slave.local->definitions().output_mappings[0].from == 2);
+  service restored; configure_node(restored, true); restored.session = 11; restored.load();
+  assert(restored.candidate && restored.candidate->layout_count == 3 && restored.candidate->layout[0].from == 2);
+  const auto saved = stored;
+  auto invalid = c; invalid.layout[2].from = 0; // Local master span two, but hardware adapter has one pixel.
+  upload(master, invalid, 82); assert(master.revision == 2 && stored == saved);
+  invalid = c; invalid.layout[0].node_mac[0] = 6;
+  upload(master, invalid, 83); assert(master.revision == 2 && stored == saved);
+  invalid = c; invalid.layout_count = 0;
+  upload(master, invalid, 84); assert(master.revision == 2 && stored == saved);
+}
 int main() {
   matrix_core_tests_main();
   matrix_service::gpio_queue = xQueueCreate(64, sizeof(matrix_service::gpio_event));
   test_deploy_recover_persist();
   test_old_matrix_evaluates_until_shared_boundary();
   test_command_retry_gap_and_snapshot_overflow();
+  test_animated_deployment_and_reconnect();
   test_remote_gpio_delivery();
   test_remote_gpio_source_only_and_replacement();
   test_remote_gpio_time_queues_and_sessions();
+  test_car_layout_distribution_and_recovery();
+  test_only_current_hello_format();
   delete matrix_service::gpio_queue;
   test_callback_queue_limits();
   std::puts("Matrix worker: deployment, recovery, persistence, remote GPIO timing/retries/fencing, and queue limits passed.");

@@ -1,7 +1,12 @@
 #include "matrix_core.hpp"
 #include "../animation_trigger_table/animation_effect/impl/static_color_animation_effect.hpp"
+#include "../animation_trigger_table/animation_effect/impl/keyframe_animation_effect.hpp"
+#include "../animation_trigger_table/animation_effect/impl/periodic_animation_effect.hpp"
+#include "../lighting_driver/impl/linear_lighting_driver_view.hpp"
 #include <algorithm>
 #include <cstring>
+#include <type_traits>
+#include <new>
 #include <pb_decode.h>
 #include <pb_encode.h>
 
@@ -75,18 +80,86 @@ template <class item_type> bool unique(const item_type *items, size_t count) {
   }
   return true;
 }
-const char *validate(const matrix_config &c, const uint8_t[6]) {
-  if (c.schema_version != 1) return "Unsupported schema version";
+template <class enum_type> auto enum_value(const enum_type &value) {
+  // Nanopb can decode unknown enum numbers. Read their representation without
+  // loading an out-of-range unscoped C++ enum before validating it.
+  std::underlying_type_t<enum_type> number;
+  memcpy(&number, &value, sizeof(number));
+  return number;
+}
+bool valid_driver(const mesh_interop_MatrixDriver &driver) {
+  const auto value = enum_value(driver);
+  return value == mesh_interop_MatrixDriver_WS2812 || value == mesh_interop_MatrixDriver_HC595;
+}
+std::array<animation_keyframe, MAX_ANIMATION_KEYFRAMES> effect_keyframes(const matrix_effect &e) {
+  std::array<animation_keyframe, MAX_ANIMATION_KEYFRAMES> frames{};
+  for (size_t i = 0; i < e.keyframes_count && i < frames.size(); ++i) {
+    const auto &f = e.keyframes[i];
+    frames[i] = {f.time_ms, alpha_color(color(f.red, f.green, f.blue), f.alpha),
+                 static_cast<animation_interpolation>(enum_value(f.interpolation)), f.track_id,
+                 f.position, f.has_width ? f.width : 1, f.wrap, f.all_pixels};
+  }
+  return frames;
+}
+const char *validate_effect(const matrix_effect &e) {
+  if (e.red > 255 || e.green > 255 || e.blue > 255 || e.alpha > 255) return "Invalid effect color";
+  if (e.keyframes_count > MAX_ANIMATION_KEYFRAMES) return "Too many keyframes";
+  const auto kind = enum_value(e.kind);
+  if (kind != mesh_interop_MatrixEffect_Kind_KEYFRAMES && e.keyframes_count)
+    return "Keyframes require the keyframe effect type";
+  switch (kind) {
+  case mesh_interop_MatrixEffect_Kind_STATIC_COLOR: return nullptr;
+  case mesh_interop_MatrixEffect_Kind_KEYFRAMES: {
+    const auto frames = effect_keyframes(e);
+    return valid_animation_keyframes(frames.data(), e.keyframes_count) ? nullptr :
+        "Invalid keyframe times, interpolation, or pixel tracks";
+  }
+  case mesh_interop_MatrixEffect_Kind_BLINK:
+    if (e.duty_percent > 100) return "Blink duty must be 1..100 percent (zero defaults to 50)";
+    break;
+  case mesh_interop_MatrixEffect_Kind_BREATHE: break;
+  case mesh_interop_MatrixEffect_Kind_FLOWING_GRADIENT:
+    if (!e.has_secondary_color) return "Flowing gradient requires a secondary color";
+    break;
+  default: return "Unsupported effect type";
+  }
+  return e.period_ms == 1 ? "Animation period must be at least 2 ms" : nullptr;
+}
+animation_effect_instance_base *create_effect(const matrix_effect &e) {
+  const alpha_color primary(color(e.red, e.green, e.blue), e.alpha);
+  if (e.kind == mesh_interop_MatrixEffect_Kind_STATIC_COLOR)
+    return animation_effect_descriptor<animation_effect_type::STATIC_COLOR>(primary, e.duration_ms).create_instance();
+  if (e.kind == mesh_interop_MatrixEffect_Kind_KEYFRAMES) {
+    const auto frames = effect_keyframes(e);
+    return animation_effect_descriptor<animation_effect_type::KEYFRAMES>(
+        frames.data(), e.keyframes_count, e.loop, e.duration_ms).create_instance();
+  }
+  periodic_animation_options options;
+  options.primary = primary; options.duration_ms = e.duration_ms;
+  options.period_ms = e.period_ms ? e.period_ms : 1000;
+  options.duty_percent = e.kind == mesh_interop_MatrixEffect_Kind_BLINK && e.duty_percent ? e.duty_percent : 50;
+  const auto &s = e.secondary_color;
+  options.secondary = alpha_color(color(s.red, s.green, s.blue), s.alpha);
+  options.wavelength_pixels = e.wavelength_pixels; options.reverse = e.reverse;
+  switch (e.kind) {
+  case mesh_interop_MatrixEffect_Kind_BLINK:
+    return animation_effect_descriptor<animation_effect_type::BLINK>(options).create_instance();
+  case mesh_interop_MatrixEffect_Kind_BREATHE:
+    return animation_effect_descriptor<animation_effect_type::BREATHE>(options).create_instance();
+  case mesh_interop_MatrixEffect_Kind_FLOWING_GRADIENT:
+    return animation_effect_descriptor<animation_effect_type::FLOWING_GRADIENT>(options).create_instance();
+  default: return nullptr;
+  }
+}
+const char *validate(const matrix_config &c, const uint8_t master_mac[6]) {
+  if (c.schema_version != SCHEMA_VERSION) return "Unsupported schema version (expected 2)";
   if (c.entries_count > 32 || c.effects_count > 32 || c.sources_count > 32 ||
-      c.conditions_count > 32) return "Too many definitions";
+      c.conditions_count > 32 || c.layout_count > 34) return "Too many definitions";
   if (!unique(c.effects, c.effects_count) || !unique(c.sources, c.sources_count) ||
       !unique(c.conditions, c.conditions_count) || !unique(c.entries, c.entries_count))
     return "Definition IDs must be nonzero and unique";
   for (size_t i = 0; i < c.effects_count; ++i) {
-    const auto &e = c.effects[i];
-    if (e.kind != mesh_interop_MatrixEffect_Kind_STATIC_COLOR || e.red > 255 ||
-        e.green > 255 || e.blue > 255 || e.alpha > 255)
-      return "Invalid effect or color";
+    if (auto error = validate_effect(c.effects[i])) return error;
   }
   for (size_t i = 0; i < c.sources_count; ++i) {
     const auto &s = c.sources[i];
@@ -100,31 +173,57 @@ const char *validate(const matrix_config &c, const uint8_t[6]) {
   for (size_t i = 0; i < c.conditions_count; ++i)
     if (c.conditions[i].kind != mesh_interop_MatrixCondition_Kind_ALWAYS)
       return "Unsupported condition";
+  for (size_t i = 0; i < c.layout_count; ++i) {
+    const auto &m = c.layout[i];
+    if (!valid_driver(m.driver)) return "Unknown layout driver ID";
+    if ((m.node_mac[0] & 1) ||
+        std::all_of(m.node_mac, m.node_mac + 6, [](uint8_t v) { return v == 0; })) return "Invalid layout MAC";
+    if (m.from == m.to || std::max(m.from, m.to) > 65536) return "Invalid layout bounds";
+    for (size_t j = 0; j < i; ++j)
+      if (!memcmp(m.node_mac, c.layout[j].node_mac, 6) && m.driver == c.layout[j].driver)
+        return "Duplicate layout node/driver";
+  }
+  size_t node_count = 0;
+  for (size_t i = 0; i < c.layout_count; ++i) {
+    bool first = true;
+    for (size_t j = 0; j < i; ++j)
+      if (!memcmp(c.layout[i].node_mac, c.layout[j].node_mac, 6)) first = false;
+    if (first && ++node_count > 17) return "Too many layout nodes";
+  }
   for (size_t i = 0; i < c.entries_count; ++i) {
     const auto &e = c.entries[i];
     if (!lookup(c.effects, c.effects_count, e.effect_id) ||
         !lookup(c.sources, c.sources_count, e.source_id) ||
         !lookup(c.conditions, c.conditions_count, e.condition_id) ||
-        e.priority > 255 || !e.targets_count || e.targets_count > 17)
-      return "Invalid entry reference, priority, or target count";
-    for (size_t j = 0; j < e.targets_count; ++j) {
-      const auto &t = e.targets[j];
-      if (t.driver != mesh_interop_MatrixDriver_WS2812 &&
-          t.driver != mesh_interop_MatrixDriver_HC595) return "Unknown driver ID";
-      if ((t.node_mac[0] & 1) ||
-          std::all_of(t.node_mac, t.node_mac + 6, [](uint8_t v) { return v == 0; }))
-        return "Invalid target MAC";
-      for (size_t k = 0; k < j; ++k)
-        if (!memcmp(t.node_mac, e.targets[k].node_mac, 6) && t.driver == e.targets[k].driver)
-          return "Duplicate node/driver target";
-    }
+        e.priority > 255) return "Invalid entry reference or priority";
+  }
+  if (c.entries_count && !c.layout_count) return "Animations require the car layout";
+  // Layer messages embed their effect, so repeated references can expand beyond
+  // the uploaded config's size. Reject that before persistence/activation.
+  for (size_t i = 0; i < c.layout_count; ++i) {
+    const auto *mac = c.layout[i].node_mac;
+    if (!memcmp(mac, master_mac, 6)) continue;
+    bool first = true;
+    for (size_t j = 0; j < i; ++j)
+      if (!memcmp(mac, c.layout[j].node_mac, 6)) first = false;
+    if (!first) continue;
+    const auto d = make_definitions(c, mac, UINT64_MAX, UINT64_MAX);
+    if (!d) return "Unable to allocate animation definitions";
+    size_t size = 0;
+    if (!pb_get_encoded_size(&size, mesh_interop_AnimationDefinitions_fields, d.get()) || size > MAX_BYTES)
+      return "Node animation definitions exceed 16 KiB";
   }
   return nullptr;
 }
-animation_definitions definitions_for(const matrix_config &c, const uint8_t *mac,
-                            uint64_t session, uint64_t revision) {
-  animation_definitions d{};
-  d.schema_version = 1; d.master_session = session; d.revision = revision;
+void fill_definitions(const matrix_config &c, const uint8_t *mac,
+                      uint64_t session, uint64_t revision, animation_definitions &d) {
+  d.schema_version = SCHEMA_VERSION; d.master_session = session; d.revision = revision;
+  for (size_t i = 0; i < c.layout_count; ++i) {
+    const auto &m = c.layout[i];
+    d.canvas_size = std::max(d.canvas_size, std::max(m.from, m.to));
+    if (mac && !memcmp(m.node_mac, mac, 6))
+      d.output_mappings[d.output_mappings_count++] = {m.driver, m.from, m.to};
+  }
   for (size_t i = 0; mac && i < c.sources_count; ++i) {
     const auto &s = c.sources[i];
     if (s.kind != mesh_interop_MatrixSource_Kind_GPIO_EDGE || memcmp(s.node_mac, mac, 6)) continue;
@@ -133,19 +232,24 @@ animation_definitions definitions_for(const matrix_config &c, const uint8_t *mac
   }
   for (size_t i = 0; i < c.entries_count; ++i) {
     const auto &e = c.entries[i];
-    mesh_interop_AnimationLayer *layer = nullptr;
-    for (size_t j = 0; j < e.targets_count; ++j) {
-      if (mac && memcmp(e.targets[j].node_mac, mac, 6)) continue;
-      if (!layer) {
-        layer = &d.layers[d.layers_count++];
-        layer->entry_id = e.id; layer->has_effect = true;
-        layer->effect = *lookup(c.effects, c.effects_count, e.effect_id);
-        layer->priority = e.priority; layer->order = i;
-      }
-      layer->drivers[layer->drivers_count++] = e.targets[j].driver;
-      if (!mac) break; // The master ledger needs only one layer per entry.
-    }
+    if (mac && !d.output_mappings_count) continue;
+    auto &layer = d.layers[d.layers_count++];
+    layer.entry_id = e.id; layer.has_effect = true;
+    layer.effect = *lookup(c.effects, c.effects_count, e.effect_id);
+    layer.priority = e.priority; layer.order = i;
   }
+}
+animation_definitions definitions_for(const matrix_config &c, const uint8_t *mac,
+                            uint64_t session, uint64_t revision) {
+  animation_definitions d{};
+  fill_definitions(c, mac, session, revision, d);
+  return d;
+}
+std::unique_ptr<animation_definitions> make_definitions(const matrix_config &c,
+    const uint8_t *mac, uint64_t session, uint64_t revision) {
+  std::unique_ptr<animation_definitions> d(new (std::nothrow) animation_definitions{});
+  if (!d) return nullptr;
+  fill_definitions(c, mac, session, revision, *d);
   return d;
 }
 
@@ -155,32 +259,33 @@ int player::find(uint32_t id) const {
   return -1;
 }
 bool player::prepare(const animation_definitions &d) {
-  if (d.schema_version != 1 || !d.master_session || !d.revision || d.layers_count > 32 ||
-      d.gpio_inputs_count > 32)
+  if (d.schema_version != SCHEMA_VERSION || !d.master_session || !d.revision || d.layers_count > 32 ||
+      d.gpio_inputs_count > 32 || d.canvas_size > 65536 || d.output_mappings_count > 2 ||
+      (!d.canvas_size && (d.output_mappings_count || d.layers_count)) ||
+      (_resolver && d.layers_count && !d.output_mappings_count))
     return false;
+  for (size_t i = 0; i < d.output_mappings_count; ++i) {
+    const auto &m = d.output_mappings[i];
+    if (!valid_driver(m.driver) || m.from == m.to || std::max(m.from, m.to) > d.canvas_size) return false;
+    for (size_t j = 0; j < i; ++j) if (d.output_mappings[j].driver == m.driver) return false;
+    if (_resolver) {
+      auto *driver = _resolver(m.driver);
+      if (!driver || !linear_lighting_driver_view(*driver, m.from, m.to, d.canvas_size).valid()) return false;
+    }
+  }
   for (size_t i = 0; i < d.gpio_inputs_count; ++i) {
     if (d.gpio_inputs[i] > 39) return false;
     for (size_t j = 0; j < i; ++j) if (d.gpio_inputs[i] == d.gpio_inputs[j]) return false;
   }
   for (size_t i = 0; i < d.layers_count; ++i) {
     const auto &l = d.layers[i];
-    if (!l.entry_id || !l.has_effect || l.effect.kind != mesh_interop_MatrixEffect_Kind_STATIC_COLOR ||
-        l.effect.red > 255 || l.effect.green > 255 || l.effect.blue > 255 ||
-        l.effect.alpha > 255 || l.priority > 255 || !l.drivers_count || l.drivers_count > 2) return false;
-    for (size_t j = 0; j < l.drivers_count; ++j) {
-      if ((l.drivers[j] != mesh_interop_MatrixDriver_WS2812 && l.drivers[j] != mesh_interop_MatrixDriver_HC595) ||
-          (_resolver && !_resolver(l.drivers[j]))) return false;
-      for (size_t k = 0; k < j; ++k) if (l.drivers[k] == l.drivers[j]) return false;
-    }
+    if (!l.entry_id || !l.has_effect || validate_effect(l.effect) || l.priority > 255) return false;
     for (size_t j = 0; j < i; ++j) if (d.layers[j].entry_id == l.entry_id) return false;
   }
   _definitions = d; _pending_count = 0;
   for (auto &l : _layers) l = layer{};
   for (size_t i = 0; i < d.layers_count; ++i) {
-    const auto &e = d.layers[i].effect;
-    animation_effect_descriptor<animation_effect_type::STATIC_COLOR> descriptor(
-        alpha_color(color(e.red, e.green, e.blue), e.alpha), e.duration_ms);
-    _layers[i].effect.reset(descriptor.create_instance());
+    _layers[i].effect.reset(create_effect(d.layers[i].effect));
     if (!_layers[i].effect) return false;
   }
   return true;
@@ -238,15 +343,12 @@ esp_err_t player::blank() {
   esp_err_t result = ESP_OK;
   std::array<rgb_lighting_driver *, 32> done{};
   size_t count = 0;
-  for (size_t i = 0; i < _definitions.layers_count; ++i) {
-    const auto &layer = _definitions.layers[i];
-    for (size_t j = 0; j < layer.drivers_count; ++j) {
-      auto *d = _resolver(layer.drivers[j]);
-      if (std::find(done.begin(), done.begin() + count, d) != done.begin() + count) continue;
-      done[count++] = d;
-      auto err = d->clear(); if (err == ESP_OK) err = d->show();
-      if (result == ESP_OK) result = err;
-    }
+  for (size_t i = 0; i < _definitions.output_mappings_count; ++i) {
+    auto *d = _resolver(_definitions.output_mappings[i].driver);
+    if (std::find(done.begin(), done.begin() + count, d) != done.begin() + count) continue;
+    done[count++] = d;
+    auto err = d->clear(); if (err == ESP_OK) err = d->show();
+    if (result == ESP_OK) result = err;
   }
   return result;
 }
@@ -265,10 +367,9 @@ esp_err_t player::tick(uint64_t now, bool render) {
     if (!l.active) continue;
     if (now >= l.started) l.begun = true;
     if (!l.begun) continue;
-    const auto elapsed = now < l.started ? 0 :
-        std::min<uint64_t>((now - l.started) / 1000, UINT32_MAX);
-    l.elapsed = std::max(l.elapsed, static_cast<uint32_t>(elapsed));
-    l.effect->update(l.elapsed);
+    const auto elapsed = now < l.started ? 0 : (now - l.started) / 1000;
+    l.elapsed = std::max(l.elapsed, elapsed);
+    l.effect->seek(l.elapsed);
     if (l.effect->is_finished()) l.active = false;
   }
   if (!render || !_resolver) return ESP_OK;
@@ -278,22 +379,21 @@ esp_err_t player::tick(uint64_t now, bool render) {
   });
   std::array<rgb_lighting_driver *, 32> drivers{};
   size_t count = 0;
-  for (size_t i = 0; i < _definitions.layers_count; ++i) {
-    const auto &layer = _definitions.layers[i];
-    for (size_t j = 0; j < layer.drivers_count; ++j) {
-      auto *d = _resolver(layer.drivers[j]);
-      if (std::find(drivers.begin(), drivers.begin() + count, d) == drivers.begin() + count) {
-        drivers[count++] = d;
-        auto err = d->clear(); if (err != ESP_OK) return err;
-      }
+  for (size_t i = 0; i < _definitions.output_mappings_count; ++i) {
+    auto *d = _resolver(_definitions.output_mappings[i].driver);
+    if (std::find(drivers.begin(), drivers.begin() + count, d) == drivers.begin() + count) {
+      drivers[count++] = d;
+      auto err = d->clear(); if (err != ESP_OK) return err;
     }
   }
   for (size_t j = 0; j < _definitions.layers_count; ++j) {
     size_t i = order[j];
     if (_layers[i].active && _layers[i].begun) {
-      const auto &layer = _definitions.layers[i];
-      for (size_t k = 0; k < layer.drivers_count; ++k) {
-        auto err = _layers[i].effect->render(*_resolver(layer.drivers[k]));
+      for (size_t k = 0; k < _definitions.output_mappings_count; ++k) {
+        const auto &mapping = _definitions.output_mappings[k];
+        auto *driver = _resolver(mapping.driver);
+        linear_lighting_driver_view view(*driver, mapping.from, mapping.to, _definitions.canvas_size);
+        auto err = _layers[i].effect->render(view);
         if (err != ESP_OK) return err;
       }
     }

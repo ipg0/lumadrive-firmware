@@ -9,6 +9,7 @@
 
 namespace matrix {
 constexpr size_t MAX_BYTES = 16384;
+constexpr uint32_t SCHEMA_VERSION = 2;
 constexpr uint64_t LEAD_US = 100000;
 constexpr uint64_t TRANSFER_TIMEOUT_US = 5000000;
 using matrix_config = mesh_interop_MatrixConfig;
@@ -16,6 +17,7 @@ using animation_definitions = mesh_interop_AnimationDefinitions;
 using animation_command = mesh_interop_AnimationCommand;
 using animation_snapshot = mesh_interop_AnimationSnapshot;
 using matrix_effect = mesh_interop_MatrixEffect;
+using output_mapping = mesh_interop_AnimationOutputMapping;
 using driver_resolver = rgb_lighting_driver *(*)(uint32_t);
 
 uint32_t crc32(const uint8_t *data, size_t length);
@@ -46,6 +48,9 @@ private:
 const char *validate(const matrix_config &config, const uint8_t master_mac[6]);
 animation_definitions definitions_for(const matrix_config &config, const uint8_t *node_mac,
                             uint64_t session, uint64_t revision);
+// Heap-backed to keep keyframe buffers off the worker stack; nullptr on allocation failure.
+std::unique_ptr<animation_definitions> make_definitions(const matrix_config &config,
+    const uint8_t *node_mac, uint64_t session, uint64_t revision);
 
 // One reusable instance per layer; commands and snapshots never evaluate rules.
 class player {
@@ -65,7 +70,7 @@ private:
     bool active = false;
     bool begun = false;
     uint64_t started = 0;
-    uint32_t elapsed = 0;
+    uint64_t elapsed = 0;
   };
   int find(uint32_t id) const;
   animation_definitions _definitions{};

@@ -1,4 +1,4 @@
-# Distributed matrix protocol v1
+# Distributed matrix protocol
 
 The master owns the full protobuf `MatrixConfig`, persisted in NVS as one
 versioned, checksummed record. Only the master evaluates sources and conditions.
@@ -8,18 +8,23 @@ playback loop after connected drivers and ESP-NOW have initialized.
 
 ## Configuration
 
-Use schema version 1, nonzero IDs unique within each definition category, and
+Use schema version 2, nonzero IDs unique within each definition category, and
 valid effect/source/condition references. Limits are 32 entries, 32 definitions
-per category, 17 targets per entry, and 16 KiB encoded bytes. Targets are unique
-node/driver pairs; one entry may drive both outputs of a node. Driver IDs are WS2812
+per category, 34 layout elements on 17 nodes, and 16 KiB encoded bytes.
+`MatrixConfig.layout` describes the one physical arrangement of the car, and
+every animation renders on its complete canvas. Entries have no output targets.
+See [Car layout](layout.md) for boundary indices, reversal, overlap, and examples.
+Driver IDs are WS2812
 `1` and HC595 `2`; pin assignments remain in `connected_lighting_drivers`.
 
-Supported types are static color (RGBA 0–255, duration in milliseconds; zero
-duration holds indefinitely), default state, local or slave GPIO edges, and always
+Supported effects are static color, addressed RGBA keyframes, blink, breathe,
+and flowing gradient; see [Animation effects](animations.md) for parameters.
+Duration is in milliseconds; zero runs indefinitely. Sources include default
+state and local or slave GPIO edges, with always
 conditions. Set alpha explicitly: protobuf's default zero is transparent.
 GPIO inputs use external biasing, with internal pulls disabled. Role/discovery,
 flash, and connected-driver pins cannot be used as trigger inputs. GPIO sources
-identify the owning node's ESP-NOW MAC; remote sources and targets must be paired.
+identify the owning node's ESP-NOW MAC; remote source and layout nodes must be paired.
 All nodes currently share the firmware wiring configuration. The owning slave
 validates its input pins again before accepting definitions. Empty matrices clear existing layers.
 Input-only slaves receive definitions and snapshots even with no output layers.
@@ -78,7 +83,7 @@ offset; conflicting metadata, size violations, and invalid CRCs are rejected.
 Only paired senders are accepted; slaves accept playback traffic only from their
 configured master after clock synchronization. Radio callbacks enqueue bounded
 copies; the worker processes command/ACK and GPIO event/ACK traffic before bulk chunks.
-Legacy 20-byte HELLO bodies remain accepted, but remote GPIO requires updated firmware.
+HELLO bodies must contain all 29 bytes, including the GPIO stream and loss flag.
 
 ## Slave GPIO reporting
 
@@ -125,8 +130,9 @@ Per-node command streams are ordered and acknowledged. Sequence gaps, exhausted
 retries, and queue pressure request recovery snapshots containing active layers
 and pending transitions. Reconnecting slaves retain the original start times.
 Master reboot restores the matrix under a new session; slaves clear old-session
-state and await new definitions. Upgrade all nodes together: heartbeat payloads
-now carry both master time and boot session.
+state and await new definitions. Only the current configuration and protocol
+formats are supported. During development, update all nodes and the control app
+together and discard incompatible saved configurations; no migration is provided.
 
 ## Validation
 

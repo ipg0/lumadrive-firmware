@@ -11,6 +11,7 @@
 #include <mutex>
 #include <cstring>
 #include <cstdio>
+#include <new>
 #include <esp_log.h>
 #include <esp_now.h>
 #include <esp_random.h>
@@ -151,6 +152,15 @@ public:
   }
   const char *platform_validate(const matrix_config &c, bool check_peers) {
     if (auto e = validate(c, mac)) return e;
+    for (size_t i = 0; i < c.layout_count; ++i) {
+      const auto &m = c.layout[i];
+      if (!memcmp(m.node_mac, mac, 6)) {
+        auto *driver = connected_lighting_drivers::find(m.driver);
+        if (!driver || std::max(m.from, m.to) - std::min(m.from, m.to) != driver->get_pixel_count())
+          return "Layout span does not match local driver length";
+      } else if (check_peers && !mesh_interop::instance().slave_node_exists(m.node_mac))
+        return "Layout node is not paired";
+    }
     for (size_t i = 0; i < c.sources_count; ++i) {
       auto &s = c.sources[i];
       if (s.kind != mesh_interop_MatrixSource_Kind_GPIO_EDGE) continue;
@@ -159,12 +169,6 @@ public:
       if (check_peers && memcmp(s.node_mac, mac, 6) &&
           !mesh_interop::instance().slave_node_exists(s.node_mac)) return "GPIO source node is not paired";
     }
-    if (check_peers) for (size_t i = 0; i < c.entries_count; ++i)
-      for (size_t j = 0; j < c.entries[i].targets_count; ++j) {
-        auto &t = c.entries[i].targets[j];
-        if (memcmp(t.node_mac, mac, 6) && !mesh_interop::instance().slave_node_exists(t.node_mac))
-          return "Target node is not paired";
-      }
     return nullptr;
   }
   static void gpio_isr(void *arg) {
@@ -206,7 +210,8 @@ public:
     return true;
   }
   bool prepare_gpio(const matrix_config &c) {
-    return prepare_gpio(definitions_for(c, mac, session, revision));
+    auto d = make_definitions(c, mac, session, revision);
+    return d && prepare_gpio(*d);
   }
   bool save(const std::vector<uint8_t> &bytes, uint64_t rev) {
     std::vector<uint8_t> record;
@@ -220,11 +225,15 @@ public:
     nvs_close(handle); return err == ESP_OK;
   }
   bool prepare_runtime(const matrix_config &c, uint64_t rev) {
-    auto next_ledger = std::make_unique<player>();
-    auto next_local = std::make_unique<player>(connected_lighting_drivers::find);
-    auto all = definitions_for(c, nullptr, session, rev);
-    auto own = definitions_for(c, mac, session, rev);
-    if (!next_ledger->prepare(all) || !next_local->prepare(own)) return false;
+    std::unique_ptr<player> next_ledger(new (std::nothrow) player);
+    if (!next_ledger) return false;
+    auto definitions = make_definitions(c, nullptr, session, rev);
+    if (!definitions || !next_ledger->prepare(*definitions)) return false;
+    definitions.reset();
+    std::unique_ptr<player> next_local(new (std::nothrow) player(connected_lighting_drivers::find));
+    if (!next_local) return false;
+    definitions = make_definitions(c, mac, session, rev);
+    if (!definitions || !next_local->prepare(*definitions)) return false;
     prepared_ledger = std::move(next_ledger); prepared_local = std::move(next_local);
     return true;
   }
@@ -243,8 +252,8 @@ public:
         crc32(record.data() + 24, size - 24) != w::get(record.data() + 16, 4)) {
       error("Saved matrix record is invalid", true); return;
     }
-    auto c = std::make_unique<matrix_config>();
-    if (!decode(mesh_interop_MatrixConfig_fields, c.get(), record.data() + 24, size - 24) ||
+    std::unique_ptr<matrix_config> c(new (std::nothrow) matrix_config{});
+    if (!c || !decode(mesh_interop_MatrixConfig_fields, c.get(), record.data() + 24, size - 24) ||
         platform_validate(*c, false) || !prepare_gpio(*c)) {
       error("Saved matrix cannot be restored", true); return;
     }
@@ -296,8 +305,8 @@ public:
     } else if (u.which_operation == mesh_interop_MatrixUpload_commit_tag) {
       if (!ble_rx.complete(u.operation.commit)) { error("Upload is incomplete or CRC32 failed", true); return; }
       state.stage = mesh_interop_MatrixStatus_Stage_VALIDATING;
-      auto c = std::make_unique<matrix_config>();
-      if (!decode(mesh_interop_MatrixConfig_fields, c.get(), ble_rx.bytes().data(), ble_rx.bytes().size())) {
+      std::unique_ptr<matrix_config> c(new (std::nothrow) matrix_config{});
+      if (!c || !decode(mesh_interop_MatrixConfig_fields, c.get(), ble_rx.bytes().data(), ble_rx.bytes().size())) {
         error("Invalid matrix protobuf", true); ble_rx.reset(); return;
       }
       if (auto e = platform_validate(*c, true)) { error(e, true); ble_rx.reset(); return; }
@@ -370,13 +379,13 @@ public:
   }
   bool install_received() {
     if (inbound_kind == 1) {
-      auto d = std::make_unique<animation_definitions>();
-      if (!decode(mesh_interop_AnimationDefinitions_fields, d.get(), radio_rx.bytes().data(), radio_rx.bytes().size()) ||
+      std::unique_ptr<animation_definitions> d(new (std::nothrow) animation_definitions{});
+      if (!d || !decode(mesh_interop_AnimationDefinitions_fields, d.get(), radio_rx.bytes().data(), radio_rx.bytes().size()) ||
           d->master_session != session || d->revision != inbound_revision) return false;
       if (local && d->revision < local->definitions().revision) return false;
       if (pending_player && d->revision < pending_player->definitions().revision) return false;
-      auto p = std::make_unique<player>(connected_lighting_drivers::find);
-      if (!p->prepare(*d)) return false;
+      std::unique_ptr<player> p(new (std::nothrow) player(connected_lighting_drivers::find));
+      if (!p || !p->prepare(*d)) return false;
       const auto *existing = pending_player ? &pending_player->definitions() : local ? &local->definitions() : nullptr;
       if (existing && existing->revision == d->revision)
         return encode(mesh_interop_AnimationDefinitions_fields, existing) == radio_rx.bytes();
@@ -392,8 +401,8 @@ public:
     const animation_definitions *d = pending_player ? &pending_player->definitions() : local ? &local->definitions() : nullptr;
     if (!d || d->revision != s->revision) return false;
     // Prepare alongside the active player: malformed recovery never changes it.
-    auto p = std::make_unique<player>(connected_lighting_drivers::find);
-    if (!p->prepare(*d) || !p->restore(*s)) return false;
+    std::unique_ptr<player> p(new (std::nothrow) player(connected_lighting_drivers::find));
+    if (!p || !p->prepare(*d) || !p->restore(*s)) return false;
     if (local && !pending_snapshot && s->revision != local->definitions().revision)
       previous_sequence = local_sequence;
     pending_player = std::move(p); local_sequence = s->sequence;
@@ -474,11 +483,9 @@ public:
                    w::get(b + 16, 4) == p.commands.front().sequence) {
           p.commands.pop_front(); p.retries = 0; p.last_retry = 0;
         }
-      } else if (type == w::HELLO && (n == 20 || n == 29) && w::get(b, 8) == session) {
-        if (n == 29) {
-          if (!accept_gpio_stream(p, w::get(b + 20, 8))) return;
-          if (b[28]) { p.gpio_degraded = true; error("Slave reported GPIO event loss"); }
-        }
+      } else if (type == w::HELLO && n == 29 && w::get(b, 8) == session) {
+        if (!accept_gpio_stream(p, w::get(b + 20, 8))) return;
+        if (b[28]) { p.gpio_degraded = true; error("Slave reported GPIO event loss"); }
         p.seen = now;
         const auto running_revision = ledger ? ledger->definitions().revision : revision;
         if (p.ready && (w::get(b + 8, 8) != running_revision ||
@@ -545,11 +552,11 @@ public:
     for (size_t i = 0; i < config->entries_count; ++i)
       if (config->entries[i].id == command.entry_id) entry = &config->entries[i];
     if (!entry) return false;
-    for (size_t j = 0; j < entry->targets_count; ++j) {
-      auto &target = entry->targets[j];
+    for (size_t j = 0; j < config->layout_count; ++j) {
+      auto &target = config->layout[j];
       bool handled = false;
       for (size_t k = 0; k < j; ++k)
-        if (!memcmp(target.node_mac, entry->targets[k].node_mac, 6)) handled = true;
+        if (!memcmp(target.node_mac, config->layout[k].node_mac, 6)) handled = true;
       if (handled) continue; // One command drives all this entry's local outputs.
       if (!memcmp(target.node_mac, s.mac, 6)) {
         auto *p = previous ? s.local.get() : s.pending_snapshot ? s.pending_player.get() : s.local.get();
@@ -663,8 +670,9 @@ public:
       for (size_t i = 0; i < peer_count; ++i) {
         auto &p = peers[i];
         if (p.attempted || !available(p, now)) continue;
-        auto d = definitions_for(*candidate, p.mac, session, revision);
-        begin_transfer(i, 1, encode(mesh_interop_AnimationDefinitions_fields, &d));
+        auto d = make_definitions(*candidate, p.mac, session, revision);
+        if (!d) { p.attempted = true; error("Unable to allocate node definitions"); continue; }
+        begin_transfer(i, 1, encode(mesh_interop_AnimationDefinitions_fields, d.get()));
         started = true; break;
       }
       if (!started) activate(clock);
@@ -696,11 +704,12 @@ public:
           }
         }
         if (!deployment && !p.ready && !p.snapshotting && tx.peer_index < 0 && now - p.last_recover >= 1000000) {
-          auto d = definitions_for(*config, p.mac, session, revision);
-          if (!p.definitions) begin_transfer(i, 1, encode(mesh_interop_AnimationDefinitions_fields, &d));
+          auto d = make_definitions(*config, p.mac, session, revision);
+          if (!d) { p.last_recover = now; error("Unable to allocate node definitions"); continue; }
+          if (!p.definitions) begin_transfer(i, 1, encode(mesh_interop_AnimationDefinitions_fields, d.get()));
           else {
             p.commands.clear(); p.retries = 0; p.last_retry = 0;
-            auto snapshot = std::make_unique<animation_snapshot>(ledger->snapshot(d, p.sequence, activate_at));
+            auto snapshot = std::make_unique<animation_snapshot>(ledger->snapshot(*d, p.sequence, activate_at));
             begin_transfer(i, 2, encode(mesh_interop_AnimationSnapshot_fields, snapshot.get()));
           }
         }

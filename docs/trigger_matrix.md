@@ -26,6 +26,11 @@ Static-color effects fill the target driver. A duration of zero holds the color;
 a nonzero duration expires after that many milliseconds. Higher-priority
 transparent colors reveal the layers below.
 
+Keyframe descriptors interpolate RGBA, position, and width on independent spatial
+tracks, including fractional motion and wrapping. Parametric descriptors provide blink, breathe, and
+flowing gradients. See [Animation effects](animations.md) for configuration,
+addressing, looping, and native C++ examples.
+
 ```cpp
 #include "animation_trigger_table/animation_trigger_table.hpp"
 #include "animation_trigger_table/animation_effect/impl/static_color_animation_effect.hpp"

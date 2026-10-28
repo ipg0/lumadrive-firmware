@@ -20,9 +20,10 @@ public:
   }
 
   void update(uint32_t now_ms) override {
-    _finished = _duration_ms != 0 &&
-                static_cast<uint32_t>(now_ms - _started_at_ms) >= _duration_ms;
+    seek(static_cast<uint32_t>(now_ms - _started_at_ms));
   }
+
+  void seek(uint64_t elapsed_ms) override { _finished = _duration_ms && elapsed_ms >= _duration_ms; }
 
   bool is_finished() const override { return _finished; }
 

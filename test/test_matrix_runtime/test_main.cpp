@@ -1,5 +1,7 @@
 #include "matrix_runtime/matrix_core.hpp"
 #include "matrix_runtime/matrix_wire.hpp"
+#include "animation_trigger_table/animation_effect/impl/keyframe_animation_effect.hpp"
+#include "animation_trigger_table/animation_effect/impl/periodic_animation_effect.hpp"
 #include <cassert>
 #include <cstring>
 #include <cstdio>
@@ -7,17 +9,24 @@
 using namespace matrix;
 const uint8_t master_mac[6] = {2, 1, 2, 3, 4, 5};
 const uint8_t slave_mac[6] = {4, 1, 2, 3, 4, 5};
+mesh_interop_MatrixLayout layout_row(const uint8_t *mac, mesh_interop_MatrixDriver driver,
+                                    uint32_t from, uint32_t to) {
+  mesh_interop_MatrixLayout row{}; memcpy(row.node_mac, mac, 6);
+  row.driver = driver; row.from = from; row.to = to; return row;
+}
 matrix_config fixture() {
-  matrix_config c{}; c.schema_version = 1;
-  c.effects_count = 1; c.effects[0] = {1, mesh_interop_MatrixEffect_Kind_STATIC_COLOR, 255, 0, 0, 255, 100};
+  matrix_config c{}; c.schema_version = SCHEMA_VERSION;
+  c.effects_count = 1; auto &effect = c.effects[0];
+  effect.id = 1; effect.kind = mesh_interop_MatrixEffect_Kind_STATIC_COLOR;
+  effect.red = 255; effect.alpha = 255; effect.duration_ms = 100;
   c.sources_count = 1; auto &s = c.sources[0];
   s.id = 2; s.kind = mesh_interop_MatrixSource_Kind_GPIO_EDGE; s.gpio = 12; s.rising = true;
   memcpy(s.node_mac, master_mac, 6);
   c.conditions_count = 1; c.conditions[0] = {3, mesh_interop_MatrixCondition_Kind_ALWAYS};
   c.entries_count = 1; auto &e = c.entries[0];
   e.id = 4; e.effect_id = 1; e.source_id = 2; e.condition_id = 3; e.priority = 10;
-  e.targets_count = 1; memcpy(e.targets[0].node_mac, slave_mac, 6);
-  e.targets[0].driver = mesh_interop_MatrixDriver_WS2812;
+  c.layout_count = 1; memcpy(c.layout[0].node_mac, slave_mac, 6);
+  c.layout[0].driver = mesh_interop_MatrixDriver_WS2812; c.layout[0].to = 1;
   return c;
 }
 class fake_driver : public rgb_lighting_driver {
@@ -85,10 +94,10 @@ void test_schema_validation() {
   c.sources[0].node_mac[0] |= 1; assert(validate(c, master_mac));
   memset(c.sources[0].node_mac, 0, 6); assert(validate(c, master_mac));
   c = fixture(); c.sources[0].gpio = 40; assert(validate(c, master_mac));
-  c = fixture(); c.entries[0].targets[0].driver = mesh_interop_MatrixDriver_DRIVER_UNSPECIFIED;
+  c = fixture(); c.layout[0].driver = mesh_interop_MatrixDriver_DRIVER_UNSPECIFIED;
   assert(validate(c, master_mac));
   c = fixture(); c.effects[0].alpha = 256; assert(validate(c, master_mac));
-  c = fixture(); c.schema_version = 2; assert(validate(c, master_mac));
+  c = fixture(); c.schema_version = 1; assert(validate(c, master_mac));
 }
 void test_scheduled_player() {
   auto config = fixture(); auto d = definitions_for(config, slave_mac, 10, 20);
@@ -146,13 +155,13 @@ void test_layering() {
   p.tick(120000); red(true);
 }
 void test_one_entry_two_drivers() {
-  auto config = fixture(); auto &entry = config.entries[0];
-  entry.targets_count = 2; entry.targets[1] = entry.targets[0];
+  auto config = fixture();
+  config.layout_count = 2; config.layout[1] = config.layout[0];
   assert(validate(config, master_mac)); // Exact duplicate is invalid.
-  entry.targets[1].driver = mesh_interop_MatrixDriver_HC595;
+  config.layout[1].driver = mesh_interop_MatrixDriver_HC595;
   assert(!validate(config, master_mac));
   auto d = definitions_for(config, slave_mac, 10, 20);
-  assert(d.layers_count == 1 && d.layers[0].drivers_count == 2);
+  assert(d.layers_count == 1 && d.output_mappings_count == 2);
   player p(resolve); assert(p.prepare(d)); assert(p.enqueue(start()));
   const auto first = output.shows, second = output_secondary.shows;
   p.tick(100000);
@@ -162,7 +171,7 @@ void test_one_entry_two_drivers() {
 void test_node_input_definitions() {
   auto c = fixture(); memcpy(c.sources[0].node_mac, slave_mac, 6);
   c.sources[1] = c.sources[0]; c.sources[1].id = 8; c.sources[1].rising = false; c.sources_count = 2;
-  memcpy(c.entries[0].targets[0].node_mac, master_mac, 6);
+  memcpy(c.layout[0].node_mac, master_mac, 6);
   assert(!validate(c, master_mac));
   auto d = definitions_for(c, slave_mac, 10, 20);
   assert(d.layers_count == 0 && d.gpio_inputs_count == 1 && d.gpio_inputs[0] == 12);
@@ -175,11 +184,263 @@ void test_node_input_definitions() {
   decoded.gpio_inputs_count = 2; decoded.gpio_inputs[1] = 12; assert(!p.prepare(decoded));
   decoded.gpio_inputs_count = 1; decoded.gpio_inputs[0] = 40; assert(!p.prepare(decoded));
 }
+mesh_interop_MatrixKeyframe keyframe(uint32_t at, uint8_t red, uint8_t green, uint8_t blue,
+    uint8_t alpha, mesh_interop_MatrixInterpolation interpolation, uint32_t track = 0,
+    float position = 0, float width = 1) {
+  mesh_interop_MatrixKeyframe frame{};
+  frame.time_ms = at; frame.red = red; frame.green = green; frame.blue = blue; frame.alpha = alpha;
+  frame.interpolation = interpolation; frame.track_id = track; frame.position = position;
+  frame.has_width = true; frame.width = width;
+  return frame;
+}
+matrix_config keyframe_fixture() {
+  auto c = fixture(); auto &e = c.effects[0];
+  e.kind = mesh_interop_MatrixEffect_Kind_KEYFRAMES; e.duration_ms = 0;
+  e.keyframes_count = 3; e.loop = true;
+  e.keyframes[0] = keyframe(0, 255, 0, 0, 255, mesh_interop_MatrixInterpolation_LINEAR);
+  e.keyframes[1] = keyframe(500, 0, 0, 255, 255, mesh_interop_MatrixInterpolation_SMOOTH);
+  e.keyframes[2] = keyframe(1000, 255, 0, 0, 255, mesh_interop_MatrixInterpolation_STEP);
+  return c;
+}
+void test_effect_validation_and_roundtrip() {
+  auto c = keyframe_fixture(); assert(!validate(c, master_mac));
+  const auto bytes = encode(mesh_interop_MatrixConfig_fields, &c);
+  matrix_config decoded{};
+  assert(decode(mesh_interop_MatrixConfig_fields, &decoded, bytes.data(), bytes.size()));
+  assert(decoded.effects[0].keyframes[1].interpolation == mesh_interop_MatrixInterpolation_SMOOTH);
+  assert(decoded.effects[0].keyframes[1].blue == 255 && decoded.effects[0].loop);
+  c.effects[0].keyframes[3] = keyframe(0, 0, 255, 0, 255, mesh_interop_MatrixInterpolation_LINEAR, 1, 3, 2);
+  c.effects[0].keyframes[4] = keyframe(1000, 255, 0, 255, 255, mesh_interop_MatrixInterpolation_LINEAR, 1, 9.5, 0);
+  c.effects[0].keyframes_count = 5; assert(!validate(c, master_mac));
+  const auto spatial_bytes = encode(mesh_interop_MatrixConfig_fields, &c);
+  assert(decode(mesh_interop_MatrixConfig_fields, &decoded, spatial_bytes.data(), spatial_bytes.size()));
+  assert(decoded.effects[0].keyframes[4].track_id == 1 && decoded.effects[0].keyframes[4].position == 9.5);
+  assert(decoded.effects[0].keyframes[4].has_width && decoded.effects[0].keyframes[4].width == 0);
+  c.effects[0].keyframes[3].wrap = true; // Track settings must agree at each frame.
+  assert(validate(c, master_mac));
+  c = keyframe_fixture();
+  c.effects[0].keyframes[1].time_ms = 0; assert(validate(c, master_mac));
+  c = keyframe_fixture(); c.effects[0].keyframes[0].time_ms = 1; assert(validate(c, master_mac));
+  c = keyframe_fixture(); c.effects[0].keyframes_count = 1; assert(validate(c, master_mac));
+  c = keyframe_fixture(); c.effects[0].keyframes_count = 17; assert(validate(c, master_mac));
+  c = keyframe_fixture(); c.effects[0].keyframes[0].interpolation = static_cast<mesh_interop_MatrixInterpolation>(99);
+  assert(validate(c, master_mac));
+  auto d = definitions_for(c, slave_mac, 10, 20); player invalid;
+  assert(!invalid.prepare(d)); // Slave validates definitions independently.
+  c = fixture(); c.effects[0].kind = mesh_interop_MatrixEffect_Kind_BLINK;
+  assert(!validate(c, master_mac)); c.effects[0].period_ms = 1; assert(validate(c, master_mac));
+  c.effects[0].period_ms = 2; c.effects[0].duty_percent = 101; assert(validate(c, master_mac));
+  c.effects[0].duty_percent = 100; assert(!validate(c, master_mac));
+  c.effects[0].kind = mesh_interop_MatrixEffect_Kind_FLOWING_GRADIENT; assert(validate(c, master_mac));
+  c.effects[0].has_secondary_color = true; c.effects[0].secondary_color = {0, 0, 255, 128};
+  assert(!validate(c, master_mac));
+  c = fixture(); c.effects[0].kind = static_cast<mesh_interop_MatrixEffect_Kind>(99);
+  assert(validate(c, master_mac));
+  c = keyframe_fixture(); c.effects[0].kind = mesh_interop_MatrixEffect_Kind_STATIC_COLOR;
+  assert(validate(c, master_mac));
+}
+void test_animated_player_phase_and_snapshots() {
+  auto config = keyframe_fixture(); auto d = definitions_for(config, slave_mac, 10, 20);
+  player original(resolve), recovered(resolve); assert(original.prepare(d) && recovered.prepare(d));
+  assert(original.enqueue(start())); original.tick(350000);
+  assert(output.shown.r == 128 && output.shown.b == 128);
+  auto state = original.snapshot(d, 1, 0); assert(recovered.restore(state));
+  recovered.tick(350000); assert(output.shown.r == 128 && output.shown.b == 128);
+  recovered.tick(225000); assert(output.shown.r == 128 && output.shown.b == 128); // Clamp backwards.
+  recovered.tick(600000); assert(output.shown.b == 255);
+  assert(recovered.enqueue(start(700000))); recovered.tick(700000); red(true); // Retrigger resets phase.
+  const auto long_elapsed_ms = uint64_t(UINT32_MAX) + 455; // 4,294,967,750 -> phase 750 ms.
+  original.tick(100000 + long_elapsed_ms * 1000);
+  assert(output.shown.r == 128 && output.shown.b == 128);
+
+  for (const auto kind : {mesh_interop_MatrixEffect_Kind_BLINK, mesh_interop_MatrixEffect_Kind_BREATHE,
+                         mesh_interop_MatrixEffect_Kind_FLOWING_GRADIENT}) {
+    config = fixture(); auto &e = config.effects[0]; e.kind = kind; e.duration_ms = 0;
+    e.period_ms = 1000; e.has_secondary_color = true; e.secondary_color = {0, 0, 255, 255};
+    d = definitions_for(config, slave_mac, 10, 20);
+    assert(original.prepare(d) && recovered.prepare(d)); assert(original.enqueue(start()));
+    original.tick(350000); const auto expected = output.shown;
+    state = original.snapshot(d, 1, 0); assert(recovered.restore(state)); recovered.tick(350000);
+    assert(output.shown.r == expected.r && output.shown.b == expected.b);
+    if (kind == mesh_interop_MatrixEffect_Kind_BREATHE) assert(expected.r == 128);
+    if (kind == mesh_interop_MatrixEffect_Kind_FLOWING_GRADIENT) assert(expected.r == 128 && expected.b == 128);
+    auto stop = start(400000); stop.stop = true; assert(recovered.enqueue(stop));
+    recovered.tick(400000); red(false); assert(output.shown.b == 0);
+    e.duration_ms = 200; d = definitions_for(config, slave_mac, 10, 20);
+    assert(recovered.prepare(d) && recovered.enqueue(start())); recovered.tick(500000);
+    red(false); assert(output.shown.b == 0); // Finite animations already expired on arrival.
+  }
+}
+class motion_test_driver : public rgb_lighting_driver {
+public:
+  std::array<color, 4> pixels{}, shown{};
+  esp_err_t init() override { return ESP_OK; }
+  esp_err_t deinit() override { return ESP_OK; }
+  size_t get_pixel_count() const override { return pixels.size(); }
+  esp_err_t set_pixel(uint16_t i, alpha_color c) override { pixels.at(i) = c.blend_with(pixels.at(i)); return ESP_OK; }
+  esp_err_t fill(alpha_color c) override { for (size_t i = 0; i < pixels.size(); ++i) set_pixel(i, c); return ESP_OK; }
+  esp_err_t clear() override { pixels = {}; return ESP_OK; }
+  esp_err_t show() override { shown = pixels; return ESP_OK; }
+  esp_err_t set_global_brightness(uint8_t) override { return ESP_OK; }
+  bool _is_ready() const override { return true; }
+} motion_output;
+rgb_lighting_driver *resolve_motion(uint32_t id) { return id == 1 ? &motion_output : nullptr; }
+void test_motion_phase_recovery() {
+  auto c = keyframe_fixture(); c.layout[0].to = 4;
+  auto &e = c.effects[0]; e.keyframes_count = 2;
+  e.keyframes[0] = keyframe(0, 255, 0, 0, 255, mesh_interop_MatrixInterpolation_LINEAR, 5, 0);
+  e.keyframes[1] = keyframe(1000, 255, 0, 0, 255, mesh_interop_MatrixInterpolation_LINEAR, 5, 4);
+  e.keyframes[0].wrap = e.keyframes[1].wrap = true;
+  auto d = definitions_for(c, slave_mac, 10, 20);
+  player original(resolve_motion), recovered(resolve_motion);
+  assert(original.prepare(d) && recovered.prepare(d) && original.enqueue(start()));
+  original.tick(225000); // 125 ms of playback, position 0.5.
+  assert(motion_output.shown[0].r == 128 && motion_output.shown[1].r == 128);
+  assert(motion_output.shown[2].r == 0 && motion_output.shown[3].r == 0);
+  auto snapshot = original.snapshot(d, 1, 0); assert(recovered.restore(snapshot));
+  recovered.tick(975000); // Late recovery at position 3.5, including seam coverage.
+  assert(motion_output.shown[0].r == 128 && motion_output.shown[3].r == 128);
+  recovered.tick(875000); // Backward correction preserves motion phase.
+  assert(motion_output.shown[0].r == 128 && motion_output.shown[3].r == 128);
+  recovered.tick(1100000); assert(motion_output.shown[0].r == 255 && motion_output.shown[3].r == 0);
+  const auto elapsed = uint64_t(UINT32_MAX) + 830; // Phase 125 ms after 32-bit millisecond rollover.
+  recovered.tick(100000 + elapsed * 1000);
+  assert(motion_output.shown[0].r == 128 && motion_output.shown[1].r == 128);
+}
+void test_expanded_definition_limit() {
+  auto c = keyframe_fixture(); auto &effect = c.effects[0]; effect.keyframes_count = 16;
+  for (size_t i = 0; i < effect.keyframes_count; ++i) {
+    effect.keyframes[i] = keyframe(i * 200000000, 255, 255, 255, 255,
+        mesh_interop_MatrixInterpolation_SMOOTH, UINT32_MAX, i % 2 ? 1000000 : -1000000, 65536);
+    effect.keyframes[i].wrap = true;
+  }
+  for (size_t i = 1; i < 32; ++i) { c.entries[i] = c.entries[0]; c.entries[i].id += i; }
+  c.entries_count = 32;
+  assert(!encode(mesh_interop_MatrixConfig_fields, &c).empty());
+  const auto error = validate(c, master_mac);
+  assert(error && !strcmp(error, "Node animation definitions exceed 16 KiB"));
+}
+void test_layout_validation() {
+  auto c = fixture(); c.layout_count = 0; assert(validate(c, master_mac));
+  c = fixture(); c.layout[0].from = 1; assert(validate(c, master_mac));
+  c = fixture(); c.layout[0].to = 65537; assert(validate(c, master_mac));
+  c = fixture(); c.layout[0].from = 12; c.layout[0].to = 10; assert(!validate(c, master_mac));
+  auto d = definitions_for(c, slave_mac, 10, 20);
+  assert(d.canvas_size == 12 && d.output_mappings[0].from == 12 && d.output_mappings[0].to == 10);
+  player p(resolve); assert(!p.prepare(d)); // Physical length is one in this adapter, not two.
+  d.output_mappings[0].to = 11; assert(p.prepare(d));
+  d.canvas_size = 11; assert(!p.prepare(d));
+  d.canvas_size = 65537; assert(!p.prepare(d));
+  d.canvas_size = 12; d.output_mappings_count = 0; assert(!p.prepare(d));
+  c = fixture(); memset(c.layout[0].node_mac, 0, 6); assert(validate(c, master_mac));
+  c = fixture(); c.layout[0].node_mac[0] |= 1; assert(validate(c, master_mac));
+  c = fixture(); c.layout[0].driver = static_cast<mesh_interop_MatrixDriver>(99); assert(validate(c, master_mac));
+  c = fixture(); c.layout_count = 2; c.layout[1] = c.layout[0]; assert(validate(c, master_mac));
+  c.layout[1].driver = mesh_interop_MatrixDriver_HC595; assert(!validate(c, master_mac)); // Overlap is valid.
+  d = definitions_for(c, slave_mac, 10, 20);
+  d.output_mappings[1].driver = d.output_mappings[0].driver; assert(!p.prepare(d));
+  c.layout_count = 35; assert(validate(c, master_mac));
+  c = fixture(); c.entries_count = 0; d = definitions_for(c, slave_mac, 10, 20);
+  assert(p.prepare(d)); output.pixel = color(255, 0, 0);
+  p.tick(0); red(false); // An empty animation matrix still clears the configured car outputs.
+}
+class canvas_test_driver : public rgb_lighting_driver {
+public:
+  explicit canvas_test_driver(size_t count) : pixels(count), shown(count) {}
+  std::vector<color> pixels, shown;
+  unsigned clears = 0, shows = 0;
+  esp_err_t init() override { return ESP_OK; }
+  esp_err_t deinit() override { return ESP_OK; }
+  size_t get_pixel_count() const override { return pixels.size(); }
+  esp_err_t set_pixel(uint16_t pixel, alpha_color c) override {
+    pixels.at(pixel) = c.blend_with(pixels.at(pixel)); return ESP_OK;
+  }
+  esp_err_t fill(alpha_color c) override { for (auto &pixel : pixels) pixel = c.blend_with(pixel); return ESP_OK; }
+  esp_err_t clear() override { std::fill(pixels.begin(), pixels.end(), color()); ++clears; return ESP_OK; }
+  esp_err_t show() override { shown = pixels; ++shows; return ESP_OK; }
+  esp_err_t set_global_brightness(uint8_t) override { return ESP_OK; }
+  bool _is_ready() const override { return true; }
+};
+canvas_test_driver canvas_strip_a(4), canvas_strip_b(4), canvas_block(2);
+rgb_lighting_driver *resolve_canvas_a(uint32_t id) {
+  return id == 1 ? &canvas_strip_a : id == 2 ? &canvas_block : nullptr;
+}
+rgb_lighting_driver *resolve_canvas_b(uint32_t id) { return id == 1 ? &canvas_strip_b : nullptr; }
+void assert_canvas_projection(const canvas_test_driver &reference) {
+  const auto same = [](color a, color b) { return a.r == b.r && a.g == b.g && a.b == b.b; };
+  for (size_t i = 0; i < 4; ++i) {
+    assert(same(canvas_strip_a.shown[i], reference.pixels[i]));
+    assert(same(canvas_strip_b.shown[i], reference.pixels[7 - i]));
+  }
+  assert(same(canvas_block.shown[0], reference.pixels[2]));
+  assert(same(canvas_block.shown[1], reference.pixels[1]));
+}
+void test_shared_canvas_motion_and_gradient() {
+  auto c = keyframe_fixture(); c.layout_count = 3;
+  c.layout[0] = layout_row(slave_mac, mesh_interop_MatrixDriver_WS2812, 0, 4);
+  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_HC595, 3, 1);
+  c.layout[2] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 8, 4);
+  auto &effect = c.effects[0]; effect.keyframes_count = 2;
+  effect.keyframes[0] = keyframe(0, 255, 0, 0, 255, mesh_interop_MatrixInterpolation_LINEAR, 1, 0);
+  effect.keyframes[1] = keyframe(2000, 255, 0, 0, 255, mesh_interop_MatrixInterpolation_LINEAR, 1, 8);
+  effect.keyframes[0].wrap = effect.keyframes[1].wrap = true;
+  assert(!validate(c, master_mac));
+  auto a = make_definitions(c, slave_mac, 10, 20), b = make_definitions(c, master_mac, 10, 20);
+  assert(a->canvas_size == 8 && b->canvas_size == 8 && a->output_mappings_count == 2);
+  player node_a(resolve_canvas_a), node_b(resolve_canvas_b), recovered(resolve_canvas_a);
+  assert(node_a.prepare(*a) && node_b.prepare(*b) && recovered.prepare(*a));
+  assert(node_a.enqueue(start()) && node_b.enqueue(start()));
+  canvas_test_driver reference(8);
+  animation_keyframe frames[] = {
+    {0, alpha_color(color(255, 0, 0)), animation_interpolation::LINEAR, 1, 0, 1, true},
+    {2000, alpha_color(color(255, 0, 0)), animation_interpolation::LINEAR, 1, 8, 1, true}
+  };
+  animation_effect_descriptor<animation_effect_type::KEYFRAMES> descriptor(frames, 2, true);
+  std::unique_ptr<animation_effect_instance_base> expected(descriptor.create_instance());
+  for (uint64_t elapsed : {0, 500, 1000, 1750, 1875, 2000, 2500}) {
+    reference.clear(); expected->seek(elapsed); expected->render(reference);
+    node_a.tick(100000 + elapsed * 1000); node_b.tick(100000 + elapsed * 1000);
+    assert_canvas_projection(reference);
+  }
+  const auto snapshot = node_a.snapshot(*a, 1, 0); assert(recovered.restore(snapshot));
+  reference.clear(); expected->seek(3875); expected->render(reference);
+  recovered.tick(3975000); node_b.tick(3975000); assert_canvas_projection(reference);
+  assert(canvas_strip_a.shown[0].r == 128 && canvas_strip_b.shown[0].r == 128); // Global seam, not driver seam.
+  effect = {}; effect.id = 1; effect.kind = mesh_interop_MatrixEffect_Kind_FLOWING_GRADIENT;
+  effect.red = 255; effect.alpha = 255; effect.has_secondary_color = true; effect.secondary_color = {0, 0, 255, 255};
+  a = make_definitions(c, slave_mac, 10, 20); b = make_definitions(c, master_mac, 10, 20);
+  assert(node_a.prepare(*a) && node_b.prepare(*b) && node_a.enqueue(start()) && node_b.enqueue(start()));
+  periodic_animation_options options; options.primary = alpha_color(color(255, 0, 0));
+  options.secondary = alpha_color(color(0, 0, 255));
+  animation_effect_descriptor<animation_effect_type::FLOWING_GRADIENT> gradient(options);
+  expected.reset(gradient.create_instance());
+  for (uint64_t elapsed : {0, 250, 500, 750, 1000}) {
+    reference.clear(); expected->seek(elapsed); expected->render(reference);
+    node_a.tick(100000 + elapsed * 1000); node_b.tick(100000 + elapsed * 1000);
+    assert_canvas_projection(reference);
+  }
+  // Every layer reaches every configured output, even outputs overlapping others.
+  c.effects_count = 2; c.effects[1].id = 8; c.effects[1].kind = mesh_interop_MatrixEffect_Kind_STATIC_COLOR;
+  c.effects[1].blue = 255; c.effects[1].alpha = 128;
+  c.entries_count = 2; c.entries[1] = c.entries[0]; c.entries[1].id = 5; c.entries[1].effect_id = 8; c.entries[1].priority = 20;
+  a = make_definitions(c, slave_mac, 10, 20); b = make_definitions(c, master_mac, 10, 20);
+  assert(a->layers_count == 2 && b->layers_count == 2);
+  assert(node_a.prepare(*a) && node_b.prepare(*b));
+  auto overlay = start(); overlay.entry_id = 5;
+  assert(node_a.enqueue(overlay) && node_b.enqueue(overlay));
+  node_a.tick(100000); node_b.tick(100000);
+  for (auto *driver : {&canvas_strip_a, &canvas_strip_b, &canvas_block})
+    for (auto pixel : driver->shown) assert(pixel.r == 0 && pixel.b == 128);
+}
 int main() {
   test_transfer(); test_schema_validation(); test_scheduled_player();
   test_master_evaluation_and_recovery(); test_layering();
   test_one_entry_two_drivers();
   test_node_input_definitions();
+  test_effect_validation_and_roundtrip(); test_animated_player_phase_and_snapshots();
+  test_motion_phase_recovery();
+  test_expanded_definition_limit();
+  test_layout_validation(); test_shared_canvas_motion_and_gradient();
   std::puts("Matrix runtime: transfer, schema, scheduling, recovery, and layering passed.");
   return 0;
 }

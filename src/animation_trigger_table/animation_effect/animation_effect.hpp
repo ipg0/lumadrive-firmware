@@ -7,6 +7,10 @@ class animation_effect_instance_base;
 
 enum class animation_effect_type {
   STATIC_COLOR = 0,
+  KEYFRAMES,
+  BLINK,
+  BREATHE,
+  FLOWING_GRADIENT,
 };
 
 class animation_effect_descriptor_base {
@@ -23,6 +27,10 @@ public:
   virtual animation_effect_type type() const = 0;
   virtual void start(uint32_t now_ms) = 0;
   virtual void update(uint32_t now_ms) = 0;
+  // Distributed playback seeks directly to a phase, including after long uptime.
+  virtual void seek(uint64_t elapsed_ms) {
+    update(elapsed_ms > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(elapsed_ms));
+  }
   virtual bool is_finished() const = 0;
   // Draw into the driver's frame buffer. The table clears and presents it.
   virtual esp_err_t render(rgb_lighting_driver &driver) const = 0;
