@@ -1,15 +1,13 @@
 #pragma once
 
 #include "../trigger_source.hpp"
-#include <driver/gpio.h>
-#include <esp_attr.h>
-#include <memory.h>
+#include <cstring>
 
 template <>
 class trigger_source<trigger_source_type::GPIO_EDGE>
     : public trigger_source_base {
 public:
-  trigger_source(uint8_t from_node_mac[6], gpio_num_t gpio_num, bool rising)
+  trigger_source(const uint8_t from_node_mac[6], gpio_num_t gpio_num, bool rising)
       : _gpio_num(gpio_num), _rising(rising) {
     memcpy(this->_from_node_mac, from_node_mac, 6);
   }
@@ -18,6 +16,9 @@ public:
     return trigger_source_type::GPIO_EDGE;
   };
   bool poll(const trigger_context &context) override {
+    if (context.gpio_edges == nullptr) {
+      return false;
+    }
     for (size_t i = 0; i < context.gpio_edges_count; i++) {
       const auto &edge = context.gpio_edges[i];
       if (edge.gpio_num == _gpio_num && edge.rising == _rising &&

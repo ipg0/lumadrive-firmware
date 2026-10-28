@@ -21,6 +21,15 @@ class ble_interop {
                        0xbf, 0xd2, 0x57, 0x2d, 0x8b, 0x4b, 0x29);
 
 private:
+  static constexpr ble_uuid128_t MATRIX_UPLOAD_UUID =
+      BLE_UUID128_INIT(0x39, 0x15, 0x9d, 0x2c, 0x61, 0x5c, 0x41, 0xdc, 0x85,
+                      0xbf, 0xd2, 0x57, 0x2e, 0x8b, 0x4b, 0x29);
+  static constexpr ble_uuid128_t MATRIX_STATUS_UUID =
+      BLE_UUID128_INIT(0x39, 0x15, 0x9d, 0x2c, 0x61, 0x5c, 0x41, 0xdc, 0x85,
+                      0xbf, 0xd2, 0x57, 0x2f, 0x8b, 0x4b, 0x29);
+  static uint16_t _matrix_status_handle;
+  static int handle_matrix_upload(uint16_t, uint16_t, struct ble_gatt_access_ctxt *, void *);
+  static int handle_matrix_status(uint16_t, uint16_t, struct ble_gatt_access_ctxt *, void *);
   static constexpr const char *TAG = "ble_interop";
   std::mutex _state_mutex;
   bool _is_ready = false;
@@ -55,7 +64,7 @@ private:
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 
-  static constexpr struct ble_gatt_svc_def gatt_service_defs[] = {
+  static constexpr struct ble_gatt_svc_def GATT_SERVICE_DEFS[] = {
       {
           .type = BLE_GATT_SVC_TYPE_PRIMARY,
           .uuid = &BLE_INTEROP_SERVICE_UUID.u,
@@ -68,6 +77,18 @@ private:
                       .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY |
                                BLE_GATT_CHR_F_READ_ENC |
                                BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC,
+                  },
+                  {
+                      .uuid = &MATRIX_UPLOAD_UUID.u,
+                      .access_cb = ble_interop::handle_matrix_upload,
+                      .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC,
+                  },
+                  {
+                      .uuid = &MATRIX_STATUS_UUID.u,
+                      .access_cb = ble_interop::handle_matrix_status,
+                      .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY |
+                               BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC,
+                      .val_handle = &_matrix_status_handle,
                   },
                   {0}, // end of characteristics
               },
@@ -84,4 +105,5 @@ public:
   }
 
   static void notify_mesh_status(struct ble_npl_event *ev);
+  static void init_matrix_notifications();
 };

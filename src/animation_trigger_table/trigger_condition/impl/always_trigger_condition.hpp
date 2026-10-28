@@ -10,7 +10,7 @@ public:
   trigger_condition_type type() const override {
     return trigger_condition_type::ALWAYS;
   };
-  bool evaluate(const trigger_context &context) const override {
+  bool evaluate(const trigger_context &) const override {
     return true;
   };
 };

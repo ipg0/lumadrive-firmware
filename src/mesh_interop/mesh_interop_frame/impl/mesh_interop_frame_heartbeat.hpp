@@ -9,7 +9,8 @@ class mesh_interop_frame<mesh_interop_frame_type::HEARTBEAT>
 
 private:
   static constexpr const char *TAG = "mesh_interop";
-  int64_t _master_timestamp;
+  int64_t _master_timestamp = 0;
+  uint64_t _session = 0;
   void apply_payload(const uint8_t *payload, size_t payload_size) override;
 
 protected:

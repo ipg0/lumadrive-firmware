@@ -10,6 +10,7 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include <nvs.h>
+#include "matrix_runtime/matrix_service.hpp"
 
 extern "C" {
 void ble_store_config_init(void);
@@ -68,6 +69,7 @@ int ble_interop::handle_ble_gap_event(struct ble_gap_event *event, void *arg) {
     return 0;
 
   case BLE_GAP_EVENT_DISCONNECT:
+    matrix_service::disconnect(event->disconnect.conn.conn_handle);
     ESP_LOGI("ble_interop", "Received BLE GAP event of type DISCONNECT");
     ESP_LOGI("ble_interop", "BLE disconnected, reason=%d",
              event->disconnect.reason);
@@ -134,8 +136,9 @@ ble_interop::ble_interop() {
   ble_store_config_init();
   ble_svc_gap_init();
   ble_svc_gatt_init();
-  ble_gatts_count_cfg(this->gatt_service_defs);
-  ble_gatts_add_svcs(this->gatt_service_defs);
+  init_matrix_notifications();
+  ble_gatts_count_cfg(this->GATT_SERVICE_DEFS);
+  ble_gatts_add_svcs(this->GATT_SERVICE_DEFS);
 
   this->ble_hs_configure();
   this->_active_conn_handle = BLE_HS_CONN_HANDLE_NONE;

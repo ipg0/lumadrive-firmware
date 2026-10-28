@@ -17,7 +17,7 @@ mesh_interop_frame_base::serialize_payload() const {
   auto *frame = reinterpret_cast<serialized_frame_t *>(
       new uint8_t[sizeof(serialized_frame_t)]);
   frame->frame_id = this->frame_id;
-  frame->magic = mesh_interop::mesh_interop_FRAME_MAGIC;
+  frame->magic = mesh_interop::MESH_INTEROP_FRAME_MAGIC;
   frame->frame_type = static_cast<uint8_t>(this->type());
   frame->payload_size = 0;
   return frame;
@@ -27,7 +27,11 @@ mesh_interop_frame_base::frame_buffer_t *
 mesh_interop_frame_base::serialize() const {
   serialized_frame_t *serialized_frame = this->serialize_payload();
 
-  uint8_t *buffer = new uint8_t[ESP_NOW_MAX_DATA_LEN_V2];
+  if (serialized_frame->payload_size > ESP_NOW_MAX_DATA_LEN - sizeof(serialized_frame_t)) {
+    delete[] reinterpret_cast<uint8_t *>(serialized_frame);
+    return nullptr;
+  }
+  uint8_t *buffer = new uint8_t[ESP_NOW_MAX_DATA_LEN];
   auto *frame = reinterpret_cast<serialized_frame_t *>(buffer);
   frame->frame_id = serialized_frame->frame_id;
   frame->magic = serialized_frame->magic;
@@ -83,10 +87,9 @@ esp_err_t mesh_interop_frame_base::send() const {
   ESP_LOGI("mesh_interop", "Sending frame with frame_id: %u",
            this->frame_id);
   mesh_interop_frame_base::frame_buffer_t *buffer = this->serialize();
+  if (!buffer) return ESP_ERR_INVALID_SIZE;
 
-  bool peer_created = esp_now_is_peer_exist(this->mac);
-
-  mesh_interop::instance().add_peer_unless_exists(this->mac);
+  bool peer_created = mesh_interop::instance().add_peer_unless_exists(this->mac);
 
   esp_err_t err =
       esp_now_send(this->mac, (const uint8_t *)buffer->data, buffer->len);
@@ -105,7 +108,7 @@ esp_err_t mesh_interop_frame_base::send() const {
 mesh_interop_frame_base *
 mesh_interop_frame_base::parse(const uint8_t *data, size_t size,
                                   const uint8_t mac[ESP_NOW_ETH_ALEN]) {
-  if (size < sizeof(serialized_frame_t)) {
+  if (size < sizeof(serialized_frame_t) || size > ESP_NOW_MAX_DATA_LEN) {
     ESP_LOGV("mesh_interop",
              "Received data is too small to be a valid frame");
     return nullptr;
@@ -114,7 +117,7 @@ mesh_interop_frame_base::parse(const uint8_t *data, size_t size,
   auto *frame =
       reinterpret_cast<serialized_frame_t *>(const_cast<uint8_t *>(data));
 
-  if (frame->magic != mesh_interop::mesh_interop_FRAME_MAGIC) {
+  if (frame->magic != mesh_interop::MESH_INTEROP_FRAME_MAGIC) {
     ESP_LOGV("mesh_interop", "Invalid magic number: 0x%08X, skipping frame",
              frame->magic);
     return nullptr;
@@ -130,7 +133,7 @@ mesh_interop_frame_base::parse(const uint8_t *data, size_t size,
     return nullptr;
   }
 
-  if (sizeof(serialized_frame_t) + frame->payload_size > size) {
+  if (frame->payload_size != size - sizeof(serialized_frame_t)) {
     ESP_LOGV("mesh_interop",
              "Invalid payload size: header=%zu payload=%zu packet=%zu",
              sizeof(serialized_frame_t), frame->payload_size, size);

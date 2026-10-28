@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../color/color.hpp"
+#include <cstddef>
 #include <cstdint>
 #include <esp_err.h>
 

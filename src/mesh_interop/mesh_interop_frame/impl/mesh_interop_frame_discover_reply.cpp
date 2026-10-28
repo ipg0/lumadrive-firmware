@@ -23,7 +23,7 @@ mesh_interop_frame<mesh_interop_frame_type::DISCOVER_REPLY>::serialize_payload()
   auto *frame = reinterpret_cast<serialized_frame_t *>(
       new uint8_t[sizeof(serialized_frame_t) + payload_size]);
   frame->frame_id = this->frame_id;
-  frame->magic = mesh_interop::mesh_interop_FRAME_MAGIC;
+  frame->magic = mesh_interop::MESH_INTEROP_FRAME_MAGIC;
   frame->frame_type = static_cast<uint8_t>(this->type());
   frame->payload_size = sizeof(_discover_frame_id);
   memcpy(frame->payload, &_discover_frame_id, sizeof(_discover_frame_id));

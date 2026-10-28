@@ -36,6 +36,7 @@ public:
   } frame_buffer_t;
 
   const uint16_t frame_id;
+  int64_t received_at_us = 0;
 
 private:
   static uint16_t _frame_id_seq;

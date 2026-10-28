@@ -13,4 +13,4 @@ public:
   virtual bool evaluate(const trigger_context &context) const = 0;
 };
 
-template <trigger_condition_type T> class trigger_condition;
+template <trigger_condition_type condition_type> class trigger_condition;

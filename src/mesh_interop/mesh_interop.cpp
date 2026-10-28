@@ -7,21 +7,43 @@
 #include <esp_log.h>
 #include <esp_wifi.h>
 #include <nvs.h>
+#include "matrix_runtime/matrix_service.hpp"
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
+
+namespace {
+struct received_frame {
+  uint8_t mac[6];
+  uint8_t data[ESP_NOW_MAX_DATA_LEN];
+  size_t size;
+  int64_t received_at;
+};
+QueueHandle_t mesh_receive_queue = nullptr;
+void mesh_receive_task(void *) {
+  received_frame packet;
+  for (;;) {
+    if (xQueueReceive(mesh_receive_queue, &packet, portMAX_DELAY) != pdTRUE) continue;
+    auto *frame = mesh_interop_frame_base::parse(packet.data, packet.size, packet.mac);
+    if (!frame) continue;
+    frame->received_at_us = packet.received_at;
+    frame->handle();
+    delete frame;
+  }
+}
+}
 
 void mesh_interop::handle_esp_now_recv(const esp_now_recv_info_t *esp_now_info,
                                        const uint8_t *data, int data_len) {
-  auto *frame =
-      mesh_interop_frame_base::parse(data, data_len, esp_now_info->src_addr);
-  if (frame == nullptr) {
-    ESP_LOGE("mesh_interop", "Failed to parse received frame");
-    return;
-  }
-
-  ESP_LOGI("mesh_interop", "Received frame with frame_id: %u", frame->frame_id);
-
-  frame->handle();
-
-  delete frame;
+  const auto received_at = esp_timer_get_time();
+  if (data_len <= 0 || data_len > ESP_NOW_MAX_DATA_LEN) return;
+  if (matrix_service::receive(esp_now_info->src_addr, data, data_len)) return;
+  received_frame packet;
+  memcpy(packet.mac, esp_now_info->src_addr, 6);
+  memcpy(packet.data, data, data_len);
+  packet.size = data_len; packet.received_at = received_at;
+  if (xQueueSend(mesh_receive_queue, &packet, 0) != pdTRUE)
+    ESP_EARLY_LOGW("mesh_interop", "Receive queue full");
 }
 
 void mesh_interop::heartbeat_timer_cb(void *arg) {
@@ -48,6 +70,10 @@ mesh_interop::mesh_interop() {
   ESP_ERROR_CHECK(esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE));
 
   ESP_ERROR_CHECK(esp_now_init());
+  mesh_receive_queue = xQueueCreate(16, sizeof(received_frame));
+  ESP_ERROR_CHECK(mesh_receive_queue ? ESP_OK : ESP_ERR_NO_MEM);
+  ESP_ERROR_CHECK(xTaskCreate(mesh_receive_task, "mesh_rx", 6144, nullptr, 6, nullptr) == pdPASS
+                      ? ESP_OK : ESP_ERR_NO_MEM);
   ESP_ERROR_CHECK(esp_now_register_recv_cb(&mesh_interop::handle_esp_now_recv));
 
   // add broadcast MAC as peer by default
@@ -119,7 +145,7 @@ mesh_interop::mesh_interop() {
     esp_timer_handle_t heartbeat_timer;
     ESP_ERROR_CHECK(esp_timer_create(&heartbeat_timer_args, &heartbeat_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(
-        heartbeat_timer, mesh_interop_HEARTBEAT_INTERVAL_US));
+        heartbeat_timer, MESH_INTEROP_HEARTBEAT_INTERVAL_US));
   }
 }
 
@@ -147,7 +173,7 @@ esp_err_t mesh_interop::start_discovery_impl() {
     ESP_ERROR_CHECK(esp_timer_create(&finish_discovery_timer_args,
                                      &finish_discovery_timer));
     ESP_ERROR_CHECK(esp_timer_start_once(
-        finish_discovery_timer, mesh_interop_MASTER_DISCOVERY_TIMEOUT_US));
+        finish_discovery_timer, MESH_INTEROP_MASTER_DISCOVERY_TIMEOUT_US));
   } else {
     this->_state.is_configured = false;
   }
@@ -315,7 +341,7 @@ mesh_interop::register_slave_node(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
     return ESP_ERR_INVALID_ARG;
   }
 
-  if (this->_state.nodes_count >= mesh_interop::mesh_interop_SLAVE_NODES_MAX) {
+  if (this->_state.nodes_count >= mesh_interop::MESH_INTEROP_SLAVE_NODES_MAX) {
     ESP_LOGE("mesh_interop", "Cannot register more slave nodes, limit reached");
     return ESP_ERR_NO_MEM;
   }
@@ -426,11 +452,11 @@ esp_err_t mesh_interop::load_state() {
     return ESP_ERR_INVALID_SIZE;
   }
 
-  if (this->_state.magic != mesh_interop::mesh_interop_NVS_MAGIC) {
+  if (this->_state.magic != mesh_interop::MESH_INTEROP_NVS_MAGIC) {
     ESP_LOGE("mesh_interop",
              "State magic mismatch, expected 0x%08X, got "
              "0x%08X",
-             mesh_interop::mesh_interop_NVS_MAGIC, this->_state.magic);
+             mesh_interop::MESH_INTEROP_NVS_MAGIC, this->_state.magic);
     return ESP_ERR_INVALID_STATE;
   }
 
@@ -442,7 +468,7 @@ esp_err_t mesh_interop::load_state() {
     return ESP_ERR_INVALID_STATE;
   }
 
-  for (size_t i = 0; i < mesh_interop_SLAVE_NODES_MAX; i++) {
+  for (size_t i = 0; i < MESH_INTEROP_SLAVE_NODES_MAX; i++) {
     this->_node_last_synced_at[i] = 0;
   }
 
@@ -458,7 +484,7 @@ esp_err_t mesh_interop::save_state() {
     return nvs_err;
   }
 
-  this->_state.magic = mesh_interop::mesh_interop_NVS_MAGIC;
+  this->_state.magic = mesh_interop::MESH_INTEROP_NVS_MAGIC;
 
   nvs_err =
       nvs_set_blob(nvs_handle, "_state", &this->_state, sizeof(this->_state));
@@ -513,12 +539,12 @@ esp_err_t mesh_interop::clear_saved_state() {
 }
 
 void mesh_interop::init_state() {
-  this->_state.magic = mesh_interop::mesh_interop_NVS_MAGIC;
+  this->_state.magic = mesh_interop::MESH_INTEROP_NVS_MAGIC;
   this->_state.is_configured = false;
   this->_state.is_master_state = global_config::instance().is_master_node();
   this->_state.nodes_count = 0;
 
-  for (size_t i = 0; i < mesh_interop_SLAVE_NODES_MAX; i++) {
+  for (size_t i = 0; i < MESH_INTEROP_SLAVE_NODES_MAX; i++) {
     this->_node_last_synced_at[i] = 0;
   }
 }

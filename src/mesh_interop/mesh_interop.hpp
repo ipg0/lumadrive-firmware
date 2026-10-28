@@ -9,12 +9,12 @@
 class mesh_interop {
 
 public:
-  static constexpr uint32_t mesh_interop_FRAME_MAGIC = 0xFAB17000;
-  static constexpr uint32_t mesh_interop_NVS_MAGIC = mesh_interop_FRAME_MAGIC;
+  static constexpr uint32_t MESH_INTEROP_FRAME_MAGIC = 0xFAB17000;
+  static constexpr uint32_t MESH_INTEROP_NVS_MAGIC = MESH_INTEROP_FRAME_MAGIC;
   static constexpr uint8_t ESP_NOW_CHANNEL = 6;
-  static constexpr uint8_t mesh_interop_SLAVE_NODES_MAX = 16;
-  static constexpr uint32_t mesh_interop_HEARTBEAT_INTERVAL_US = 1000000;
-  static constexpr uint32_t mesh_interop_MASTER_DISCOVERY_TIMEOUT_US = 20000000;
+  static constexpr uint8_t MESH_INTEROP_SLAVE_NODES_MAX = 16;
+  static constexpr uint32_t MESH_INTEROP_HEARTBEAT_INTERVAL_US = 1000000;
+  static constexpr uint32_t MESH_INTEROP_MASTER_DISCOVERY_TIMEOUT_US = 20000000;
 
   typedef struct {
     uint8_t mac[ESP_NOW_ETH_ALEN];
@@ -24,7 +24,7 @@ public:
   typedef struct {
     bool is_discovery_mode;
     uint8_t nodes_count;
-    mesh_interop_node_result_t nodes[mesh_interop_SLAVE_NODES_MAX];
+    mesh_interop_node_result_t nodes[MESH_INTEROP_SLAVE_NODES_MAX];
   } mesh_interop_state_result_t;
 
   static mesh_interop &instance() {
@@ -58,14 +58,14 @@ private:
     bool is_configured;
     bool is_master_state;
     uint8_t nodes_count;
-    mesh_interop_node_t nodes[mesh_interop_SLAVE_NODES_MAX];
+    mesh_interop_node_t nodes[MESH_INTEROP_SLAVE_NODES_MAX];
   } mesh_interop_state_t;
 
   static constexpr const char *TAG = "mesh_interop";
   std::mutex _state_mutex;
   bool _discovery_mode;
   mesh_interop_state_t _state;
-  int64_t _node_last_synced_at[mesh_interop_SLAVE_NODES_MAX];
+  int64_t _node_last_synced_at[MESH_INTEROP_SLAVE_NODES_MAX];
   void (*_mesh_state_cb)();
 
   void broadcast_discover();

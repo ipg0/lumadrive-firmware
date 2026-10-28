@@ -3,6 +3,7 @@
 #include "global_config/global_config.hpp"
 #include "master_clock_manager/master_clock_manager.hpp"
 #include "mesh_interop/mesh_interop.hpp"
+#include "matrix_runtime/matrix_service.hpp"
 #include <esp_err.h>
 
 extern "C" {
@@ -10,8 +11,8 @@ void app_main() {
   global_config::instance();
   master_clock_manager::instance();
   mesh_interop::instance();
-  ble_interop::instance();
-
   ESP_ERROR_CHECK(connected_lighting_drivers::init());
+  ESP_ERROR_CHECK(matrix_service::init());
+  ble_interop::instance();
 }
 }

@@ -16,4 +16,4 @@ public:
   virtual bool poll(const trigger_context &context) = 0;
 };
 
-template <trigger_source_type T> class trigger_source;
+template <trigger_source_type source_type> class trigger_source;

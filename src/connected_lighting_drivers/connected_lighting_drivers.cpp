@@ -8,12 +8,12 @@ namespace {
 constexpr const char *TAG = "connected_lighting_drivers";
 
 // Connected hardware: update these pins and bit mappings to match the board.
-constexpr ws2812_driver_config ws2812_cfg = {
+constexpr ws2812_driver_config WS2812_CFG = {
     .data_pin = GPIO_NUM_19,
     .led_count = 60,
 };
 
-constexpr hc595_driver_config hc595_cfg = {
+constexpr hc595_driver_config HC595_CFG = {
     .ser_pin = GPIO_NUM_23,
     .srclk_pin = GPIO_NUM_18,
     .rclk_pin = GPIO_NUM_5,
@@ -38,13 +38,26 @@ constexpr hc595_driver_config hc595_cfg = {
 
 namespace connected_lighting_drivers {
 
+bool uses_gpio(uint32_t pin) {
+  return pin == static_cast<uint32_t>(WS2812_CFG.data_pin) ||
+         pin == static_cast<uint32_t>(HC595_CFG.ser_pin) ||
+         pin == static_cast<uint32_t>(HC595_CFG.srclk_pin) ||
+         pin == static_cast<uint32_t>(HC595_CFG.rclk_pin);
+}
+
+rgb_lighting_driver *find(uint32_t id) {
+  if (id == 1) return &ws2812();
+  if (id == 2) return &hc595();
+  return nullptr;
+}
+
 rgb_lighting_driver &ws2812() {
-  static ws2812_lighting_driver driver(ws2812_cfg);
+  static ws2812_lighting_driver driver(WS2812_CFG);
   return driver;
 }
 
 rgb_lighting_driver &hc595() {
-  static bcm_74hc595_lighting_driver driver(hc595_cfg);
+  static bcm_74hc595_lighting_driver driver(HC595_CFG);
   return driver;
 }
 
