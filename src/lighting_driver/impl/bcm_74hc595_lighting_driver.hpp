@@ -4,6 +4,7 @@
 #include <cstring>
 #include <driver/gpio.h>
 #include <esp_check.h>
+#include <esp_log.h>
 #include <esp_timer.h>
 
 struct hc595_led_config {
@@ -76,13 +77,14 @@ public:
   esp_err_t set_pixel(uint16_t index, alpha_color c) override {
     if (index >= _cfg.led_count)
       return ESP_ERR_INVALID_ARG;
-    _pixels[index] = c.blend_with(_pixels[index]);
+    _pixels[index] =
+        c.alpha == 255 ? c.base_color : c.blend_with(_pixels[index]);
     return ESP_OK;
   }
 
   esp_err_t fill(alpha_color c) override {
     for (uint8_t i = 0; i < _cfg.led_count; ++i)
-      _pixels[i] = c.blend_with(_pixels[i]);
+      _pixels[i] = c.alpha == 255 ? c.base_color : c.blend_with(_pixels[i]);
     return ESP_OK;
   }
 
@@ -117,24 +119,23 @@ private:
     uint8_t byte = 0;
     for (uint8_t i = 0; i < _cfg.led_count; ++i) {
       const hc595_led_config &led = _cfg.leds[i];
-      uint8_t r = apply_brightness(_pixels[i].r);
-      uint8_t g = apply_brightness(_pixels[i].g);
-      uint8_t b = apply_brightness(_pixels[i].b);
+      const uint8_t r = apply_brightness(_pixels[i].r);
+      const uint8_t g = apply_brightness(_pixels[i].g);
+      const uint8_t b = apply_brightness(_pixels[i].b);
+
       if (led.common_is_anode) {
+        // COM is held high and the LED channel is active-low:
+        // bit=1 => channel low (LED on), bit=0 => channel high (LED off).
         byte |= (1u << led.com_bit);
-        if (!((r >> plane) & 1u))
-          byte |= (1u << led.r_bit);
-        if (!((g >> plane) & 1u))
-          byte |= (1u << led.g_bit);
-        if (!((b >> plane) & 1u))
-          byte |= (1u << led.b_bit);
+        if (((r >> plane) & 1u) == 0u) byte |= (1u << led.r_bit);
+        if (((g >> plane) & 1u) == 0u) byte |= (1u << led.g_bit);
+        if (((b >> plane) & 1u) == 0u) byte |= (1u << led.b_bit);
       } else {
-        if ((r >> plane) & 1u)
-          byte |= (1u << led.r_bit);
-        if ((g >> plane) & 1u)
-          byte |= (1u << led.g_bit);
-        if ((b >> plane) & 1u)
-          byte |= (1u << led.b_bit);
+        // COM is held low and the LED channel is active-high:
+        // bit=1 => channel high (LED on), bit=0 => channel low (LED off).
+        if (((r >> plane) & 1u) != 0u) byte |= (1u << led.r_bit);
+        if (((g >> plane) & 1u) != 0u) byte |= (1u << led.g_bit);
+        if (((b >> plane) & 1u) != 0u) byte |= (1u << led.b_bit);
       }
     }
     return byte;
@@ -145,9 +146,12 @@ private:
     for (uint8_t i = 0; i < _cfg.led_count; ++i) {
       const hc595_led_config &led = _cfg.leds[i];
       if (led.common_is_anode) {
-        byte |= (1u << led.r_bit) | (1u << led.g_bit) | (1u << led.b_bit);
+        // Common-anode LEDs are off with COM high and each channel high.
+        byte |= (1u << led.r_bit) | (1u << led.g_bit) | (1u << led.b_bit) |
+                (1u << led.com_bit);
       } else {
-        byte |= (1u << led.com_bit);
+        // Common-cathode LEDs are off with COM low and each channel low.
+        // Leave the byte at 0 for this case.
       }
     }
     return byte;
@@ -166,7 +170,8 @@ private:
   static void bcm_timer_cb(void *arg) {
     auto *self = static_cast<bcm_74hc595_lighting_driver *>(arg);
     uint8_t plane = self->_bcm_plane;
-    self->shift_out(self->compute_byte(plane));
+    uint8_t byte = self->compute_byte(plane);
+    self->shift_out(byte);
     // hold this plane for 2^plane units, then move to the next
     esp_timer_start_once(self->_timer,
                          (1u << plane) * self->_cfg.bcm_base_period_us);
