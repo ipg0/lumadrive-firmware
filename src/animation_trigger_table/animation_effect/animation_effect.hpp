@@ -11,6 +11,7 @@ enum class animation_effect_type {
   BLINK,
   BREATHE,
   FLOWING_GRADIENT,
+  RAINBOW,
 };
 
 class animation_effect_descriptor_base {

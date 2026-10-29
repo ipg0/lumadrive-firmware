@@ -26,6 +26,19 @@ inline alpha_color mix(alpha_color from, alpha_color to, uint32_t fraction) {
                            mix_channel(from.base_color.b, to.base_color.b, fraction)),
                      mix_channel(from.alpha, to.alpha, fraction));
 }
+
+inline alpha_color rainbow(uint32_t phase, uint8_t alpha) {
+  const uint32_t hue = uint64_t(phase % SCALE) * 1536 / SCALE;
+  const uint8_t rising = hue & 255, falling = 255 - rising;
+  switch (hue >> 8) {
+  case 0: return alpha_color(color(255, rising, 0), alpha);
+  case 1: return alpha_color(color(falling, 255, 0), alpha);
+  case 2: return alpha_color(color(0, 255, rising), alpha);
+  case 3: return alpha_color(color(0, falling, 255), alpha);
+  case 4: return alpha_color(color(rising, 0, 255), alpha);
+  default: return alpha_color(color(255, 0, falling), alpha);
+  }
+}
 } // namespace animation_math
 
 class timed_animation_effect_instance : public animation_effect_instance_base {

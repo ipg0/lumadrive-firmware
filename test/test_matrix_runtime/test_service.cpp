@@ -25,7 +25,7 @@ esp_err_t esp_now_send(const uint8_t *mac, const uint8_t *bytes, size_t size) {
   t.bytes.assign(bytes, bytes + size); network.push_back(std::move(t)); return ESP_OK;
 }
 esp_err_t nvs_open(const char *, int mode, nvs_handle_t *h) {
-  *h = 1; return mode == NVS_READONLY && stored.empty() ? ESP_FAIL : ESP_OK;
+  *h = 1; return mode == NVS_READONLY && stored.empty() ? ESP_ERR_NVS_NOT_FOUND : ESP_OK;
 }
 esp_err_t nvs_set_blob(nvs_handle_t, const char *, const void *data, size_t size) {
   auto *p = static_cast<const uint8_t *>(data); staged.assign(p, p + size); return ESP_OK;
@@ -52,7 +52,8 @@ mesh_interop::mesh_interop_state_result_t mesh_interop::get_state() {
   s.nodes[0].last_synced_at = fake_now; return s;
 }
 namespace connected_lighting_drivers {
-rgb_lighting_driver *find(uint32_t id) { return resolve(id); }
+driver_resolver configured_resolver = resolve;
+rgb_lighting_driver *find(uint32_t id) { return configured_resolver(id); }
 bool uses_gpio(uint32_t pin) { return pin == 5 || pin == 18 || pin == 19 || pin == 23; }
 }
 using matrix_service::service;
@@ -159,7 +160,7 @@ void test_callback_queue_limits() {
   assert(matrix_service::overflow.load());
   const auto generation = matrix_service::ble_generation.load();
   matrix_service::disconnect(1); assert(matrix_service::ble_generation.load() != generation);
-  delete matrix_service::instance; matrix_service::instance = nullptr;
+  matrix_service::instance.reset();
   delete matrix_service::ble_queue; delete matrix_service::radio_queue;
   delete matrix_service::priority_queue; delete matrix_service::gpio_queue;
 }
@@ -245,7 +246,10 @@ void test_animated_deployment_and_reconnect() {
   e.keyframes[4] = keyframe(1000, 0, 0, 255, 255, mesh_interop_MatrixInterpolation_LINEAR, 1, 5, 1);
   upload(master, c, 70); cycles(master, slave, 200, true);
   assert(slave.local && master.peers[0].ready);
-  assert(slave.local->definitions().layers[0].effect.keyframes_count == 5);
+  auto received = std::make_unique<animation_definitions>();
+  const auto &encoded = slave.local->definition_bytes();
+  assert(decode(mesh_interop_AnimationDefinitions_fields, received.get(), encoded.data(), encoded.size()));
+  assert(received->layers[0].effect.keyframes_count == 5);
   const auto started = master.activate_at;
   fake_now = started + ((fake_now - started) / 1000000 + 1) * 1000000 + 250000;
   master.playback_step(fake_now); slave.playback_step(fake_now);
@@ -473,6 +477,410 @@ void test_car_layout_distribution_and_recovery() {
   invalid = c; invalid.layout_count = 0;
   upload(master, invalid, 84); assert(master.revision == 2 && stored == saved);
 }
+void upload_editor(service &s, const pb_msgdesc_t *fields, const void *update, uint32_t id, bool matrix = false) {
+  const auto bytes = encode(fields, update);
+  const auto submit = [&](const mesh_interop_MatrixUpload &u) {
+    const auto encoded = encode(mesh_interop_MatrixUpload_fields, &u);
+    packet p{}; p.connection = 1; p.generation = matrix_service::ble_generation.load(); p.size = encoded.size();
+    memcpy(p.data, encoded.data(), encoded.size()); s.handle_upload(p, fake_now);
+  };
+  mesh_interop_MatrixUpload u{};
+  u.which_operation = matrix ? mesh_interop_MatrixUpload_matrix_begin_tag : mesh_interop_MatrixUpload_layout_begin_tag;
+  const mesh_interop_TransferBegin begin{id, uint32_t(bytes.size()), crc32(bytes.data(), bytes.size())};
+  if (matrix) u.operation.matrix_begin = begin; else u.operation.layout_begin = begin;
+  submit(u);
+  for (size_t offset = 0; offset < bytes.size();) {
+    u = {}; u.which_operation = mesh_interop_MatrixUpload_chunk_tag;
+    auto &chunk = u.operation.chunk; chunk.transfer_id = id; chunk.offset = offset;
+    chunk.data.size = std::min<size_t>(200, bytes.size() - offset);
+    memcpy(chunk.data.bytes, bytes.data() + offset, chunk.data.size); submit(u); offset += chunk.data.size;
+  }
+  u = {}; u.which_operation = mesh_interop_MatrixUpload_commit_tag; u.operation.commit = id; submit(u);
+}
+void upload_layout(service &s, const mesh_interop_LayoutUpdate &update, uint32_t id) {
+  upload_editor(s, mesh_interop_LayoutUpdate_fields, &update, id);
+}
+void test_editor_patch_decoding() {
+  auto config = make_heap_object<matrix_config>(fixture());
+  auto update = make_heap_object<mesh_interop_LayoutUpdate>();
+  update->expected_revision = 300; update->master_session = UINT64_MAX;
+  update->layout_count = MAX_LAYOUT_SOURCES;
+  for (size_t i = 0; i < update->layout_count; ++i) {
+    update->layout[i] = layout_row(slave_mac, mesh_interop_MatrixDriver_DRIVER_6, i, i + 1);
+    update->layout[i].source_index = i % 2;
+    snprintf(update->layout[i].name, sizeof(update->layout[i].name), "Independent LED %u", unsigned(i));
+  }
+  auto bytes = encode(mesh_interop_LayoutUpdate_fields, update.get());
+  uint64_t revision, session;
+  assert(matrix_service::decode_editor_update(bytes, true, *config, revision, session));
+  assert(revision == 300 && session == UINT64_MAX && config->layout_count == MAX_LAYOUT_SOURCES);
+  assert(config->effects_count == 1 && config->effects[0].red == 255 && config->entries_count == 1);
+  for (size_t i = 0; i < config->layout_count; ++i)
+    assert(encode(mesh_interop_MatrixLayout_fields, &config->layout[i]) == encode(mesh_interop_MatrixLayout_fields, &update->layout[i]));
+  // Unknown protobuf fields remain forward-compatible; malformed ones fail.
+  bytes.insert(bytes.end(), {0xa0, 0x06, 123});
+  assert(matrix_service::decode_editor_update(bytes, true, *config, revision, session));
+  bytes.insert(bytes.end(), {0x1a, 2, 0x30, 1}); // An 85th layout source.
+  assert(!matrix_service::decode_editor_update(bytes, true, *config, revision, session));
+  assert(!matrix_service::decode_editor_update({0x1a, 3, 0x30, 1}, true, *config, revision, session));
+  assert(!matrix_service::decode_editor_update({0x1a, 1, 0}, true, *config, revision, session));
+  assert(!matrix_service::decode_editor_update({0x0a, 0}, true, *config, revision, session));
+  assert(!matrix_service::decode_editor_update({0}, true, *config, revision, session));
+  // Nested strings keep Nanopb's length limit.
+  bytes = {0x1a, 0x84, 1, 0x2a, 0x81, 1}; bytes.insert(bytes.end(), 129, 'x');
+  assert(!matrix_service::decode_editor_update(bytes, true, *config, revision, session));
+  *config = fixture();
+  auto matrix = make_heap_object<mesh_interop_MatrixUpdate>();
+  matrix->expected_revision = 400; matrix->master_session = UINT64_MAX - 1;
+  matrix->effects_count = matrix->sources_count = matrix->conditions_count = matrix->entries_count = 32;
+  for (size_t i = 0; i < 32; ++i) {
+    matrix->effects[i] = config->effects[0]; matrix->effects[i].id = i + 1;
+    matrix->sources[i] = config->sources[0]; matrix->sources[i].id = i + 1;
+    matrix->conditions[i] = config->conditions[0]; matrix->conditions[i].id = i + 1;
+    matrix->entries[i] = config->entries[0]; matrix->entries[i].id = i + 1;
+  }
+  bytes = encode(mesh_interop_MatrixUpdate_fields, matrix.get());
+  assert(matrix_service::decode_editor_update(bytes, false, *config, revision, session));
+  assert(revision == 400 && session == UINT64_MAX - 1 && config->layout_count == 1);
+  assert(config->effects_count == 32 && config->sources_count == 32 && config->conditions_count == 32 && config->entries_count == 32);
+  assert(config->effects[31].id == 32 && config->sources[31].id == 32 && config->conditions[31].id == 32 && config->entries[31].id == 32);
+  bytes.insert(bytes.end(), {0x1a, 2, 0x08, 33}); // A 33rd effect.
+  assert(!matrix_service::decode_editor_update(bytes, false, *config, revision, session));
+  // Empty repeated fields replace the edited portion, preserving the other half.
+  assert(matrix_service::decode_editor_update({0x08, 1, 0x10, 2}, false, *config, revision, session));
+  assert(!config->effects_count && !config->sources_count && !config->conditions_count && !config->entries_count && config->layout_count == 1);
+  *config = fixture();
+  assert(matrix_service::decode_editor_update({0x08, 1, 0x10, 2}, true, *config, revision, session));
+  assert(!config->layout_count && config->effects_count == 1 && config->entries_count == 1);
+}
+void layout_request(service &s, uint32_t request_id, uint32_t snapshot_id = 0, uint32_t offset = 0,
+                    bool identify = false, uint32_t output_index = 0, bool matrix = false, bool active = false,
+                    uint32_t count = 0, bool reversed = false) {
+  mesh_interop_MatrixUpload u{}; u.which_operation = mesh_interop_MatrixUpload_layout_request_tag;
+  auto &q = u.operation.layout_request; q.request_id = request_id; q.snapshot_id = snapshot_id;
+  q.offset = offset; q.operation = active ? mesh_interop_LayoutRequest_Operation_READ_ACTIVE_MATRIX : matrix ? mesh_interop_LayoutRequest_Operation_READ_MATRIX : identify ? mesh_interop_LayoutRequest_Operation_IDENTIFY : mesh_interop_LayoutRequest_Operation_READ;
+  q.output_index = output_index;
+  if (count || reversed) { q.has_identify_options = true; q.identify_options = output_index | (count << 8) | (uint32_t(reversed) << 20); }
+  const auto encoded = encode(mesh_interop_MatrixUpload_fields, &u);
+  packet p{}; p.connection = 1; p.generation = matrix_service::ble_generation.load(); p.size = encoded.size();
+  memcpy(p.data, encoded.data(), encoded.size()); s.handle_upload(p, fake_now);
+}
+mesh_interop_LayoutResponse layout_response() {
+  uint8_t bytes[512]; const auto size = matrix_service::read_layout_response(bytes, sizeof(bytes));
+  mesh_interop_LayoutResponse response{};
+  assert(size && decode(mesh_interop_LayoutResponse_fields, &response, bytes, size)); return response;
+}
+void test_layout_editor_service() {
+  service master, slave; configure_node(master, true); configure_node(slave, false);
+  auto c = fixture(); c.effects[0].duration_ms = 0; c.sources[0].kind = mesh_interop_MatrixSource_Kind_DEFAULT_STATE;
+  c.layout_count = 3;
+  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 0, 1);
+  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_WS2812, 1, 2);
+  c.layout[2] = layout_row(slave_mac, mesh_interop_MatrixDriver_HC595, 2, 1);
+  for (auto &row : c.layout) snprintf(row.name, sizeof(row.name), "%0120d", 1);
+  upload(master, c, 90); cycles(master, slave, 200);
+  assert(master.peers[0].catalog_known && master.peers[0].outputs_count == 2);
+  assert(master.peers[0].outputs[0].pixel_count == output.get_pixel_count());
+  layout_request(master, 1); const auto first = layout_response();
+  assert(first.request_id == 1 && !first.error[0] && !first.complete && first.data.size == 320);
+  std::vector<uint8_t> bytes(first.data.bytes, first.data.bytes + first.data.size);
+  // Snapshot pages retain the same layout/revision while a new config is committed.
+  c.layout[0].name[0] = 'X'; upload(master, c, 91); cycles(master, slave, 200);
+  uint32_t request = 2;
+  while (bytes.size() < first.total_size) {
+    layout_request(master, request++, first.snapshot_id, bytes.size()); const auto page = layout_response();
+    assert(!page.error[0] && page.snapshot_id == first.snapshot_id && page.offset == bytes.size());
+    bytes.insert(bytes.end(), page.data.bytes, page.data.bytes + page.data.size);
+  }
+  auto snapshot = std::make_unique<mesh_interop_LayoutSnapshot>();
+  assert(decode(mesh_interop_LayoutSnapshot_fields, snapshot.get(), bytes.data(), bytes.size()));
+  assert(snapshot->revision == 1 && snapshot->layout[0].name[0] != 'X' && snapshot->outputs_count == 4);
+  assert(snapshot->outputs[2].known && snapshot->outputs[2].pixel_count == 1);
+  auto update = std::make_unique<mesh_interop_LayoutUpdate>(); update->master_session = 10; update->expected_revision = 1;
+  update->layout_count = c.layout_count; std::copy_n(c.layout, c.layout_count, update->layout);
+  const auto saved = stored; upload_layout(master, *update, 92);
+  assert(master.state.stage == mesh_interop_MatrixStatus_Stage_FAILED && master.revision == 2 && stored == saved);
+  update->expected_revision = 2; update->layout[1].from = 4; update->layout[1].to = 5;
+  snprintf(update->layout[1].name, sizeof(update->layout[1].name), "Rear indicator");
+  upload_layout(master, *update, 93);
+  assert(master.deployment && master.candidate->entries_count == c.entries_count && master.candidate->effects[0].red == 255);
+  assert(master.candidate->sources[0].kind == c.sources[0].kind && master.candidate->layout[1].from == 4);
+  cycles(master, slave, 200); assert(master.revision == 3 && slave.local->definitions().canvas_size == 5);
+  auto persisted = std::make_unique<matrix_config>();
+  assert(decode(mesh_interop_MatrixConfig_fields, persisted.get(), stored.data() + 24, stored.size() - 24));
+  assert(persisted->entries_count == 1 && !strcmp(persisted->layout[1].name, "Rear indicator"));
+  const auto valid_saved = stored;
+  update->expected_revision = 3; update->master_session = 11;
+  upload_layout(master, *update, 94);
+  assert(master.state.stage == mesh_interop_MatrixStatus_Stage_FAILED && master.revision == 3 && stored == valid_saved);
+  update->master_session = 10; update->layout[1].to = 6;
+  upload_layout(master, *update, 95);
+  assert(master.state.stage == mesh_interop_MatrixStatus_Stage_FAILED && master.revision == 3 && stored == valid_saved);
+  update->layout[1].to = 5;
+  fail_commit = true; upload_layout(master, *update, 96); fail_commit = false;
+  assert(master.state.stage == mesh_interop_MatrixStatus_Stage_FAILED && master.revision == 3 && stored == valid_saved);
+  assert(master.config->effects[0].red == 255 && master.config->layout[1].to == 5);
+  layout_request(master, 20); auto response = layout_response(); const auto token = response.snapshot_id;
+  layout_request(master, 21, token, 0, true, 0); response = layout_response();
+  assert(response.request_id == 21 && response.complete && master.identify_driver == 1);
+  master.playback_step(fake_now); assert(output.shown.g == 255 && output.shown.r == 0);
+  const auto before_identify = stored;
+  fake_now += 3000001; master.playback_step(fake_now);
+  assert(!master.identify_driver && output.shown.r == 255 && stored == before_identify);
+  // Unmapped output identification also clears itself at the deadline.
+  layout_request(master, 22); response = layout_response();
+  layout_request(master, 23, response.snapshot_id, 0, true, 1); master.playback_step(fake_now);
+  assert(output_secondary.shown.g == 255); fake_now += 3000001; master.playback_step(fake_now);
+  assert(output_secondary.shown.r == 0 && output_secondary.shown.g == 0 && output_secondary.shown.b == 0);
+  // Slave identify ACK loss retries without restarting the three-second window.
+  master.master_step(fake_now, fake_now); bool drop = false; deliver(master, slave, drop);
+  layout_request(master, 24); response = layout_response();
+  layout_request(master, 25, response.snapshot_id, 0, true, 3);
+  master.master_step(fake_now, fake_now); drop = true; deliver(master, slave, drop, w::IDENTIFY_ACK);
+  assert(!drop && slave.identify_driver == 2); const auto deadline = slave.identify_until;
+  fake_now += 100000; master.master_step(fake_now, fake_now); deliver(master, slave, drop);
+  response = layout_response(); assert(response.request_id == 25 && response.complete && !master.identifying.active);
+  assert(slave.identify_until == deadline); slave.playback_step(fake_now); assert(output_secondary.shown.g == 255);
+  fake_now = deadline + 1; slave.playback_step(fake_now); assert(output_secondary.shown.r == 255);
+  // Tokens cannot cross a BLE disconnection, and expired snapshots are explicit errors.
+  layout_request(master, 26); response = layout_response(); matrix_service::disconnect(1);
+  layout_request(master, 27, response.snapshot_id, 320); response = layout_response(); assert(response.error[0]);
+  layout_request(master, 28); response = layout_response(); fake_now += TRANSFER_TIMEOUT_US;
+  layout_request(master, 29, response.snapshot_id, 320); assert(layout_response().error[0]);
+  network.clear();
+  // First-time setup supports saving a layout before any animation exists.
+  service fresh; configure_node(fresh, true);
+  update->expected_revision = 0; update->layout_count = 1;
+  update->layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 0, 1);
+  upload_layout(fresh, *update, 97);
+  assert(fresh.revision == 1 && fresh.candidate && fresh.candidate->entries_count == 0);
+  assert(fresh.candidate->schema_version == SCHEMA_VERSION && fresh.candidate->layout_count == 1);
+  network.clear();
+}
+void test_matrix_editor_service() {
+  service master, slave; configure_node(master, true); configure_node(slave, false);
+  auto c = fixture(); c.sources[0].kind = mesh_interop_MatrixSource_Kind_DEFAULT_STATE;
+  c.effects[0].duration_ms = 0;
+  snprintf(c.effects[0].name, sizeof(c.effects[0].name), "%0120d", 1);
+  snprintf(c.entries[0].name, sizeof(c.entries[0].name), "%0120d", 2);
+  snprintf(c.layout[0].name, sizeof(c.layout[0].name), "%0120d", 3);
+  upload(master, c, 101); cycles(master, slave, 200);
+  layout_request(master, 100, 0, 0, false, 0, true); const auto first = layout_response();
+  assert(!first.error[0] && !first.complete);
+  std::vector<uint8_t> bytes(first.data.bytes, first.data.bytes + first.data.size);
+  layout_request(master, 101, first.snapshot_id, 320); assert(layout_response().error[0]); // Wrong snapshot kind.
+  while (bytes.size() < first.total_size) {
+    layout_request(master, 102, first.snapshot_id, bytes.size(), false, 0, true); const auto page = layout_response();
+    assert(!page.error[0] && page.offset == bytes.size());
+    bytes.insert(bytes.end(), page.data.bytes, page.data.bytes + page.data.size);
+  }
+  auto document = std::make_unique<mesh_interop_MatrixDocument>();
+  assert(decode(mesh_interop_MatrixDocument_fields, document.get(), bytes.data(), bytes.size()));
+  assert(document->revision == 1 && document->nodes_count == 2 && document->nodes[1].known);
+  for (size_t i = 0; i < document->nodes_count; ++i) {
+    const auto &node = document->nodes[i];
+    assert(std::find(node.gpios, node.gpios + node.gpios_count, 12) != node.gpios + node.gpios_count);
+    assert(std::find(node.gpios, node.gpios + node.gpios_count, 19) == node.gpios + node.gpios_count);
+  }
+  auto update = std::make_unique<mesh_interop_MatrixUpdate>(); update->master_session = 10; update->expected_revision = 2;
+  update->effects_count = c.effects_count; std::copy_n(c.effects, c.effects_count, update->effects);
+  update->sources_count = c.sources_count; std::copy_n(c.sources, c.sources_count, update->sources);
+  update->conditions_count = c.conditions_count; std::copy_n(c.conditions, c.conditions_count, update->conditions);
+  update->entries_count = c.entries_count; std::copy_n(c.entries, c.entries_count, update->entries);
+  update->effects[0].kind = mesh_interop_MatrixEffect_Kind_BREATHE; update->effects[0].period_ms = 2000;
+  const auto original = stored;
+  upload_editor(master, mesh_interop_MatrixUpdate_fields, update.get(), 102, true);
+  assert(master.revision == 1 && stored == original);
+  update->expected_revision = 1; upload_editor(master, mesh_interop_MatrixUpdate_fields, update.get(), 103, true);
+  assert(master.candidate && master.candidate->layout[0].to == c.layout[0].to && !strcmp(master.candidate->layout[0].name, c.layout[0].name));
+  cycles(master, slave, 200); assert(master.revision == 2 && master.config->effects[0].period_ms == 2000);
+  const auto accepted = stored; update->expected_revision = 2; update->effects[0].blue = 255;
+  fail_commit = true; upload_editor(master, mesh_interop_MatrixUpdate_fields, update.get(), 104, true); fail_commit = false;
+  assert(master.revision == 2 && stored == accepted && master.config->effects[0].blue == c.effects[0].blue);
+  network.clear();
+}
+std::unique_ptr<mesh_interop_MatrixDocument> read_document(service &node, bool active = false) {
+  layout_request(node, 300, 0, 0, false, 0, true, active); const auto first = layout_response();
+  assert(!first.error[0]);
+  std::vector<uint8_t> bytes(first.data.bytes, first.data.bytes + first.data.size);
+  while (bytes.size() < first.total_size) {
+    layout_request(node, 301, first.snapshot_id, bytes.size(), false, 0, true, active); const auto page = layout_response();
+    assert(!page.error[0]); bytes.insert(bytes.end(), page.data.bytes, page.data.bytes + page.data.size);
+  }
+  auto document = std::make_unique<mesh_interop_MatrixDocument>();
+  assert(decode(mesh_interop_MatrixDocument_fields, document.get(), bytes.data(), bytes.size()));
+  return document;
+}
+void test_preconfigured_rainbow_and_current_read() {
+  stored.clear(); staged.clear(); network.clear();
+  service master, slave; configure_node(master, true); configure_node(slave, false);
+  fake_synchronized = false; slave.initialize_configuration();
+  assert(slave.standalone_default && slave.config->factory_default && slave.config->layout_count == 2);
+  for (size_t i = 0; i < slave.config->layout_count; ++i) assert(slave.config->layout[i].from == 0);
+  slave.playback_step(0); assert(output.shown.r == 255 && output_secondary.shown.r == 255);
+  slave.playback_step(2000000); assert(output.shown.b == 255 && output_secondary.shown.b == 255);
+  fake_synchronized = true;
+  master.initialize_configuration(); assert(master.candidate && master.candidate->factory_default && !stored.empty());
+  cycles(master, slave, 400);
+  assert(master.config && master.config->factory_default && master.config->layout_count == 4);
+  assert(!slave.standalone_default && !slave.config && slave.local->definitions().output_mappings_count == 2);
+  for (size_t i = 0; i < master.config->layout_count; ++i) assert(master.config->layout[i].from == 0 && master.config->layout[i].to == 1);
+  auto document = read_document(master);
+  assert(document->revision == master.revision && document->active_revision == master.revision && document->persisted && !document->activation_pending);
+  auto running = read_document(master, true);
+  auto current = std::make_unique<matrix_config>();
+  assert(decode(mesh_interop_MatrixConfig_fields, current.get(), running->config.bytes, running->config.size));
+  assert(current->factory_default && current->effects[0].kind == mesh_interop_MatrixEffect_Kind_RAINBOW);
+  auto snapshot = slave.local->snapshot(slave.local->definitions(), 0, 0);
+  assert(snapshot.states_count == 1 && snapshot.states[0].started_at_us == 0);
+  const auto old_revision = master.revision;
+  auto replacement = master.config->to_wire();
+  replacement->effects[0].kind = mesh_interop_MatrixEffect_Kind_STATIC_COLOR;
+  replacement->effects[0].red = 0; replacement->effects[0].green = 0; replacement->effects[0].blue = 255;
+  upload(master, *replacement, 200); assert(master.candidate && !master.candidate->factory_default);
+  document = read_document(master); running = read_document(master, true);
+  assert(document->revision == old_revision + 1 && document->activation_pending);
+  assert(running->revision == old_revision && running->active_revision == old_revision);
+  for (unsigned i = 0; !master.pending_snapshot && i < 100; ++i) cycles(master, slave, 1);
+  assert(master.pending_snapshot && fake_now < master.activate_at);
+  running = read_document(master, true);
+  assert(decode(mesh_interop_MatrixConfig_fields, current.get(), running->config.bytes, running->config.size));
+  assert(current->factory_default && current->effects[0].kind == mesh_interop_MatrixEffect_Kind_RAINBOW);
+  cycles(master, slave, 200); running = read_document(master, true);
+  assert(running->revision == master.revision && !running->activation_pending);
+  assert(output.shown.b == 255 && output.shown.r == 0);
+  service restored; configure_node(restored, true); restored.initialize_configuration();
+  assert(restored.candidate && !restored.candidate->factory_default && restored.candidate->effects[0].kind == mesh_interop_MatrixEffect_Kind_STATIC_COLOR);
+  auto empty = std::make_unique<matrix_config>(); empty->schema_version = SCHEMA_VERSION;
+  upload(master, *empty, 201); cycles(master, slave, 600);
+  assert(master.config->entries_count == 0 && !master.config->factory_default);
+  assert(output.shown.r == 0 && output.shown.g == 0 && output.shown.b == 0);
+  service empty_restored; configure_node(empty_restored, true); empty_restored.initialize_configuration();
+  assert(empty_restored.candidate && empty_restored.candidate->entries_count == 0);
+  network.clear(); stored.clear(); fail_commit = true;
+  service volatile_default; configure_node(volatile_default, true); volatile_default.initialize_configuration();
+  assert(volatile_default.candidate && !volatile_default.configuration_persisted && stored.empty());
+  fail_commit = false; network.clear();
+}
+void test_six_driver_inventory_and_independent_remote_leds() {
+  stored.clear(); staged.clear(); network.clear();
+  connected_lighting_drivers::configured_resolver = resolve_six;
+  service master, slave; configure_node(master, true); configure_node(slave, false);
+  master.initialize_configuration(); slave.initialize_configuration(); cycles(master, slave, 400);
+  assert(master.config && master.config->layout_count == 24);
+  assert(master.peers[0].outputs_count == 12 && slave.local->definitions().output_mappings_count == 12);
+  layout_request(master, 901);
+  assert(master.snapshot_outputs.size() == 24);
+  for (const auto &output : master.snapshot_outputs)
+    assert(output.pixel_count == 1 && output.driver_kind == mesh_interop_MatrixDriverKind_RGB_LED_MODULE);
+  auto replacement = master.config->to_wire();
+  for (size_t i = 0; i < replacement->layout_count; ++i) {
+    auto &row = replacement->layout[i];
+    if (!memcmp(row.node_mac, slave_mac, 6) && row.driver == mesh_interop_MatrixDriver_DRIVER_6) {
+      row.from = row.source_index ? 70 : 10; row.to = row.from + 1;
+    }
+  }
+  upload(master, *replacement, 902); cycles(master, slave, 200);
+  size_t points = 0;
+  for (const auto &mapping : slave.local->definitions().output_mappings)
+    if (mapping.driver == mesh_interop_MatrixDriver_DRIVER_6) {
+      assert(mapping.from == (mapping.source_index ? 70u : 10u)); ++points;
+    }
+  assert(points == 2);
+  layout_request(master, 903); const auto token = layout_response().snapshot_id;
+  size_t index = 0;
+  for (; index < master.snapshot_outputs.size(); ++index) {
+    const auto &output = master.snapshot_outputs[index];
+    if (!memcmp(output.node_mac, slave_mac, 6) && output.driver == mesh_interop_MatrixDriver_DRIVER_6 && output.source_index == 1) break;
+  }
+  assert(index < master.snapshot_outputs.size());
+  layout_request(master, 904, token, 0, true, index); cycles(master, slave, 10);
+  assert(slave.identify_driver == 6 && slave.identify_source == 1 && layout_response().complete);
+  assert(six_outputs[5].shown[1].g == 255 && six_outputs[5].shown[1].r == 0);
+  network.clear(); slave.send_inventory(master_mac);
+  assert(network.size() == 1 && network.front().bytes.size() == w::HEADER_SIZE + 101);
+  auto frame = network.front().bytes; network.clear();
+  packet packet{}; memcpy(packet.mac, slave_mac, 6); packet.size = frame.size();
+  // Duplicate physical slot IDs cannot partially replace the existing catalog.
+  frame[w::HEADER_SIZE + 9 + 14] = frame[w::HEADER_SIZE + 9];
+  memcpy(packet.data, frame.data(), frame.size());
+  const auto accepted_at = master.peers[0].catalog_at;
+  master.handle_radio(packet, fake_now + 1); assert(master.peers[0].catalog_at == accepted_at);
+  connected_lighting_drivers::configured_resolver = resolve; network.clear();
+}
+class growable_test_driver : public canvas_test_driver {
+public:
+  growable_test_driver() : canvas_test_driver(4) {}
+  bool fail_growth = false;
+  lighting_driver_kind get_kind() const override { return lighting_driver_kind::LED_STRIP; }
+  size_t get_layout_max_pixel_count(uint32_t source) const override { return source ? 0 : 16; }
+  esp_err_t reserve_layout_pixels(uint32_t source, size_t count) override {
+    if (source || !count || count > 16) return ESP_ERR_INVALID_ARG;
+    if (count > pixels.size()) {
+      if (fail_growth) return ESP_ERR_NO_MEM;
+      pixels.resize(count); shown.resize(count);
+    }
+    return ESP_OK;
+  }
+};
+growable_test_driver growing_output;
+rgb_lighting_driver *resolve_growing(uint32_t id) { return id == 1 ? &growing_output : nullptr; }
+void test_configurable_strip_and_identify_preview() {
+  stored.clear(); staged.clear(); network.clear();
+  connected_lighting_drivers::configured_resolver = resolve_growing;
+  service master, slave; configure_node(master, true); configure_node(slave, false);
+  auto c = fixture(); c.effects[0].duration_ms = 0; c.sources[0].kind = mesh_interop_MatrixSource_Kind_DEFAULT_STATE;
+  c.layout[0].to = 12; c.layout[0].car_position = mesh_interop_CarPosition_FRONT_LEFT_DOOR;
+  upload(master, c, 1001); cycles(master, slave, 250);
+  assert(master.revision == 1 && slave.local && growing_output.get_pixel_count() == 12);
+  assert(slave.local->definitions().output_mappings[0].to == 12);
+  layout_request(master, 1002); const auto token = layout_response().snapshot_id;
+  size_t index = 0;
+  for (; index < master.snapshot_outputs.size(); ++index) if (!memcmp(master.snapshot_outputs[index].node_mac, slave_mac, 6)) break;
+  assert(index < master.snapshot_outputs.size() && master.snapshot_outputs[index].max_pixel_count == 16);
+  layout_request(master, 1003, token, 0, true, index, false, false, 8, true); cycles(master, slave, 10);
+  assert(slave.identify_length == 8 && slave.identify_reversed);
+  const auto start = slave.identify_until - 3000000;
+  fake_now = start; slave.playback_step(fake_now);
+  assert(growing_output.shown[7].g == 255 && growing_output.shown[0].g == 0 && growing_output.shown[11].r == 0);
+  fake_now = start + 1000000; slave.playback_step(fake_now);
+  for (size_t i = 4; i < 8; ++i) assert(growing_output.shown[i].g == 255);
+  assert(growing_output.shown[3].g == 0 && growing_output.shown[0].b == 0);
+  fake_now = start + 1999999; slave.playback_step(fake_now);
+  assert(growing_output.shown[1].g == 255 && growing_output.shown[0].b == 0);
+  for (uint64_t elapsed : {2000000, 2500000, 2999999}) {
+    fake_now = start + elapsed; slave.playback_step(fake_now);
+    assert(growing_output.shown[0].b == 255);
+    for (size_t i = 1; i < 8; ++i) assert(growing_output.shown[i].g == 255);
+    for (size_t i = 8; i < 12; ++i) assert(growing_output.shown[i].r == 0 && growing_output.shown[i].g == 0 && growing_output.shown[i].b == 0);
+  }
+  fake_now = start + 3000001; slave.playback_step(fake_now);
+  assert(!slave.identify_driver && growing_output.shown[11].r == 255); // Normal full-length playback resumes.
+  assert(slave.begin_identify(1, fake_now, 0, 6, false));
+  const auto forward_start = fake_now;
+  fake_now += 1000000; slave.playback_step(fake_now);
+  for (size_t i = 0; i < 3; ++i) assert(growing_output.shown[i].g == 255);
+  assert(growing_output.shown[3].g == 0 && growing_output.shown[5].b == 0);
+  fake_now = forward_start + 2500000; slave.playback_step(fake_now);
+  assert(growing_output.shown[0].g == 255 && growing_output.shown[5].b == 255 && growing_output.shown[6].r == 0);
+  fake_now = forward_start + 3000001; slave.playback_step(fake_now);
+  assert(!slave.identify_driver && growing_output.shown[11].r == 255);
+  const auto before = stored;
+  growing_output.fail_growth = true; c.layout[0].to = 16;
+  // The owning slave rejects failed buffer growth; the current player remains valid.
+  auto replacement = definitions_for(c, slave_mac, 10, 2);
+  player rejected(resolve_growing); assert(!rejected.prepare(replacement));
+  assert(growing_output.get_pixel_count() == 12 && stored == before);
+  growing_output.fail_growth = false;
+  growing_output.pixels.resize(4); growing_output.shown.resize(4);
+  service restored; configure_node(restored, true); restored.load();
+  assert(restored.candidate && restored.candidate->layout[0].to == 12);
+  assert(restored.candidate->layout[0].car_position == mesh_interop_CarPosition_FRONT_LEFT_DOOR);
+  // A local persisted strip also reserves its configured length during restore.
+  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 0, 12);
+  assert(restored.prepare_runtime(c, 2) && growing_output.get_pixel_count() == 12);
+  connected_lighting_drivers::configured_resolver = resolve; network.clear(); stored.clear();
+}
 int main() {
   matrix_core_tests_main();
   matrix_service::gpio_queue = xQueueCreate(64, sizeof(matrix_service::gpio_event));
@@ -484,6 +892,12 @@ int main() {
   test_remote_gpio_source_only_and_replacement();
   test_remote_gpio_time_queues_and_sessions();
   test_car_layout_distribution_and_recovery();
+  test_editor_patch_decoding();
+  test_layout_editor_service();
+  test_matrix_editor_service();
+  test_preconfigured_rainbow_and_current_read();
+  test_six_driver_inventory_and_independent_remote_leds();
+  test_configurable_strip_and_identify_preview();
   test_only_current_hello_format();
   delete matrix_service::gpio_queue;
   test_callback_queue_limits();

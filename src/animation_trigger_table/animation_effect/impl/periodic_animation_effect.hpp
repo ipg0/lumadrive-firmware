@@ -16,7 +16,7 @@ struct periodic_animation_options {
 template <animation_effect_type effect_type>
 class animation_effect_instance : public timed_animation_effect_instance {
   static_assert(effect_type == animation_effect_type::BLINK || effect_type == animation_effect_type::BREATHE ||
-                effect_type == animation_effect_type::FLOWING_GRADIENT);
+                effect_type == animation_effect_type::FLOWING_GRADIENT || effect_type == animation_effect_type::RAINBOW);
 public:
   explicit animation_effect_instance(periodic_animation_options options)
       : timed_animation_effect_instance(options.duration_ms), _options(options) {}
@@ -45,8 +45,10 @@ public:
         if (pixel >= count) return ESP_ERR_INVALID_ARG;
         const uint32_t position = uint64_t(pixel % wavelength) * SCALE / wavelength;
         const uint32_t shifted = (position + (_options.reverse ? phase : SCALE - phase)) % SCALE;
-        auto err = driver.set_pixel(static_cast<uint16_t>(pixel),
-            mix(_options.primary, _options.secondary, triangle(shifted)));
+        alpha_color value;
+        if constexpr (effect_type == animation_effect_type::RAINBOW) value = rainbow(shifted, _options.primary.alpha);
+        else value = mix(_options.primary, _options.secondary, triangle(shifted));
+        auto err = driver.set_pixel(static_cast<uint16_t>(pixel), value);
         if (err != ESP_OK) return err;
       }
       return ESP_OK;

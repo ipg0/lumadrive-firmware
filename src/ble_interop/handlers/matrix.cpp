@@ -11,11 +11,17 @@ void ble_interop::init_matrix_notifications() {
     // The notification is an invalidation signal, deliberately one byte so it
     // works at MTU 23. Clients read the complete status through ATT long reads.
     auto &self = ble_interop::instance();
-    std::lock_guard<std::mutex> lock(self._state_mutex);
-    if (!self._is_connected) return;
+    uint16_t connection;
+    {
+      std::lock_guard<std::mutex> lock(self._state_mutex);
+      if (!self._is_connected) return;
+      connection = self._active_conn_handle;
+    }
+    // NimBLE invokes GAP NOTIFY_TX synchronously, reentering our GAP handler.
+    // That handler takes _state_mutex, so no state lock may span this call.
     const uint8_t changed = 1;
     auto *om = ble_hs_mbuf_from_flat(&changed, 1);
-    if (om) ble_gatts_notify_custom(self._active_conn_handle, _matrix_status_handle, om);
+    if (om) ble_gatts_notify_custom(connection, _matrix_status_handle, om);
   }, nullptr);
   matrix_service::set_status_callback([]() {
     if (!ble_npl_event_is_queued(&status_event))
@@ -37,6 +43,14 @@ int ble_interop::handle_matrix_status(uint16_t, uint16_t,
   if (ctx->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_READ_NOT_PERMITTED;
   uint8_t bytes[512];
   const auto size = matrix_service::read_status(bytes, sizeof(bytes));
+  if (!size) return BLE_ATT_ERR_INSUFFICIENT_RES;
+  return os_mbuf_append(ctx->om, bytes, size) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+int ble_interop::handle_layout_response(uint16_t, uint16_t,
+                                       ble_gatt_access_ctxt *ctx, void *) {
+  if (ctx->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_READ_NOT_PERMITTED;
+  uint8_t bytes[512];
+  const auto size = matrix_service::read_layout_response(bytes, sizeof(bytes));
   if (!size) return BLE_ATT_ERR_INSUFFICIENT_RES;
   return os_mbuf_append(ctx->om, bytes, size) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
 }

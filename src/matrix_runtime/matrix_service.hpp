@@ -12,5 +12,6 @@ bool upload(uint16_t connection, const uint8_t *data, size_t size);
 void disconnect(uint16_t connection);
 mesh_interop_MatrixStatus status();
 size_t read_status(uint8_t *destination, size_t capacity);
+size_t read_layout_response(uint8_t *destination, size_t capacity);
 void set_status_callback(void (*callback)());
 } // namespace matrix_service

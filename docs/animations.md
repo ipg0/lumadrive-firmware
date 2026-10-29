@@ -81,6 +81,7 @@ defaults to 1000 ms; explicit periods must be at least 2 ms. Rendering runs at
 | `BLINK` | Primary color on first, then transparent. `duty_percent` is the on fraction, 1–100; zero defaults to 50. |
 | `BREATHE` | Smoothly vary primary alpha from zero to its configured value and back, peaking halfway through `period_ms`. |
 | `FLOWING_GRADIENT` | Move a repeating primary → `secondary_color` → primary gradient along canvas indices. Requires secondary RGBA. `wavelength_pixels: 0` fits one cycle to the full canvas; a positive value sets its spatial length. `reverse: true` flows toward decreasing indices. |
+| `RAINBOW` | Move a repeating saturated RGB spectrum along canvas indices. Uses primary alpha for opacity, with the same wavelength and reverse controls as flowing gradient. Primary RGB and secondary color are ignored. |
 
 These parametric types cover the whole canvas. Blink/breathe off phases reveal
 lower layers. Gradient interpolation includes alpha and uses logical RGB pixels

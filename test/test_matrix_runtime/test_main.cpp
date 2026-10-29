@@ -7,6 +7,7 @@
 #include <cstdio>
 
 using namespace matrix;
+static_assert(sizeof(player) < 8192, "Players must not retain maximum-sized protobuf effect arrays");
 const uint8_t master_mac[6] = {2, 1, 2, 3, 4, 5};
 const uint8_t slave_mac[6] = {4, 1, 2, 3, 4, 5};
 mesh_interop_MatrixLayout layout_row(const uint8_t *mac, mesh_interop_MatrixDriver driver,
@@ -31,6 +32,7 @@ matrix_config fixture() {
 }
 class fake_driver : public rgb_lighting_driver {
 public:
+  lighting_driver_kind get_kind() const override { return lighting_driver_kind::LED_STRIP; }
   color pixel{}, shown{}; unsigned clears = 0, shows = 0;
   esp_err_t init() override { return ESP_OK; }
   esp_err_t deinit() override { return ESP_OK; }
@@ -271,6 +273,52 @@ void test_animated_player_phase_and_snapshots() {
     red(false); assert(output.shown.b == 0); // Finite animations already expired on arrival.
   }
 }
+void test_compact_player_definition_ownership() {
+  player recovered(resolve);
+  animation_snapshot snapshot{};
+  {
+    player original(resolve);
+    {
+      auto config = make_heap_object<matrix_config>(keyframe_fixture());
+      auto definitions = make_definitions(*config, slave_mac, 10, 20);
+      assert(definitions && original.prepare(*definitions));
+      assert(original.definition_bytes().size() < sizeof(animation_definitions) / 10);
+    }
+    assert(original.enqueue(start())); original.tick(350000);
+    snapshot = original.snapshot(original.definitions(), 3, 0);
+    assert(recovered.prepare(original));
+    assert(recovered.definition_bytes() == original.definition_bytes());
+    assert(recovered.restore(snapshot));
+  }
+  // The clone owns both its effect instances and its encoded definition bytes.
+  recovered.tick(350000); assert(output.shown.r == 128 && output.shown.b == 128);
+  recovered.tick(600000); assert(output.shown.b == 255);
+}
+void test_compact_config_and_direct_preparation() {
+  static_assert(sizeof(runtime_config) < 512);
+  for (const auto keyframes : {false, true}) {
+    auto c = make_heap_object<matrix_config>(keyframes ? keyframe_fixture() : fixture());
+    auto compact = make_heap_object<runtime_config>(*c);
+    assert(compact->effects.size() == 1 && compact->entries.size() == 1);
+    assert(compact->encoded() == encode(mesh_interop_MatrixConfig_fields, c.get()));
+    for (const auto *mac : std::array<const uint8_t *, 3>{nullptr, master_mac, slave_mac}) {
+      auto expected = make_definitions(*c, mac, 10, 20);
+      auto actual = make_definitions(*compact, mac, 10, 20);
+      assert(encode(mesh_interop_AnimationDefinitions_fields, expected.get()) ==
+          encode(mesh_interop_AnimationDefinitions_fields, actual.get()));
+      player direct(mac ? resolve : nullptr);
+      assert(direct.prepare(*c, mac, 10, 20));
+      assert(direct.definition_bytes() == encode(mesh_interop_AnimationDefinitions_fields, expected.get()));
+    }
+    auto copy = compact->to_wire();
+    assert(copy && encode(mesh_interop_MatrixConfig_fields, copy.get()) == compact->encoded());
+    c->effects[0].red = 17;
+    assert(compact->effects[0].red != 17); // Owned independently of staging storage.
+  }
+  auto empty = make_heap_object<matrix_config>(); empty->schema_version = SCHEMA_VERSION;
+  runtime_config compact(*empty);
+  assert(compact.encoded() == encode(mesh_interop_MatrixConfig_fields, empty.get()));
+}
 class motion_test_driver : public rgb_lighting_driver {
 public:
   std::array<color, 4> pixels{}, shown{};
@@ -361,6 +409,61 @@ public:
   esp_err_t set_global_brightness(uint8_t) override { return ESP_OK; }
   bool _is_ready() const override { return true; }
 };
+class discrete_test_driver : public canvas_test_driver {
+public:
+  discrete_test_driver() : canvas_test_driver(2) {}
+  lighting_driver_kind get_kind() const override { return lighting_driver_kind::RGB_LED_MODULE; }
+  size_t get_layout_source_count() const override { return 2; }
+  size_t get_layout_pixel_count(uint32_t source) const override { return source < 2 ? 1 : 0; }
+  size_t get_layout_pixel_offset(uint32_t source) const override { return source; }
+};
+std::array<discrete_test_driver, 6> six_outputs;
+rgb_lighting_driver *resolve_six(uint32_t id) { return id >= 1 && id <= 6 ? &six_outputs[id - 1] : nullptr; }
+void test_seven_node_six_driver_point_layout() {
+  auto c = make_heap_object<matrix_config>(fixture()); c->layout_count = 0;
+  c->effects[0].kind = mesh_interop_MatrixEffect_Kind_RAINBOW;
+  c->effects[0].duration_ms = 0; c->effects[0].period_ms = 1000;
+  std::array<std::array<uint8_t, 6>, 7> nodes{};
+  for (size_t node = 0; node < nodes.size(); ++node) {
+    nodes[node] = {uint8_t(2 + node * 2), 1, 2, 3, 4, 5};
+    for (uint32_t driver = 1; driver <= 6; ++driver) for (uint32_t source = 0; source < 2; ++source) {
+      const uint32_t position = node * 12 + (driver - 1) * 2 + source;
+      auto &row = c->layout[c->layout_count++];
+      row = layout_row(nodes[node].data(), static_cast<mesh_interop_MatrixDriver>(driver), position, position + 1);
+      row.source_index = source;
+    }
+  }
+  assert(c->layout_count == 84 && !validate(*c, master_mac));
+  assert(!encode(mesh_interop_MatrixConfig_fields, c.get()).empty());
+  canvas_test_driver reference(84);
+  periodic_animation_options options; options.period_ms = 1000;
+  options.primary = alpha_color(color(255, 255, 255));
+  std::unique_ptr<animation_effect_instance_base> rainbow(
+      animation_effect_descriptor<animation_effect_type::RAINBOW>(options).create_instance());
+  for (const auto &node : nodes) {
+    player local(resolve_six); assert(local.prepare(*c, node.data(), 10, 20));
+    assert(local.definitions().output_mappings_count == 12 && local.enqueue(start()));
+    for (uint64_t elapsed : {0, 250}) {
+      const auto before = six_outputs[0].shows;
+      local.tick(100000 + elapsed * 1000); reference.clear(); rainbow->seek(elapsed); rainbow->render(reference);
+      assert(six_outputs[0].shows == before + 1); // One presentation per physical driver, not per LED.
+      for (const auto &row : c->layout) {
+        if (memcmp(row.node_mac, node.data(), 6)) continue;
+        const auto actual = six_outputs[uint32_t(row.driver) - 1].shown[row.source_index];
+        const auto expected = reference.pixels[row.from];
+        assert(actual.r == expected.r && actual.g == expected.g && actual.b == expected.b);
+      }
+    }
+    auto snapshot = local.snapshot(local.definitions(), 3, 0);
+    player recovered(resolve_six); assert(recovered.prepare(local) && recovered.restore(snapshot));
+    recovered.tick(350000);
+  }
+  auto invalid = c->layout[1]; c->layout[1].source_index = 0;
+  assert(validate(*c, master_mac)); c->layout[1] = invalid;
+  c->layout[0].to = c->layout[0].from + 2;
+  player invalid_player(resolve_six); assert(!invalid_player.prepare(*c, nodes[0].data(), 10, 20));
+  c->layout_count = 85; assert(validate(*c, master_mac));
+}
 canvas_test_driver canvas_strip_a(4), canvas_strip_b(4), canvas_block(2);
 rgb_lighting_driver *resolve_canvas_a(uint32_t id) {
   return id == 1 ? &canvas_strip_a : id == 2 ? &canvas_block : nullptr;
@@ -438,9 +541,12 @@ int main() {
   test_one_entry_two_drivers();
   test_node_input_definitions();
   test_effect_validation_and_roundtrip(); test_animated_player_phase_and_snapshots();
+  test_compact_player_definition_ownership();
+  test_compact_config_and_direct_preparation();
   test_motion_phase_recovery();
   test_expanded_definition_limit();
   test_layout_validation(); test_shared_canvas_motion_and_gradient();
+  test_seven_node_six_driver_point_layout();
   std::puts("Matrix runtime: transfer, schema, scheduling, recovery, and layering passed.");
   return 0;
 }

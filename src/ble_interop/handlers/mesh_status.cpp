@@ -28,6 +28,12 @@ esp_err_t write_mesh_interop_dto(pb_ostream_t *stream) {
     return ESP_FAIL;
   }
 
+  // Proto3 omits every field once discovery ends with no paired nodes. Keep
+  // the characteristic readable for clients that reject a zero-length value.
+  if (!stream->bytes_written &&
+      (!pb_encode_tag(stream, PB_WT_VARINT, mesh_interop_MeshInteropState_is_discovery_mode_tag) ||
+       !pb_encode_varint(stream, 0))) return ESP_FAIL;
+
   return ESP_OK;
 }
 } // namespace

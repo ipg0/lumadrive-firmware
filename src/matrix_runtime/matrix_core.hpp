@@ -2,6 +2,7 @@
 
 #include "../animation_trigger_table/animation_effect/animation_effect.hpp"
 #include "../animation_trigger_table/trigger_context.hpp"
+#include "heap_object.hpp"
 #include <array>
 #include <memory>
 #include <vector>
@@ -9,6 +10,10 @@
 
 namespace matrix {
 constexpr size_t MAX_BYTES = 16384;
+constexpr size_t MAX_DRIVERS_PER_NODE = 6;
+constexpr size_t MAX_SOURCES_PER_NODE = 12;
+constexpr size_t MAX_LAYOUT_SOURCES = 84;
+constexpr size_t MAX_INVENTORY_SOURCES = 204;
 constexpr uint32_t SCHEMA_VERSION = 2;
 constexpr uint64_t LEAD_US = 100000;
 constexpr uint64_t TRANSFER_TIMEOUT_US = 5000000;
@@ -20,8 +25,45 @@ using matrix_effect = mesh_interop_MatrixEffect;
 using output_mapping = mesh_interop_AnimationOutputMapping;
 using driver_resolver = rgb_lighting_driver *(*)(uint32_t);
 
+// Retain only populated definitions between uploads. A Nanopb MatrixConfig
+// reserves every effect/layout slot even for a tiny matrix; use it for staging.
+struct runtime_config {
+  explicit runtime_config(const matrix_config &config);
+  void copy_to(matrix_config &config) const;
+  heap_object<matrix_config> to_wire() const;
+  const std::vector<uint8_t> &encoded() const { return _encoded; }
+  uint32_t schema_version;
+  bool factory_default;
+  size_t effects_count, sources_count, conditions_count, entries_count, layout_count;
+  std::vector<matrix_effect> effects;
+  std::vector<mesh_interop_MatrixSource> sources;
+  std::vector<mesh_interop_MatrixCondition> conditions;
+  std::vector<mesh_interop_MatrixEntry> entries;
+  std::vector<mesh_interop_MatrixLayout> layout;
+private:
+  std::vector<uint8_t> _encoded;
+};
+
+// Keep only scheduling/rendering metadata after preparing effects. The protobuf
+// has room for 32 layers with 16 keyframes each, even for a one-layer rainbow.
+struct playback_layer {
+  uint32_t entry_id = 0, priority = 0, order = 0;
+};
+struct playback_definitions {
+  playback_definitions() = default;
+  playback_definitions(const animation_definitions &definitions);
+  playback_definitions(const matrix_config &config, const uint8_t *node_mac,
+                       uint64_t session, uint64_t revision);
+  uint64_t master_session = 0, revision = 0;
+  uint32_t canvas_size = 0;
+  size_t layers_count = 0, output_mappings_count = 0, gpio_inputs_count = 0;
+  std::array<playback_layer, 32> layers{};
+  std::array<output_mapping, MAX_SOURCES_PER_NODE> output_mappings{};
+  std::array<uint32_t, 32> gpio_inputs{};
+};
+
 uint32_t crc32(const uint8_t *data, size_t length);
-std::vector<uint8_t> encode(const pb_msgdesc_t *fields, const void *message);
+std::vector<uint8_t> encode(const pb_msgdesc_t *fields, const void *message, size_t limit = MAX_BYTES);
 bool decode(const pb_msgdesc_t *fields, void *message,
             const uint8_t *data, size_t length);
 
@@ -49,7 +91,9 @@ const char *validate(const matrix_config &config, const uint8_t master_mac[6]);
 animation_definitions definitions_for(const matrix_config &config, const uint8_t *node_mac,
                             uint64_t session, uint64_t revision);
 // Heap-backed to keep keyframe buffers off the worker stack; nullptr on allocation failure.
-std::unique_ptr<animation_definitions> make_definitions(const matrix_config &config,
+heap_object<animation_definitions> make_definitions(const matrix_config &config,
+    const uint8_t *node_mac, uint64_t session, uint64_t revision);
+heap_object<animation_definitions> make_definitions(const runtime_config &config,
     const uint8_t *node_mac, uint64_t session, uint64_t revision);
 
 // One reusable instance per layer; commands and snapshots never evaluate rules.
@@ -57,13 +101,17 @@ class player {
 public:
   explicit player(driver_resolver resolver = nullptr) : _resolver(resolver) {}
   bool prepare(const animation_definitions &definitions);
+  bool prepare(const matrix_config &config, const uint8_t *node_mac,
+               uint64_t session, uint64_t revision);
+  bool prepare(const player &source);
   bool enqueue(const animation_command &command);
   bool restore(const animation_snapshot &snapshot);
-  animation_snapshot snapshot(const animation_definitions &subset, uint32_t sequence,
+  animation_snapshot snapshot(const playback_definitions &subset, uint32_t sequence,
                     uint64_t activate_at) const;
-  esp_err_t tick(uint64_t now, bool render = true);
+  esp_err_t tick(uint64_t now, bool render = true, uint32_t excluded_driver = 0, uint32_t excluded_source = 0);
   esp_err_t blank();
-  const animation_definitions &definitions() const { return _definitions; }
+  const playback_definitions &definitions() const { return _definitions; }
+  const std::vector<uint8_t> &definition_bytes() const { return _definition_bytes; }
 private:
   struct layer {
     std::unique_ptr<animation_effect_instance_base> effect;
@@ -73,7 +121,10 @@ private:
     uint64_t elapsed = 0;
   };
   int find(uint32_t id) const;
-  animation_definitions _definitions{};
+  bool prepare(const playback_definitions &definitions,
+               const std::array<const matrix_effect *, 32> &effects);
+  playback_definitions _definitions{};
+  std::vector<uint8_t> _definition_bytes;
   std::array<layer, 32> _layers;
   std::array<animation_command, 64> _pending{};
   size_t _pending_count = 0;
@@ -83,11 +134,23 @@ private:
 class evaluator {
 public:
   using command_sink = bool (*)(void *, const animation_command &);
-  void configure(const matrix_config *config, uint64_t session, uint64_t revision);
+  template <typename config_type>
+  void configure(const config_type *config, uint64_t session, uint64_t revision) {
+    _entries = config ? std::data(config->entries) : nullptr;
+    _sources = config ? std::data(config->sources) : nullptr;
+    _effects = config ? std::data(config->effects) : nullptr;
+    _entries_count = config ? config->entries_count : 0;
+    _sources_count = config ? config->sources_count : 0;
+    _effects_count = config ? config->effects_count : 0;
+    _session = session; _revision = revision; _starts.fill(0); _active.fill(false);
+  }
   void tick(uint64_t now, const trigger_gpio_edge_t *edges, size_t edge_count,
             uint64_t edge_time, command_sink sink, void *arg);
 private:
-  const matrix_config *_config = nullptr;
+  const mesh_interop_MatrixEntry *_entries = nullptr;
+  const mesh_interop_MatrixSource *_sources = nullptr;
+  const matrix_effect *_effects = nullptr;
+  size_t _entries_count = 0, _sources_count = 0, _effects_count = 0;
   uint64_t _session = 0, _revision = 0;
   std::array<uint64_t, 32> _starts{};
   std::array<bool, 32> _active{};

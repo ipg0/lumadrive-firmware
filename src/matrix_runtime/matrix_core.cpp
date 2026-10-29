@@ -21,9 +21,9 @@ uint32_t crc32(const uint8_t *data, size_t length) {
   return ~crc;
 }
 
-std::vector<uint8_t> encode(const pb_msgdesc_t *fields, const void *message) {
+std::vector<uint8_t> encode(const pb_msgdesc_t *fields, const void *message, size_t limit) {
   size_t size = 0;
-  if (!pb_get_encoded_size(&size, fields, message) || size > MAX_BYTES) return {};
+  if (!pb_get_encoded_size(&size, fields, message) || size > limit) return {};
   std::vector<uint8_t> bytes(size);
   auto stream = pb_ostream_from_buffer(bytes.data(), size);
   if (!pb_encode(&stream, fields, message)) return {};
@@ -34,6 +34,29 @@ bool decode(const pb_msgdesc_t *fields, void *message,
   if (length > MAX_BYTES) return false;
   auto stream = pb_istream_from_buffer(data, length);
   return pb_decode(&stream, fields, message) && stream.bytes_left == 0;
+}
+runtime_config::runtime_config(const matrix_config &c)
+    : schema_version(c.schema_version), factory_default(c.factory_default),
+      effects_count(c.effects_count), sources_count(c.sources_count), conditions_count(c.conditions_count),
+      entries_count(c.entries_count), layout_count(c.layout_count),
+      effects(c.effects, c.effects + c.effects_count), sources(c.sources, c.sources + c.sources_count),
+      conditions(c.conditions, c.conditions + c.conditions_count), entries(c.entries, c.entries + c.entries_count),
+      layout(c.layout, c.layout + c.layout_count),
+      _encoded(encode(mesh_interop_MatrixConfig_fields, &c)) {}
+void runtime_config::copy_to(matrix_config &c) const {
+  c.schema_version = schema_version; c.factory_default = factory_default;
+  c.effects_count = effects_count; c.sources_count = sources_count; c.conditions_count = conditions_count;
+  c.entries_count = entries_count; c.layout_count = layout_count;
+  std::copy(effects.begin(), effects.end(), c.effects);
+  std::copy(sources.begin(), sources.end(), c.sources);
+  std::copy(conditions.begin(), conditions.end(), c.conditions);
+  std::copy(entries.begin(), entries.end(), c.entries);
+  std::copy(layout.begin(), layout.end(), c.layout);
+}
+heap_object<matrix_config> runtime_config::to_wire() const {
+  auto c = make_heap_object<matrix_config>();
+  if (c) copy_to(*c);
+  return c;
 }
 bool receiver::begin(uint32_t id, size_t size, uint32_t checksum, uint64_t now) {
   if (!id || !size || size > MAX_BYTES) return false;
@@ -67,7 +90,7 @@ bool receiver::complete(uint32_t id) const {
 void receiver::expire(uint64_t now) {
   if (_id && now - _touched >= TRANSFER_TIMEOUT_US) reset();
 }
-void receiver::reset() { _id = 0; _offset = 0; _bytes.clear(); }
+void receiver::reset() { _id = 0; _offset = 0; std::vector<uint8_t>().swap(_bytes); }
 
 template <class item_type> const item_type *lookup(const item_type *items, size_t count, uint32_t id) {
   for (size_t i = 0; i < count; ++i) if (items[i].id == id) return items + i;
@@ -89,7 +112,7 @@ template <class enum_type> auto enum_value(const enum_type &value) {
 }
 bool valid_driver(const mesh_interop_MatrixDriver &driver) {
   const auto value = enum_value(driver);
-  return value == mesh_interop_MatrixDriver_WS2812 || value == mesh_interop_MatrixDriver_HC595;
+  return value >= 1 && value <= MAX_DRIVERS_PER_NODE;
 }
 std::array<animation_keyframe, MAX_ANIMATION_KEYFRAMES> effect_keyframes(const matrix_effect &e) {
   std::array<animation_keyframe, MAX_ANIMATION_KEYFRAMES> frames{};
@@ -118,6 +141,7 @@ const char *validate_effect(const matrix_effect &e) {
     if (e.duty_percent > 100) return "Blink duty must be 1..100 percent (zero defaults to 50)";
     break;
   case mesh_interop_MatrixEffect_Kind_BREATHE: break;
+  case mesh_interop_MatrixEffect_Kind_RAINBOW: break;
   case mesh_interop_MatrixEffect_Kind_FLOWING_GRADIENT:
     if (!e.has_secondary_color) return "Flowing gradient requires a secondary color";
     break;
@@ -148,13 +172,15 @@ animation_effect_instance_base *create_effect(const matrix_effect &e) {
     return animation_effect_descriptor<animation_effect_type::BREATHE>(options).create_instance();
   case mesh_interop_MatrixEffect_Kind_FLOWING_GRADIENT:
     return animation_effect_descriptor<animation_effect_type::FLOWING_GRADIENT>(options).create_instance();
+  case mesh_interop_MatrixEffect_Kind_RAINBOW:
+    return animation_effect_descriptor<animation_effect_type::RAINBOW>(options).create_instance();
   default: return nullptr;
   }
 }
 const char *validate(const matrix_config &c, const uint8_t master_mac[6]) {
   if (c.schema_version != SCHEMA_VERSION) return "Unsupported schema version (expected 2)";
   if (c.entries_count > 32 || c.effects_count > 32 || c.sources_count > 32 ||
-      c.conditions_count > 32 || c.layout_count > 34) return "Too many definitions";
+      c.conditions_count > 32 || c.layout_count > MAX_LAYOUT_SOURCES) return "Too many definitions";
   if (!unique(c.effects, c.effects_count) || !unique(c.sources, c.sources_count) ||
       !unique(c.conditions, c.conditions_count) || !unique(c.entries, c.entries_count))
     return "Definition IDs must be nonzero and unique";
@@ -175,13 +201,15 @@ const char *validate(const matrix_config &c, const uint8_t master_mac[6]) {
       return "Unsupported condition";
   for (size_t i = 0; i < c.layout_count; ++i) {
     const auto &m = c.layout[i];
-    if (!valid_driver(m.driver)) return "Unknown layout driver ID";
+    if (!valid_driver(m.driver) || m.source_index > 1) return "Unknown layout driver or source ID";
     if ((m.node_mac[0] & 1) ||
         std::all_of(m.node_mac, m.node_mac + 6, [](uint8_t v) { return v == 0; })) return "Invalid layout MAC";
     if (m.from == m.to || std::max(m.from, m.to) > 65536) return "Invalid layout bounds";
+    if (m.car_position < mesh_interop_CarPosition_POSITION_UNSPECIFIED ||
+        m.car_position > mesh_interop_CarPosition_REAR_RIGHT_DOOR) return "Unknown car position";
     for (size_t j = 0; j < i; ++j)
-      if (!memcmp(m.node_mac, c.layout[j].node_mac, 6) && m.driver == c.layout[j].driver)
-        return "Duplicate layout node/driver";
+      if (!memcmp(m.node_mac, c.layout[j].node_mac, 6) && m.driver == c.layout[j].driver && m.source_index == c.layout[j].source_index)
+        return "Duplicate layout node/driver/source";
   }
   size_t node_count = 0;
   for (size_t i = 0; i < c.layout_count; ++i) {
@@ -215,14 +243,15 @@ const char *validate(const matrix_config &c, const uint8_t master_mac[6]) {
   }
   return nullptr;
 }
-void fill_definitions(const matrix_config &c, const uint8_t *mac,
+template <typename config_type>
+void fill_definitions(const config_type &c, const uint8_t *mac,
                       uint64_t session, uint64_t revision, animation_definitions &d) {
   d.schema_version = SCHEMA_VERSION; d.master_session = session; d.revision = revision;
   for (size_t i = 0; i < c.layout_count; ++i) {
     const auto &m = c.layout[i];
     d.canvas_size = std::max(d.canvas_size, std::max(m.from, m.to));
     if (mac && !memcmp(m.node_mac, mac, 6))
-      d.output_mappings[d.output_mappings_count++] = {m.driver, m.from, m.to};
+      d.output_mappings[d.output_mappings_count++] = {m.driver, m.from, m.to, m.source_index};
   }
   for (size_t i = 0; mac && i < c.sources_count; ++i) {
     const auto &s = c.sources[i];
@@ -235,7 +264,7 @@ void fill_definitions(const matrix_config &c, const uint8_t *mac,
     if (mac && !d.output_mappings_count) continue;
     auto &layer = d.layers[d.layers_count++];
     layer.entry_id = e.id; layer.has_effect = true;
-    layer.effect = *lookup(c.effects, c.effects_count, e.effect_id);
+    layer.effect = *lookup(std::data(c.effects), c.effects_count, e.effect_id);
     layer.priority = e.priority; layer.order = i;
   }
 }
@@ -245,12 +274,28 @@ animation_definitions definitions_for(const matrix_config &c, const uint8_t *mac
   fill_definitions(c, mac, session, revision, d);
   return d;
 }
-std::unique_ptr<animation_definitions> make_definitions(const matrix_config &c,
+heap_object<animation_definitions> make_definitions(const matrix_config &c,
     const uint8_t *mac, uint64_t session, uint64_t revision) {
-  std::unique_ptr<animation_definitions> d(new (std::nothrow) animation_definitions{});
+  auto d = make_heap_object<animation_definitions>();
   if (!d) return nullptr;
   fill_definitions(c, mac, session, revision, *d);
   return d;
+}
+heap_object<animation_definitions> make_definitions(const runtime_config &c,
+    const uint8_t *mac, uint64_t session, uint64_t revision) {
+  auto d = make_heap_object<animation_definitions>();
+  if (d) fill_definitions(c, mac, session, revision, *d);
+  return d;
+}
+
+playback_definitions::playback_definitions(const animation_definitions &d)
+    : master_session(d.master_session), revision(d.revision), canvas_size(d.canvas_size),
+      layers_count(d.layers_count), output_mappings_count(d.output_mappings_count),
+      gpio_inputs_count(d.gpio_inputs_count) {
+  for (size_t i = 0; i < std::min(layers_count, layers.size()); ++i)
+    layers[i] = {d.layers[i].entry_id, d.layers[i].priority, d.layers[i].order};
+  std::copy_n(d.output_mappings, std::min(output_mappings_count, output_mappings.size()), output_mappings.begin());
+  std::copy_n(d.gpio_inputs, std::min(gpio_inputs_count, gpio_inputs.size()), gpio_inputs.begin());
 }
 
 int player::find(uint32_t id) const {
@@ -258,19 +303,91 @@ int player::find(uint32_t id) const {
     if (_definitions.layers[i].entry_id == id) return static_cast<int>(i);
   return -1;
 }
+playback_definitions::playback_definitions(const matrix_config &c, const uint8_t *mac,
+    uint64_t session, uint64_t rev) : master_session(session), revision(rev) {
+  for (size_t i = 0; i < c.layout_count; ++i) {
+    const auto &m = c.layout[i]; canvas_size = std::max(canvas_size, std::max(m.from, m.to));
+    if (mac && !memcmp(m.node_mac, mac, 6)) {
+      if (output_mappings_count < output_mappings.size())
+        output_mappings[output_mappings_count] = {m.driver, m.from, m.to, m.source_index};
+      ++output_mappings_count;
+    }
+  }
+  for (size_t i = 0; mac && i < c.sources_count; ++i) {
+    const auto &s = c.sources[i];
+    if (s.kind != mesh_interop_MatrixSource_Kind_GPIO_EDGE || memcmp(s.node_mac, mac, 6)) continue;
+    if (std::find(gpio_inputs.begin(), gpio_inputs.begin() + gpio_inputs_count, s.gpio) == gpio_inputs.begin() + gpio_inputs_count)
+      gpio_inputs[gpio_inputs_count++] = s.gpio;
+  }
+  if (!mac || output_mappings_count) for (size_t i = 0; i < c.entries_count; ++i)
+    layers[layers_count++] = {c.entries[i].id, c.entries[i].priority, uint32_t(i)};
+}
+
+// Stream one layer at a time instead of materializing the 25 KiB Nanopb array.
+// Embedded messages still use generated Nanopb descriptors and the wire format
+// is identical to pb_encode(AnimationDefinitions).
+bool write_playback_definitions(pb_ostream_t &stream, const playback_definitions &d,
+    const std::array<const matrix_effect *, 32> &effects) {
+  auto scalar = [&](uint32_t tag, uint64_t value) {
+    return !value || (pb_encode_tag(&stream, PB_WT_VARINT, tag) && pb_encode_varint(&stream, value));
+  };
+  if (!scalar(mesh_interop_AnimationDefinitions_schema_version_tag, SCHEMA_VERSION) ||
+      !scalar(mesh_interop_AnimationDefinitions_master_session_tag, d.master_session) ||
+      !scalar(mesh_interop_AnimationDefinitions_revision_tag, d.revision)) return false;
+  for (size_t i = 0; i < d.layers_count; ++i) {
+    mesh_interop_AnimationLayer layer{};
+    layer.entry_id = d.layers[i].entry_id; layer.has_effect = true; layer.effect = *effects[i];
+    layer.priority = d.layers[i].priority; layer.order = d.layers[i].order;
+    if (!pb_encode_tag(&stream, PB_WT_STRING, mesh_interop_AnimationDefinitions_layers_tag) ||
+        !pb_encode_submessage(&stream, mesh_interop_AnimationLayer_fields, &layer)) return false;
+  }
+  if (d.gpio_inputs_count) {
+    pb_ostream_t size = PB_OSTREAM_SIZING;
+    for (size_t i = 0; i < d.gpio_inputs_count; ++i) if (!pb_encode_varint(&size, d.gpio_inputs[i])) return false;
+    if (!pb_encode_tag(&stream, PB_WT_STRING, mesh_interop_AnimationDefinitions_gpio_inputs_tag) ||
+        !pb_encode_varint(&stream, size.bytes_written)) return false;
+    for (size_t i = 0; i < d.gpio_inputs_count; ++i) if (!pb_encode_varint(&stream, d.gpio_inputs[i])) return false;
+  }
+  if (!scalar(mesh_interop_AnimationDefinitions_canvas_size_tag, d.canvas_size)) return false;
+  for (size_t i = 0; i < d.output_mappings_count; ++i)
+    if (!pb_encode_tag(&stream, PB_WT_STRING, mesh_interop_AnimationDefinitions_output_mappings_tag) ||
+        !pb_encode_submessage(&stream, mesh_interop_AnimationOutputMapping_fields, &d.output_mappings[i])) return false;
+  return true;
+}
 bool player::prepare(const animation_definitions &d) {
-  if (d.schema_version != SCHEMA_VERSION || !d.master_session || !d.revision || d.layers_count > 32 ||
-      d.gpio_inputs_count > 32 || d.canvas_size > 65536 || d.output_mappings_count > 2 ||
+  if (d.schema_version != SCHEMA_VERSION || d.layers_count > 32) return false;
+  std::array<const matrix_effect *, 32> effects{};
+  for (size_t i = 0; i < d.layers_count; ++i) {
+    if (!d.layers[i].has_effect) return false;
+    effects[i] = &d.layers[i].effect;
+  }
+  return prepare(playback_definitions(d), effects);
+}
+bool player::prepare(const matrix_config &c, const uint8_t *mac, uint64_t session, uint64_t rev) {
+  if (c.schema_version != SCHEMA_VERSION || c.entries_count > 32 || c.sources_count > 32 ||
+      c.effects_count > 32 || c.layout_count > MAX_LAYOUT_SOURCES) return false;
+  playback_definitions d(c, mac, session, rev);
+  std::array<const matrix_effect *, 32> effects{};
+  for (size_t i = 0; i < d.layers_count; ++i)
+    effects[i] = lookup(c.effects, c.effects_count, c.entries[i].effect_id);
+  return prepare(d, effects);
+}
+bool player::prepare(const playback_definitions &d, const std::array<const matrix_effect *, 32> &effects) {
+  if (!d.master_session || !d.revision || d.layers_count > 32 ||
+      d.gpio_inputs_count > 32 || d.canvas_size > 65536 || d.output_mappings_count > MAX_SOURCES_PER_NODE ||
       (!d.canvas_size && (d.output_mappings_count || d.layers_count)) ||
       (_resolver && d.layers_count && !d.output_mappings_count))
     return false;
   for (size_t i = 0; i < d.output_mappings_count; ++i) {
     const auto &m = d.output_mappings[i];
-    if (!valid_driver(m.driver) || m.from == m.to || std::max(m.from, m.to) > d.canvas_size) return false;
-    for (size_t j = 0; j < i; ++j) if (d.output_mappings[j].driver == m.driver) return false;
+    if (!valid_driver(m.driver) || m.source_index > 1 || m.from == m.to || std::max(m.from, m.to) > d.canvas_size) return false;
+    for (size_t j = 0; j < i; ++j)
+      if (d.output_mappings[j].driver == m.driver && d.output_mappings[j].source_index == m.source_index) return false;
     if (_resolver) {
       auto *driver = _resolver(m.driver);
-      if (!driver || !linear_lighting_driver_view(*driver, m.from, m.to, d.canvas_size).valid()) return false;
+      const auto count = std::max(m.from, m.to) - std::min(m.from, m.to);
+      if (!driver || driver->reserve_layout_pixels(m.source_index, count) != ESP_OK) return false;
+      if (!driver || !linear_lighting_driver_view(*driver, m.from, m.to, d.canvas_size, m.source_index).valid()) return false;
     }
   }
   for (size_t i = 0; i < d.gpio_inputs_count; ++i) {
@@ -279,16 +396,26 @@ bool player::prepare(const animation_definitions &d) {
   }
   for (size_t i = 0; i < d.layers_count; ++i) {
     const auto &l = d.layers[i];
-    if (!l.entry_id || !l.has_effect || validate_effect(l.effect) || l.priority > 255) return false;
+    if (!l.entry_id || !effects[i] || validate_effect(*effects[i]) || l.priority > 255) return false;
     for (size_t j = 0; j < i; ++j) if (d.layers[j].entry_id == l.entry_id) return false;
   }
-  _definitions = d; _pending_count = 0;
+  pb_ostream_t size = PB_OSTREAM_SIZING;
+  if (!write_playback_definitions(size, d, effects) || size.bytes_written > MAX_BYTES) return false;
+  std::vector<uint8_t> bytes(size.bytes_written);
+  auto stream = pb_ostream_from_buffer(bytes.data(), bytes.size());
+  if (!write_playback_definitions(stream, d, effects)) return false;
+  _definitions = d; _definition_bytes = std::move(bytes); _pending_count = 0;
   for (auto &l : _layers) l = layer{};
   for (size_t i = 0; i < d.layers_count; ++i) {
-    _layers[i].effect.reset(create_effect(d.layers[i].effect));
+    _layers[i].effect.reset(create_effect(*effects[i]));
     if (!_layers[i].effect) return false;
   }
   return true;
+}
+bool player::prepare(const player &source) {
+  auto d = make_heap_object<animation_definitions>();
+  return d && decode(mesh_interop_AnimationDefinitions_fields, d.get(),
+      source._definition_bytes.data(), source._definition_bytes.size()) && prepare(*d);
 }
 bool player::enqueue(const animation_command &c) {
   if (c.master_session != _definitions.master_session || c.revision != _definitions.revision ||
@@ -320,12 +447,13 @@ bool player::restore(const animation_snapshot &s) {
   for (size_t i = 0; i < s.pending_count; ++i) enqueue(s.pending[i]);
   return true;
 }
-animation_snapshot player::snapshot(const animation_definitions &subset, uint32_t sequence, uint64_t activate) const {
+animation_snapshot player::snapshot(const playback_definitions &subset, uint32_t sequence, uint64_t activate) const {
   animation_snapshot s{};
   s.master_session = _definitions.master_session; s.revision = _definitions.revision;
   s.sequence = sequence; s.activate_at_us = activate;
   auto included = [&](uint32_t id) {
-    for (size_t i = 0; i < subset.layers_count; ++i) if (subset.layers[i].entry_id == id) return true;
+    for (size_t i = 0; i < std::min(subset.layers_count, subset.layers.size()); ++i)
+      if (subset.layers[i].entry_id == id) return true;
     return false;
   };
   for (size_t i = 0; i < _definitions.layers_count; ++i) {
@@ -352,7 +480,7 @@ esp_err_t player::blank() {
   }
   return result;
 }
-esp_err_t player::tick(uint64_t now, bool render) {
+esp_err_t player::tick(uint64_t now, bool render, uint32_t excluded_driver, uint32_t excluded_source) {
   while (_pending_count && _pending[0].effective_at_us <= now) {
     const auto c = _pending[0];
     auto &l = _layers[find(c.entry_id)];
@@ -391,8 +519,9 @@ esp_err_t player::tick(uint64_t now, bool render) {
     if (_layers[i].active && _layers[i].begun) {
       for (size_t k = 0; k < _definitions.output_mappings_count; ++k) {
         const auto &mapping = _definitions.output_mappings[k];
+        if (mapping.driver == excluded_driver && mapping.source_index == excluded_source) continue;
         auto *driver = _resolver(mapping.driver);
-        linear_lighting_driver_view view(*driver, mapping.from, mapping.to, _definitions.canvas_size);
+        linear_lighting_driver_view view(*driver, mapping.from, mapping.to, _definitions.canvas_size, mapping.source_index);
         auto err = _layers[i].effect->render(view);
         if (err != ESP_OK) return err;
       }
@@ -400,20 +529,17 @@ esp_err_t player::tick(uint64_t now, bool render) {
   }
   esp_err_t result = ESP_OK;
   for (size_t i = 0; i < count; ++i) {
+    if (excluded_driver && drivers[i] == _resolver(excluded_driver)) continue;
     auto err = drivers[i]->show(); if (result == ESP_OK) result = err;
   }
   return result;
 }
-void evaluator::configure(const matrix_config *c, uint64_t session, uint64_t revision) {
-  _config = c; _session = session; _revision = revision; _starts.fill(0); _active.fill(false);
-}
 void evaluator::tick(uint64_t now, const trigger_gpio_edge_t *edges, size_t count,
                      uint64_t edge_time, command_sink sink, void *arg) {
-  if (!_config) return;
-  for (size_t i = 0; i < _config->entries_count; ++i) {
-    const auto &entry = _config->entries[i];
-    const auto &source = *lookup(_config->sources, _config->sources_count, entry.source_id);
-    const auto &effect = *lookup(_config->effects, _config->effects_count, entry.effect_id);
+  for (size_t i = 0; i < _entries_count; ++i) {
+    const auto &entry = _entries[i];
+    const auto &source = *lookup(_sources, _sources_count, entry.source_id);
+    const auto &effect = *lookup(_effects, _effects_count, entry.effect_id);
     if (_active[i] && effect.duration_ms && now >= _starts[i] &&
         (now - _starts[i]) / 1000 >= effect.duration_ms) _active[i] = false;
     bool fired = source.kind == mesh_interop_MatrixSource_Kind_DEFAULT_STATE && !_active[i];

@@ -1,6 +1,8 @@
 #include "matrix_service.hpp"
 #include "matrix_core.hpp"
 #include "matrix_wire.hpp"
+#include "default_matrix.hpp"
+#include "../lighting_driver/impl/linear_lighting_driver_view.hpp"
 #include "../connected_lighting_drivers/connected_lighting_drivers.hpp"
 #include "../global_config/global_config.hpp"
 #include "../master_clock_manager/master_clock_manager.hpp"
@@ -12,6 +14,7 @@
 #include <cstring>
 #include <cstdio>
 #include <new>
+#include <type_traits>
 #include <esp_log.h>
 #include <esp_now.h>
 #include <esp_random.h>
@@ -20,11 +23,56 @@
 #include <freertos/queue.h>
 #include <freertos/task.h>
 #include <nvs.h>
+#include <pb_decode.h>
+#ifdef ESP_PLATFORM
+#include <esp_heap_caps.h>
+#endif
 
 namespace matrix_service {
 namespace {
 using namespace matrix;
 namespace w = matrix::wire;
+// Decode an editor patch directly into the replacement matrix. Keeping a
+// maximum-sized LayoutUpdate/MatrixUpdate alongside it exhausts fragmented RAM
+// even for tiny edits. Nanopb still decodes and bounds every nested message.
+bool decode_editor_update(const std::vector<uint8_t> &bytes, bool layout,
+    matrix_config &config, uint64_t &expected_revision, uint64_t &master_session) {
+  if (bytes.size() > MAX_BYTES) return false;
+  expected_revision = master_session = 0;
+  if (layout) config.layout_count = 0;
+  else config.effects_count = config.sources_count = config.conditions_count = config.entries_count = 0;
+  auto stream = pb_istream_from_buffer(bytes.data(), bytes.size());
+  while (stream.bytes_left) {
+    pb_wire_type_t wire;
+    uint32_t tag;
+    bool eof;
+    if (!pb_decode_tag(&stream, &wire, &tag, &eof) || !tag) return false;
+    if (tag == 1 || tag == 2) {
+      if (wire != PB_WT_VARINT || !pb_decode_varint(&stream, tag == 1 ? &expected_revision : &master_session)) return false;
+      continue;
+    }
+    const auto repeated = [&](const pb_msgdesc_t *fields, auto &values, auto &count) {
+      if (wire != PB_WT_STRING || count >= std::size(values)) return false;
+      pb_istream_t message;
+      if (!pb_make_string_substream(&stream, &message)) return false;
+      if (!pb_decode(&message, fields, &values[count]) || !pb_close_string_substream(&stream, &message)) return false;
+      ++count;
+      return true;
+    };
+    if (layout && tag == mesh_interop_LayoutUpdate_layout_tag) {
+      if (!repeated(mesh_interop_MatrixLayout_fields, config.layout, config.layout_count)) return false;
+    } else if (!layout && tag == mesh_interop_MatrixUpdate_effects_tag) {
+      if (!repeated(mesh_interop_MatrixEffect_fields, config.effects, config.effects_count)) return false;
+    } else if (!layout && tag == mesh_interop_MatrixUpdate_sources_tag) {
+      if (!repeated(mesh_interop_MatrixSource_fields, config.sources, config.sources_count)) return false;
+    } else if (!layout && tag == mesh_interop_MatrixUpdate_conditions_tag) {
+      if (!repeated(mesh_interop_MatrixCondition_fields, config.conditions, config.conditions_count)) return false;
+    } else if (!layout && tag == mesh_interop_MatrixUpdate_entries_tag) {
+      if (!repeated(mesh_interop_MatrixEntry_fields, config.entries, config.entries_count)) return false;
+    } else if (!pb_skip_field(&stream, wire)) return false;
+  }
+  return true;
+}
 constexpr auto STAGE_RECEIVING = mesh_interop_MatrixStatus_Stage_RECEIVING;
 constexpr auto STAGE_FAILED = mesh_interop_MatrixStatus_Stage_FAILED;
 constexpr auto STAGE_DISTRIBUTING = mesh_interop_MatrixStatus_Stage_DISTRIBUTING;
@@ -56,6 +104,8 @@ std::mutex status_mutex;
 mesh_interop_MatrixStatus published{};
 std::array<uint8_t, 512> published_bytes{};
 size_t published_size = 0;
+std::array<uint8_t, 512> layout_response_bytes{0x08, 0};
+size_t layout_response_size = 2;
 
 struct peer {
   uint8_t mac[6]{};
@@ -75,6 +125,11 @@ struct peer {
   size_t retired_gpio_index = 0;
   uint32_t gpio_sequence = 0;
   bool gpio_degraded = false;
+  bool catalog_known = false;
+  size_t outputs_count = 0;
+  std::array<mesh_interop_LayoutOutput, MAX_SOURCES_PER_NODE> outputs{};
+  uint64_t catalog_at = 0, catalog_retry = 0;
+  uint64_t gpio_mask = 0;
 };
 struct outbound {
   int peer_index = -1;
@@ -97,18 +152,44 @@ public:
   uint8_t inbound_kind = 0;
   uint64_t inbound_revision = 0;
   bool deployment = false;
+  bool standalone_default = false;
+  bool default_layout_dirty = false;
+  bool configuration_persisted = false, active_persisted = false;
+  bool upload_is_layout = false;
+  bool upload_is_matrix = false;
+  bool snapshot_is_matrix = false;
+  bool snapshot_is_active = false;
+  std::vector<uint8_t> layout_snapshot_bytes;
+  std::vector<mesh_interop_LayoutOutput> snapshot_outputs;
+  uint32_t layout_snapshot_id = 0, layout_generation = 0;
+  uint16_t layout_connection = 0;
+  uint64_t layout_touched = 0;
+  uint32_t identify_driver = 0, last_identify_id = 0, last_identify_driver = 0;
+  uint32_t identify_source = 0, last_identify_source = 0;
+  uint32_t identify_length = 0, last_identify_length = 0;
+  bool identify_reversed = false, last_identify_reversed = false;
+  uint64_t identify_until = 0;
+  bool last_identify_ok = false;
+  struct identify_request {
+    bool active = false;
+    int peer_index = -1;
+    uint32_t request_id = 0, wire_id = 0, driver = 0, source = 0, generation = 0, length = 0;
+    bool reversed = false;
+    unsigned retries = 0;
+    uint64_t sent_at = 0;
+  } identifying;
   bool configured_pins[40]{};
   uint64_t gpio_stream = 0, gpio_last_send = 0;
   uint32_t gpio_sequence = 0;
   unsigned gpio_retries = 0;
   bool gpio_degraded = false;
   std::deque<pending_gpio_event> gpio_events;
-  std::unique_ptr<matrix_config> config, candidate;
-  std::unique_ptr<matrix_config> retiring_config;
-  std::unique_ptr<player> ledger, local, pending_player;
-  std::unique_ptr<player> prepared_ledger, prepared_local;
-  std::unique_ptr<player> retiring_ledger;
-  std::unique_ptr<animation_snapshot> pending_snapshot;
+  heap_object<runtime_config> config, candidate;
+  heap_object<runtime_config> retiring_config;
+  heap_object<player> ledger, local, pending_player;
+  heap_object<player> prepared_ledger, prepared_local;
+  heap_object<player> retiring_ledger;
+  heap_object<animation_snapshot> pending_snapshot;
   evaluator rules;
   evaluator retiring_rules;
   receiver ble_rx, radio_rx;
@@ -121,6 +202,14 @@ public:
     snprintf(state.error, sizeof(state.error), "%s", message);
     if (fatal) state.stage = STAGE_FAILED;
     ESP_LOGW("matrix", "%s", message);
+  }
+  void log_memory() const {
+#ifdef ESP_PLATFORM
+    ESP_LOGI("matrix", "Free heap: %u largest: %u; matrix stack headroom: %u bytes; player: %u bytes",
+        unsigned(heap_caps_get_free_size(MALLOC_CAP_8BIT)),
+        unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+        unsigned(uxTaskGetStackHighWaterMark(nullptr)), unsigned(sizeof(player)));
+#endif
   }
   void publish() {
     bool changed;
@@ -156,18 +245,31 @@ public:
       const auto &m = c.layout[i];
       if (!memcmp(m.node_mac, mac, 6)) {
         auto *driver = connected_lighting_drivers::find(m.driver);
-        if (!driver || std::max(m.from, m.to) - std::min(m.from, m.to) != driver->get_pixel_count())
-          return "Layout span does not match local driver length";
+        if (!driver || m.source_index >= driver->get_layout_source_count() ||
+            std::max(m.from, m.to) - std::min(m.from, m.to) > driver->get_layout_max_pixel_count(m.source_index))
+          return "Layout span exceeds local driver capacity";
       } else if (check_peers && !mesh_interop::instance().slave_node_exists(m.node_mac))
         return "Layout node is not paired";
+      else {
+        const auto index = find_peer(m.node_mac);
+        if (index >= 0 && peers[index].catalog_known) {
+          const auto &p = peers[index]; bool found = false;
+          for (size_t j = 0; j < p.outputs_count; ++j)
+            if (p.outputs[j].driver == m.driver && p.outputs[j].source_index == m.source_index &&
+                p.outputs[j].max_pixel_count >= std::max(m.from, m.to) - std::min(m.from, m.to)) found = true;
+          if (!found) return "Layout length exceeds reported hardware capacity";
+        }
+      }
     }
     for (size_t i = 0; i < c.sources_count; ++i) {
       auto &s = c.sources[i];
       if (s.kind != mesh_interop_MatrixSource_Kind_GPIO_EDGE) continue;
-      // Nodes run the same wiring configuration; the owner also checks on receipt.
-      if (!valid_input(s.gpio)) return "GPIO is invalid or reserved by firmware";
+      if (!memcmp(s.node_mac, mac, 6) && !valid_input(s.gpio)) return "GPIO is invalid or reserved by firmware";
       if (check_peers && memcmp(s.node_mac, mac, 6) &&
           !mesh_interop::instance().slave_node_exists(s.node_mac)) return "GPIO source node is not paired";
+      const auto owner = memcmp(s.node_mac, mac, 6) ? find_peer(s.node_mac) : -1;
+      if (owner >= 0 && peers[owner].catalog_known &&
+          !(peers[owner].gpio_mask & (1ULL << s.gpio))) return "GPIO is reserved on the source node";
     }
     return nullptr;
   }
@@ -184,7 +286,12 @@ public:
         pin != CONFIG_ROLE_GPIO && pin != CONFIG_DISCOVERY_GPIO &&
         !connected_lighting_drivers::uses_gpio(pin) && !(pin >= 6 && pin <= 11);
   }
-  bool prepare_gpio(const animation_definitions &d) {
+  static uint64_t input_mask() {
+    uint64_t mask = 0;
+    for (uint32_t pin = 0; pin < 40; ++pin) if (valid_input(pin)) mask |= 1ULL << pin;
+    return mask;
+  }
+  template <typename definitions_type> bool prepare_gpio(const definitions_type &d) {
     if (d.gpio_inputs_count > 32) return false;
     for (size_t i = 0; i < d.gpio_inputs_count; ++i)
       if (!valid_input(d.gpio_inputs[i])) return false;
@@ -210,8 +317,7 @@ public:
     return true;
   }
   bool prepare_gpio(const matrix_config &c) {
-    auto d = make_definitions(c, mac, session, revision);
-    return d && prepare_gpio(*d);
+    return prepare_gpio(playback_definitions(c, mac, session, revision));
   }
   bool save(const std::vector<uint8_t> &bytes, uint64_t rev) {
     std::vector<uint8_t> record;
@@ -225,21 +331,20 @@ public:
     nvs_close(handle); return err == ESP_OK;
   }
   bool prepare_runtime(const matrix_config &c, uint64_t rev) {
-    std::unique_ptr<player> next_ledger(new (std::nothrow) player);
+    auto next_ledger = make_heap_object<player>();
     if (!next_ledger) return false;
-    auto definitions = make_definitions(c, nullptr, session, rev);
-    if (!definitions || !next_ledger->prepare(*definitions)) return false;
-    definitions.reset();
-    std::unique_ptr<player> next_local(new (std::nothrow) player(connected_lighting_drivers::find));
+    if (!next_ledger->prepare(c, nullptr, session, rev)) return false;
+    auto next_local = make_heap_object<player>(connected_lighting_drivers::find);
     if (!next_local) return false;
-    definitions = make_definitions(c, mac, session, rev);
-    if (!definitions || !next_local->prepare(*definitions)) return false;
+    if (!next_local->prepare(c, mac, session, rev)) return false;
     prepared_ledger = std::move(next_ledger); prepared_local = std::move(next_local);
     return true;
   }
-  void load() {
+  bool load() {
     nvs_handle_t handle;
-    if (nvs_open("matrix", NVS_READONLY, &handle) != ESP_OK) return;
+    const auto opened = nvs_open("matrix", NVS_READONLY, &handle);
+    if (opened == ESP_ERR_NVS_NOT_FOUND) return false;
+    if (opened != ESP_OK) { error("Unable to read saved matrix", true); return true; }
     size_t size = 0;
     auto err = nvs_get_blob(handle, "config", nullptr, &size);
     std::vector<uint8_t> record;
@@ -247,26 +352,275 @@ public:
       record.resize(size); err = nvs_get_blob(handle, "config", record.data(), &size);
     }
     nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return false;
     if (record.empty() || err != ESP_OK || w::get(record.data(), 4) != w::MAGIC ||
         w::get(record.data() + 4, 4) != 1 || w::get(record.data() + 20, 4) != size - 24 ||
         crc32(record.data() + 24, size - 24) != w::get(record.data() + 16, 4)) {
-      error("Saved matrix record is invalid", true); return;
+      error("Saved matrix record is invalid", true); return true;
     }
-    std::unique_ptr<matrix_config> c(new (std::nothrow) matrix_config{});
+    auto c = make_heap_object<matrix_config>();
     if (!c || !decode(mesh_interop_MatrixConfig_fields, c.get(), record.data() + 24, size - 24) ||
         platform_validate(*c, false) || !prepare_gpio(*c)) {
-      error("Saved matrix cannot be restored", true); return;
+      error("Saved matrix cannot be restored", true); return true;
     }
     revision = w::get(record.data() + 8, 8);
-    if (!prepare_runtime(*c, revision)) { error("Unable to prepare saved matrix", true); return; }
+    if (!prepare_runtime(*c, revision)) { error("Unable to prepare saved matrix", true); return true; }
+    configuration_persisted = true;
     start_deployment(std::move(c));
+    return true;
   }
-  void start_deployment(std::unique_ptr<matrix_config> c) {
-    candidate = std::move(c); deployment = true; state.stage = STAGE_DISTRIBUTING;
+  bool install_standalone_default() {
+    auto c = make_default_config(mac, connected_lighting_drivers::find);
+    if (!c) return false;
+    auto definitions = make_definitions(*c, mac, session, 1);
+    auto next = make_heap_object<player>(connected_lighting_drivers::find);
+    if (!definitions || !next || !next->prepare(*definitions)) return false;
+    auto snapshot = make_heap_object<animation_snapshot>();
+    if (!snapshot) return false;
+    snapshot->master_session = session; snapshot->revision = 1;
+    snapshot->states_count = 1; snapshot->states[0] = {1, 0, true};
+    if (!next->restore(*snapshot)) return false;
+    if (local) local->blank();
+    auto compact = make_heap_object<runtime_config>(*c);
+    if (!compact) return false;
+    config = std::move(compact); local = std::move(next); revision = 1; standalone_default = true;
+    configuration_persisted = active_persisted = false;
+    state.stage = STAGE_ACTIVE; state.revision = revision;
+    return true;
+  }
+  void initialize_configuration() {
+    if (!master) {
+      if (!install_standalone_default()) error("Unable to prepare default matrix", true);
+      return;
+    }
+    if (load()) return;
+    auto c = make_default_config(mac, connected_lighting_drivers::find);
+    if (!c || validate(*c, mac) || !prepare_runtime(*c, 1)) {
+      error("Unable to prepare default matrix", true); return;
+    }
+    const auto bytes = encode(mesh_interop_MatrixConfig_fields, c.get());
+    configuration_persisted = !bytes.empty() && save(bytes, 1);
+    if (!configuration_persisted) error("Default matrix is active in RAM; NVS save failed");
+    revision = 1; start_deployment(std::move(c));
+  }
+  void extend_default_layout() {
+    if (!default_layout_dirty || !config || !config->factory_default || deployment || pending_snapshot || ble_rx.id()) return;
+    default_layout_dirty = false;
+    auto next = config->to_wire();
+    if (!next) return;
+    bool changed = false;
+    for (size_t i = 0; i < peer_count; ++i) {
+      const auto &peer = peers[i];
+      if (!peer.catalog_known || !mesh_interop::instance().slave_node_exists(peer.mac)) continue;
+      for (size_t j = 0; j < peer.outputs_count; ++j)
+        changed |= add_default_output(*next, peer.mac, peer.outputs[j].driver, peer.outputs[j].pixel_count,
+            peer.outputs[j].source_index, static_cast<lighting_driver_kind>(peer.outputs[j].driver_kind));
+    }
+    if (!changed || revision == UINT64_MAX || platform_validate(*next, true)) return;
+    const auto bytes = encode(mesh_interop_MatrixConfig_fields, next.get());
+    if (bytes.empty() || !prepare_runtime(*next, revision + 1)) return;
+    if (!save(bytes, revision + 1)) {
+      prepared_ledger.reset(); prepared_local.reset(); error("Unable to save default layout"); return;
+    }
+    configuration_persisted = true; ++revision; start_deployment(std::move(next));
+  }
+  void start_deployment(heap_object<matrix_config> c) {
+    auto compact = make_heap_object<runtime_config>(*c);
+    if (!compact) { error("Unable to retain prepared matrix", true); return; }
+    candidate = std::move(compact); deployment = true; state.stage = STAGE_DISTRIBUTING;
     state.revision = revision; tx = outbound{};
     for (auto &p : peers) {
       p.attempted = false; p.replacement_prepared = false;
     }
+  }
+  size_t own_outputs(mesh_interop_LayoutOutput *outputs) {
+    size_t count = 0;
+    for (uint32_t id = 1; id <= MAX_DRIVERS_PER_NODE; ++id) {
+      auto *driver = connected_lighting_drivers::find(id);
+      if (!driver) continue;
+      for (uint32_t source = 0; source < driver->get_layout_source_count() && count < MAX_SOURCES_PER_NODE; ++source) {
+        auto &o = outputs[count++]; o = {};
+        memcpy(o.node_mac, mac, 6); o.driver = static_cast<mesh_interop_MatrixDriver>(id);
+        o.pixel_count = driver->get_layout_default_pixel_count(source); o.online = true;
+        o.ready = driver->_is_ready(); o.known = true; o.source_index = source;
+        o.max_pixel_count = driver->get_layout_max_pixel_count(source);
+        o.driver_kind = static_cast<mesh_interop_MatrixDriverKind>(driver->get_kind());
+      }
+    }
+    return count;
+  }
+  void send_inventory(const uint8_t *destination) {
+    size_t count = 0;
+    for (uint32_t id = 1; id <= MAX_DRIVERS_PER_NODE; ++id) count += connected_lighting_drivers::find(id) != nullptr;
+    std::vector<uint8_t> body; w::put(body, session, 8); w::put(body, count, 1);
+    for (uint32_t id = 1; id <= MAX_DRIVERS_PER_NODE; ++id) {
+      auto *driver = connected_lighting_drivers::find(id); if (!driver) continue;
+      const auto count = driver->get_kind() == lighting_driver_kind::LED_STRIP ? driver->get_layout_default_pixel_count(0) : driver->get_pixel_count();
+      w::put(body, id, 4); w::put(body, count, 4);
+      w::put(body, driver->_is_ready(), 1); w::put(body, static_cast<uint8_t>(driver->get_kind()), 1);
+      w::put(body, driver->get_layout_max_pixel_count(0), 4);
+    }
+    w::put(body, input_mask(), 8);
+    send(destination, w::INVENTORY, body);
+  }
+  void publish_layout(mesh_interop_LayoutResponse &response) {
+    auto bytes = encode(mesh_interop_LayoutResponse_fields, &response);
+    std::lock_guard<std::mutex> lock(status_mutex);
+    if (bytes.size() > layout_response_bytes.size()) return;
+    memcpy(layout_response_bytes.data(), bytes.data(), bytes.size()); layout_response_size = bytes.size();
+  }
+  void layout_error(uint32_t request_id, const char *message) {
+    mesh_interop_LayoutResponse response{}; response.request_id = request_id;
+    snprintf(response.error, sizeof(response.error), "%s", message); publish_layout(response);
+  }
+  bool capture_layout(const packet &packet, uint64_t now) {
+    snapshot_is_matrix = false;
+    snapshot_is_active = false;
+    auto layout_snapshot = make_heap_object<mesh_interop_LayoutSnapshot>();
+    if (!layout_snapshot) return false;
+    auto &snapshot = *layout_snapshot; snapshot.master_session = session; snapshot.revision = revision;
+    memcpy(snapshot.master_mac, mac, 6);
+    const auto *saved = candidate ? candidate.get() : config.get();
+    if (saved) {
+      snapshot.layout_count = saved->layout_count;
+      std::copy_n(saved->layout.data(), saved->layout_count, snapshot.layout);
+    }
+    snapshot.outputs_count = own_outputs(snapshot.outputs);
+    auto mesh = mesh_interop::instance().get_state();
+    for (size_t i = 0; i < mesh.nodes_count; ++i) find_peer(mesh.nodes[i].mac);
+    for (size_t i = 0; i < peer_count; ++i) {
+      const auto &p = peers[i];
+      if (!p.catalog_known) ++snapshot.pending_nodes;
+      if (p.catalog_known) {
+        for (size_t j = 0; j < p.outputs_count && snapshot.outputs_count < MAX_INVENTORY_SOURCES; ++j) {
+          auto &out = snapshot.outputs[snapshot.outputs_count++]; out = p.outputs[j]; out.online = available(p, now);
+        }
+      } else if (saved) {
+        // Retain configured, currently unknown outputs without inventing hardware lengths.
+        for (size_t j = 0; j < saved->layout_count && snapshot.outputs_count < MAX_INVENTORY_SOURCES; ++j) {
+          if (memcmp(saved->layout[j].node_mac, p.mac, 6)) continue;
+          auto &out = snapshot.outputs[snapshot.outputs_count++];
+          memcpy(out.node_mac, p.mac, 6); out.driver = saved->layout[j].driver; out.online = available(p, now);
+          out.source_index = saved->layout[j].source_index;
+        }
+      }
+    }
+    layout_snapshot_bytes = encode(mesh_interop_LayoutSnapshot_fields, &snapshot, 32768);
+    snapshot_outputs.assign(snapshot.outputs, snapshot.outputs + snapshot.outputs_count);
+    layout_snapshot_id = esp_random(); if (!layout_snapshot_id) layout_snapshot_id = 1;
+    layout_generation = packet.generation; layout_connection = packet.connection; layout_touched = now;
+    return !layout_snapshot_bytes.empty();
+  }
+  bool capture_matrix(const packet &packet, uint64_t now, bool active = false) {
+    auto document = make_heap_object<mesh_interop_MatrixDocument>();
+    if (!document) return false;
+    const auto *saved = active ? (local ? (retiring_config ? retiring_config.get() : config.get()) : nullptr) :
+        candidate ? candidate.get() : config.get();
+    const auto bytes = saved ? saved->encoded() : std::vector<uint8_t>{8, SCHEMA_VERSION};
+    if (bytes.empty()) return false;
+    document->config.size = bytes.size(); memcpy(document->config.bytes, bytes.data(), bytes.size());
+    document->active_revision = local ? local->definitions().revision : 0;
+    document->activation_pending = deployment || pending_snapshot != nullptr;
+    document->persisted = active ? active_persisted : configuration_persisted;
+    document->revision = active ? document->active_revision : revision;
+    document->master_session = session; memcpy(document->master_mac, mac, 6);
+    auto mesh = mesh_interop::instance().get_state();
+    for (size_t i = 0; i < mesh.nodes_count; ++i) find_peer(mesh.nodes[i].mac);
+    auto add = [&](const uint8_t *address, uint64_t mask, bool known, bool online) {
+      auto &node = document->nodes[document->nodes_count++]; memcpy(node.node_mac, address, 6);
+      node.known = known; node.online = online;
+      for (uint32_t pin = 0; pin < 40; ++pin) if (mask & (1ULL << pin)) node.gpios[node.gpios_count++] = pin;
+    };
+    add(mac, input_mask(), true, true);
+    for (size_t i = 0; i < peer_count && document->nodes_count < 17; ++i)
+      if (mesh_interop::instance().slave_node_exists(peers[i].mac))
+        add(peers[i].mac, peers[i].gpio_mask, peers[i].catalog_known, available(peers[i], now));
+    layout_snapshot_bytes = encode(mesh_interop_MatrixDocument_fields, document.get(), 32768);
+    snapshot_outputs.clear(); snapshot_is_matrix = true; snapshot_is_active = active;
+    layout_snapshot_id = esp_random(); if (!layout_snapshot_id) layout_snapshot_id = 1;
+    layout_generation = packet.generation; layout_connection = packet.connection; layout_touched = now;
+    return !layout_snapshot_bytes.empty();
+  }
+  void clear_identified_source() {
+    auto *driver = connected_lighting_drivers::find(identify_driver);
+    if (!driver) return;
+    const auto length = driver->get_layout_pixel_count(identify_source);
+    linear_lighting_driver_view view(*driver, 0, length, length, identify_source);
+    view.clear(); view.show();
+  }
+  bool begin_identify(uint32_t driver_id, uint64_t now, uint32_t source = 0, uint32_t length = 0, bool reversed = false) {
+    auto *driver = connected_lighting_drivers::find(driver_id);
+    if (!driver || !driver->_is_ready() || source >= driver->get_layout_source_count() || !driver->get_layout_pixel_count(source)) return false;
+    const auto maximum = driver->get_layout_max_pixel_count(source);
+    if (length > maximum || (length && driver->reserve_layout_pixels(source, length) != ESP_OK)) return false;
+    const auto capacity = driver->get_layout_pixel_count(source);
+    if (length > capacity) return false;
+    if (identify_driver && (identify_driver != driver_id || identify_source != source)) clear_identified_source();
+    identify_driver = driver_id; identify_source = source; identify_length = length ? length : capacity;
+    identify_reversed = reversed; identify_until = now + 3000000; return true;
+  }
+  void handle_layout_request(const packet &packet, const mesh_interop_LayoutRequest &request, uint64_t now) {
+    if (!request.request_id) return;
+    std::underlying_type_t<mesh_interop_LayoutRequest_Operation> operation;
+    memcpy(&operation, &request.operation, sizeof(operation));
+    const bool active_read = operation == mesh_interop_LayoutRequest_Operation_READ_ACTIVE_MATRIX;
+    const bool matrix_read = operation == mesh_interop_LayoutRequest_Operation_READ_MATRIX || active_read;
+    const bool reading = matrix_read || operation == mesh_interop_LayoutRequest_Operation_READ;
+    if ((!reading && operation != mesh_interop_LayoutRequest_Operation_IDENTIFY) ||
+        (reading && !request.snapshot_id && request.offset)) {
+      layout_error(request.request_id, "Invalid layout request"); return;
+    }
+    if (identifying.active) { layout_error(request.request_id, "Identification is already in progress"); return; }
+    if (reading && !request.snapshot_id && !request.offset) {
+      if (!(matrix_read ? capture_matrix(packet, now, active_read) : capture_layout(packet, now))) {
+        layout_error(request.request_id, "Unable to read configuration"); return;
+      }
+    }
+    if (layout_snapshot_bytes.empty() || (reading && (matrix_read != snapshot_is_matrix || (matrix_read && active_read != snapshot_is_active))) ||
+        (request.snapshot_id && request.snapshot_id != layout_snapshot_id) ||
+        packet.generation != layout_generation || packet.connection != layout_connection ||
+        now - layout_touched >= TRANSFER_TIMEOUT_US) {
+      layout_error(request.request_id, "Layout snapshot expired; refresh and try again"); return;
+    }
+    layout_touched = now;
+    if (operation == mesh_interop_LayoutRequest_Operation_IDENTIFY) {
+      const uint32_t output_index = request.has_identify_options ? request.identify_options & 0xffu : request.output_index;
+      const uint32_t length = request.has_identify_options ? (request.identify_options >> 8) & 0xfffu : 0;
+      const bool reversed = request.has_identify_options && (request.identify_options & (1u << 20));
+      if (request.has_identify_options && request.identify_options >> 21) { layout_error(request.request_id, "Invalid identify options"); return; }
+      if (snapshot_is_matrix || request.snapshot_id != layout_snapshot_id || output_index >= snapshot_outputs.size()) {
+        layout_error(request.request_id, "Unknown output"); return;
+      }
+      const auto &output = snapshot_outputs[output_index];
+      if (!output.known || length > output.max_pixel_count) {
+        layout_error(request.request_id, "Identify length exceeds output capacity"); return;
+      }
+      if (!memcmp(output.node_mac, mac, 6)) {
+        if (!begin_identify(output.driver, now, output.source_index, length, reversed)) { layout_error(request.request_id, "Output is unavailable"); return; }
+        mesh_interop_LayoutResponse response{}; response.request_id = request.request_id; response.complete = true;
+        publish_layout(response); return;
+      }
+      const auto index = find_peer(output.node_mac);
+      if (index < 0 || !available(peers[index], now) || !output.ready || !output.known) {
+        layout_error(request.request_id, "Output is offline or unavailable"); return;
+      }
+      identifying = {}; identifying.active = true; identifying.peer_index = index;
+      identifying.request_id = request.request_id; identifying.driver = output.driver;
+      identifying.source = output.source_index;
+      identifying.length = length;
+      identifying.reversed = reversed;
+      identifying.wire_id = esp_random(); if (!identifying.wire_id) identifying.wire_id = 1;
+      identifying.generation = packet.generation;
+      return;
+    }
+    if (!reading || request.offset > layout_snapshot_bytes.size()) {
+      layout_error(request.request_id, "Invalid layout read"); return;
+    }
+    mesh_interop_LayoutResponse response{}; response.request_id = request.request_id;
+    response.snapshot_id = layout_snapshot_id; response.total_size = layout_snapshot_bytes.size(); response.offset = request.offset;
+    response.data.size = std::min<size_t>(sizeof(response.data.bytes), layout_snapshot_bytes.size() - request.offset);
+    memcpy(response.data.bytes, layout_snapshot_bytes.data() + request.offset, response.data.size);
+    response.complete = request.offset + response.data.size == layout_snapshot_bytes.size(); publish_layout(response);
   }
   void handle_upload(const packet &p, uint64_t now) {
     if (!master || p.generation != ble_generation.load()) return;
@@ -274,20 +628,29 @@ public:
     if (!decode(mesh_interop_MatrixUpload_fields, &u, p.data, p.size)) {
       error("Malformed upload envelope", true); return;
     }
+    if (u.which_operation == mesh_interop_MatrixUpload_layout_request_tag) {
+      handle_layout_request(p, u.operation.layout_request, now); return;
+    }
     if (!ble_rx.id() && u.which_operation == mesh_interop_MatrixUpload_abort_tag &&
         u.operation.abort == state.transfer_id) return;
     if (!ble_rx.id() && u.which_operation == mesh_interop_MatrixUpload_commit_tag &&
         u.operation.commit == state.transfer_id && (deployment || pending_snapshot || state.stage == STAGE_ACTIVE)) return;
-    if (u.which_operation == mesh_interop_MatrixUpload_begin_tag) {
+    if (u.which_operation == mesh_interop_MatrixUpload_begin_tag ||
+        u.which_operation == mesh_interop_MatrixUpload_layout_begin_tag || u.which_operation == mesh_interop_MatrixUpload_matrix_begin_tag) {
       if (deployment || pending_snapshot) { error("Another deployment is in progress", true); return; }
       if (ble_rx.id() && (upload_connection != p.connection || upload_generation != p.generation)) {
         error("Upload is owned by another connection", true); return;
       }
-      const auto &b = u.operation.begin;
+      const bool layout_upload = u.which_operation == mesh_interop_MatrixUpload_layout_begin_tag;
+      const bool matrix_upload = u.which_operation == mesh_interop_MatrixUpload_matrix_begin_tag;
+      if (ble_rx.id() && (upload_is_layout != layout_upload || upload_is_matrix != matrix_upload)) { error("Conflicting upload type", true); return; }
+      const auto &b = layout_upload ? u.operation.layout_begin : matrix_upload ? u.operation.matrix_begin : u.operation.begin;
       if (!ble_rx.begin(b.transfer_id, b.total_size, b.crc32, now)) {
         error("Invalid transfer size or conflicting transfer metadata", true); return;
       }
       upload_connection = p.connection; upload_generation = p.generation;
+      upload_is_layout = layout_upload;
+      upload_is_matrix = matrix_upload;
       state.transfer_id = b.transfer_id; state.received_bytes = ble_rx.offset();
       state.stage = STAGE_RECEIVING; state.error[0] = 0;
       return;
@@ -305,20 +668,34 @@ public:
     } else if (u.which_operation == mesh_interop_MatrixUpload_commit_tag) {
       if (!ble_rx.complete(u.operation.commit)) { error("Upload is incomplete or CRC32 failed", true); return; }
       state.stage = mesh_interop_MatrixStatus_Stage_VALIDATING;
-      std::unique_ptr<matrix_config> c(new (std::nothrow) matrix_config{});
-      if (!c || !decode(mesh_interop_MatrixConfig_fields, c.get(), ble_rx.bytes().data(), ble_rx.bytes().size())) {
+      auto c = make_heap_object<matrix_config>();
+      if (!c) { error("Unable to allocate matrix", true); ble_rx.reset(); return; }
+      if (upload_is_layout || upload_is_matrix) {
+        if (config) config->copy_to(*c); else c->schema_version = SCHEMA_VERSION;
+        uint64_t expected_revision, master_session;
+        if (!decode_editor_update(ble_rx.bytes(), upload_is_layout, *c, expected_revision, master_session)) {
+          error(upload_is_layout ? "Invalid layout protobuf" : "Invalid matrix update protobuf", true); ble_rx.reset(); return;
+        }
+        if (expected_revision != revision || master_session != session) {
+          error("Configuration changed on controller; reload before applying", true); ble_rx.reset(); return;
+        }
+      } else if (!decode(mesh_interop_MatrixConfig_fields, c.get(), ble_rx.bytes().data(), ble_rx.bytes().size())) {
         error("Invalid matrix protobuf", true); ble_rx.reset(); return;
       }
+      c->factory_default = false;
       if (auto e = platform_validate(*c, true)) { error(e, true); ble_rx.reset(); return; }
+      auto canonical = encode(mesh_interop_MatrixConfig_fields, c.get());
+      if (canonical.empty()) { error("Configuration exceeds 16 KiB", true); ble_rx.reset(); return; }
       if (revision == UINT64_MAX || !prepare_runtime(*c, revision + 1)) {
         error("Unable to prepare replacement runtime", true); ble_rx.reset(); return;
       }
       if (!prepare_gpio(*c)) { error("Unable to configure matrix GPIOs", true); ble_rx.reset(); return; }
-      if (revision == UINT64_MAX || !save(ble_rx.bytes(), revision + 1)) {
+      if (revision == UINT64_MAX || !save(canonical, revision + 1)) {
         prepared_ledger.reset(); prepared_local.reset();
         cleanup_gpio();
         error("Unable to persist matrix", true); ble_rx.reset(); return;
       }
+      configuration_persisted = true;
       ++revision; ble_rx.reset(); start_deployment(std::move(c));
     } else error("Unknown upload operation", true);
   }
@@ -379,30 +756,31 @@ public:
   }
   bool install_received() {
     if (inbound_kind == 1) {
-      std::unique_ptr<animation_definitions> d(new (std::nothrow) animation_definitions{});
+      auto d = make_heap_object<animation_definitions>();
       if (!d || !decode(mesh_interop_AnimationDefinitions_fields, d.get(), radio_rx.bytes().data(), radio_rx.bytes().size()) ||
           d->master_session != session || d->revision != inbound_revision) return false;
-      if (local && d->revision < local->definitions().revision) return false;
+      if (!standalone_default && local && d->revision < local->definitions().revision) return false;
       if (pending_player && d->revision < pending_player->definitions().revision) return false;
-      std::unique_ptr<player> p(new (std::nothrow) player(connected_lighting_drivers::find));
+      auto p = make_heap_object<player>(connected_lighting_drivers::find);
       if (!p || !p->prepare(*d)) return false;
-      const auto *existing = pending_player ? &pending_player->definitions() : local ? &local->definitions() : nullptr;
-      if (existing && existing->revision == d->revision)
-        return encode(mesh_interop_AnimationDefinitions_fields, existing) == radio_rx.bytes();
+      const auto *existing = pending_player ? pending_player.get() : !standalone_default && local ? local.get() : nullptr;
+      if (existing && existing->definitions().revision == d->revision)
+        return existing->definition_bytes() == radio_rx.bytes();
       if (!prepare_gpio(*d)) return false;
       pending_player = std::move(p); pending_snapshot.reset(); cleanup_gpio(true); return true;
     }
-    auto s = std::make_unique<animation_snapshot>();
+    auto s = make_heap_object<animation_snapshot>();
+    if (!s) return false;
     if (!decode(mesh_interop_AnimationSnapshot_fields, s.get(), radio_rx.bytes().data(), radio_rx.bytes().size()) ||
         s->master_session != session || s->revision != inbound_revision) return false;
     if (local && s->revision == local->definitions().revision && s->sequence < local_sequence) return false;
     if (pending_snapshot && pending_player && s->revision == pending_player->definitions().revision &&
         s->sequence < local_sequence) return false;
-    const animation_definitions *d = pending_player ? &pending_player->definitions() : local ? &local->definitions() : nullptr;
-    if (!d || d->revision != s->revision) return false;
+    const auto *source = pending_player ? pending_player.get() : local.get();
+    if (!source || source->definitions().revision != s->revision) return false;
     // Prepare alongside the active player: malformed recovery never changes it.
-    std::unique_ptr<player> p(new (std::nothrow) player(connected_lighting_drivers::find));
-    if (!p || !p->prepare(*d) || !p->restore(*s)) return false;
+    auto p = make_heap_object<player>(connected_lighting_drivers::find);
+    if (!p || !p->prepare(*source) || !p->restore(*s)) return false;
     if (local && !pending_snapshot && s->revision != local->definitions().revision)
       previous_sequence = local_sequence;
     pending_player = std::move(p); local_sequence = s->sequence;
@@ -414,10 +792,11 @@ public:
     for (auto retired : p.retired_gpio_streams) if (retired == stream) return false;
     p.retired_gpio_streams[p.retired_gpio_index++ % p.retired_gpio_streams.size()] = p.gpio_stream;
     p.gpio_stream = stream; p.gpio_sequence = 0; p.gpio_degraded = false;
+    p.catalog_at = 0; p.catalog_retry = 0;
     return true;
   }
   bool evaluate_gpio(const uint8_t *source_mac, const gpio_event &e, uint64_t rev, uint64_t clock) {
-    const matrix_config *c = nullptr;
+    const runtime_config *c = nullptr;
     evaluator *evaluation = nullptr;
     if (ledger && ledger->definitions().revision == rev &&
         (!retiring_config || e.at >= activate_at)) {
@@ -473,7 +852,44 @@ public:
       if (!mesh_interop::instance().slave_node_exists(packet.mac)) return;
       int index = find_peer(packet.mac); if (index < 0) return;
       auto &p = peers[index];
-      if (type == w::GPIO_EVENT) handle_gpio_event(p, b, n, now);
+      if (type == w::INVENTORY && n >= 17 && w::get(b, 8) == session && b[8] <= MAX_DRIVERS_PER_NODE && n == size_t(17 + b[8] * 14)) {
+        std::array<mesh_interop_LayoutOutput, MAX_SOURCES_PER_NODE> outputs{};
+        std::array<uint32_t, MAX_DRIVERS_PER_NODE> ids{};
+        size_t output_count = 0;
+        for (size_t i = 0; i < b[8]; ++i) {
+          const auto *item = b + 9 + i * 14;
+          const auto id = w::get(item, 4), count = w::get(item + 4, 4);
+          const auto maximum = w::get(item + 10, 4);
+          const auto kind = item[9];
+          if (!id || id > MAX_DRIVERS_PER_NODE || !count || count > 65536 || item[8] > 1 ||
+              (kind != 1 && kind != 2) || (kind == 2 && count > 2) ||
+              !maximum || maximum > 65536 || (kind == 1 && maximum < count) || (kind == 2 && maximum != 1) ||
+              std::find(ids.begin(), ids.begin() + i, id) != ids.begin() + i) return;
+          ids[i] = id;
+          const size_t sources = kind == 2 ? count : 1;
+          for (size_t source = 0; source < sources; ++source) {
+            auto &o = outputs[output_count++]; memcpy(o.node_mac, p.mac, 6);
+            o.driver = static_cast<mesh_interop_MatrixDriver>(id); o.pixel_count = kind == 2 ? 1 : count;
+            o.source_index = source; o.driver_kind = static_cast<mesh_interop_MatrixDriverKind>(kind);
+            o.max_pixel_count = maximum;
+            o.ready = item[8] != 0; o.known = true; o.online = true;
+          }
+        }
+        const auto mask = w::get(b + 9 + b[8] * 14, 8);
+        if (mask >> 40) return;
+        p.gpio_mask = mask; p.outputs = outputs; p.outputs_count = output_count; p.catalog_known = true; p.catalog_at = now;
+        default_layout_dirty = true;
+      } else if (type == w::IDENTIFY_ACK && n == 13 && w::get(b, 8) == session && identifying.active &&
+                 identifying.peer_index == index && identifying.wire_id == w::get(b + 8, 4)) {
+        if (identifying.generation == ble_generation.load()) {
+          if (b[12]) layout_error(identifying.request_id, "Output is unavailable");
+          else {
+            mesh_interop_LayoutResponse response{}; response.request_id = identifying.request_id;
+            response.complete = true; publish_layout(response);
+          }
+        }
+        identifying.active = false;
+      } else if (type == w::GPIO_EVENT) handle_gpio_event(p, b, n, now);
       else if (type == w::ACK) transfer_ack(index, b, n);
       else if (type == w::COMMAND_ACK && n == 20 && w::get(b, 8) == session) {
         if (!p.retiring_commands.empty() && w::get(b + 8, 8) == p.retiring_commands.front().revision &&
@@ -502,7 +918,24 @@ public:
     }
     if (!mesh_interop::instance().master_node_matches(packet.mac) ||
         !master_clock_manager::instance().is_synchronized()) return;
-    if (type == w::GPIO_EVENT_ACK && n == 29 && !gpio_events.empty() &&
+    if (type == w::INVENTORY_REQUEST && n == 8 && w::get(b, 8) == session) {
+      send_inventory(packet.mac);
+    } else if (type == w::IDENTIFY && n == 25 && w::get(b, 8) == session && w::get(b + 8, 4) && b[24] <= 1) {
+      const uint32_t id = w::get(b + 8, 4), driver = w::get(b + 12, 4);
+      const uint32_t source = w::get(b + 16, 4);
+      const uint32_t length = w::get(b + 20, 4);
+      const bool reversed = b[24];
+      bool ok;
+      if (id == last_identify_id) ok = last_identify_driver == driver && last_identify_source == source &&
+          last_identify_length == length && last_identify_reversed == reversed && last_identify_ok;
+      else {
+        ok = begin_identify(driver, now, source, length, reversed); last_identify_id = id; last_identify_driver = driver;
+        last_identify_source = source; last_identify_ok = ok;
+        last_identify_length = length; last_identify_reversed = reversed;
+      }
+      std::vector<uint8_t> reply; w::put(reply, session, 8); w::put(reply, id, 4); w::put(reply, ok ? 0 : 1, 1);
+      send(packet.mac, w::IDENTIFY_ACK, reply);
+    } else if (type == w::GPIO_EVENT_ACK && n == 29 && !gpio_events.empty() &&
         w::get(b, 8) == session && w::get(b + 16, 8) == gpio_stream &&
         w::get(b + 8, 8) == gpio_events.front().revision &&
         w::get(b + 24, 4) == gpio_events.front().sequence) {
@@ -530,7 +963,8 @@ public:
     } else if (type == w::COMMAND) {
       animation_command c{};
       if (!decode(mesh_interop_AnimationCommand_fields, &c, b, n) || c.master_session != session) return;
-      const bool previous = local && pending_snapshot && pending_player &&
+      if (standalone_default && !pending_snapshot) return;
+      const bool previous = !standalone_default && local && pending_snapshot && pending_player &&
           c.revision == local->definitions().revision && c.revision != pending_player->definitions().revision;
       auto *p = previous ? local.get() : pending_snapshot && pending_player ? pending_player.get() : local.get();
       if (!p || c.revision != p->definitions().revision) return;
@@ -541,12 +975,14 @@ public:
       w::put(reply, c.sequence, 4); send(packet.mac, w::COMMAND_ACK, reply);
     }
   }
-  static bool emit(void *arg, const animation_command &command) {
+  static bool emit(void *arg, const animation_command &input) {
     auto &s = *static_cast<service *>(arg);
+    auto command = input;
     const bool previous = s.retiring_ledger && command.revision == s.retiring_ledger->definitions().revision;
     if (previous && command.effective_at_us >= s.activate_at) return true;
     auto *timeline = previous ? s.retiring_ledger.get() : s.ledger.get();
     auto *config = previous ? s.retiring_config.get() : s.config.get();
+    if (config && config->factory_default) command.effective_at_us = 0;
     if (!timeline || !timeline->enqueue(command)) { s.error("Animation timeline queue overflow"); return false; }
     const mesh_interop_MatrixEntry *entry = nullptr;
     for (size_t i = 0; i < config->entries_count; ++i)
@@ -583,7 +1019,8 @@ public:
     return true;
   }
   void activate(uint64_t now) {
-    if (!prepared_ledger || !prepared_local) {
+    auto next_snapshot = make_heap_object<animation_snapshot>();
+    if (!prepared_ledger || !prepared_local || !next_snapshot) {
       error("Unable to allocate replacement animation runtime", true); deployment = false; return;
     }
     retiring_config = std::move(config); retiring_ledger = std::move(ledger); retiring_rules = rules;
@@ -596,7 +1033,7 @@ public:
       p.last_retry = 0; p.retries = 0;
       p.last_recover = 0;
     }
-    pending_player = std::move(prepared_local); pending_snapshot = std::make_unique<animation_snapshot>();
+    pending_player = std::move(prepared_local); pending_snapshot = std::move(next_snapshot);
     // Configuration rollout can take longer than one trigger's 100 ms lead.
     // Reserve a shared epoch far enough ahead to transfer initial snapshots.
     activate_at = now + LEAD_US + peer_count * 500000;
@@ -636,8 +1073,8 @@ public:
           pending_player.get() : local.get();
       if (!p) continue;
       const auto &d = p->definitions();
-      if (std::find(d.gpio_inputs, d.gpio_inputs + d.gpio_inputs_count, e.pin) ==
-          d.gpio_inputs + d.gpio_inputs_count) continue;
+      if (std::find(d.gpio_inputs.begin(), d.gpio_inputs.begin() + d.gpio_inputs_count, e.pin) ==
+          d.gpio_inputs.begin() + d.gpio_inputs_count) continue;
       if (master) evaluate_gpio(mac, e, d.revision, clock);
       else if (gpio_events.size() < 64 && gpio_sequence != UINT32_MAX) {
         gpio_events.push_back({e, d.revision, ++gpio_sequence});
@@ -665,11 +1102,34 @@ public:
       if (idx >= 0 && mesh.nodes[i].last_synced_at)
         peers[idx].seen = std::max(peers[idx].seen, mesh.nodes[i].last_synced_at);
     }
+    for (size_t i = 0; i < peer_count; ++i) {
+      auto &p = peers[i];
+      if (available(p, now) && (!p.catalog_at || now - p.catalog_at >= 5000000) &&
+          (!p.catalog_retry || now - p.catalog_retry >= 1000000)) {
+        std::vector<uint8_t> body; w::put(body, session, 8); send(p.mac, w::INVENTORY_REQUEST, body); p.catalog_retry = now;
+      }
+    }
+    if (identifying.active) {
+      if (identifying.generation != ble_generation.load()) identifying.active = false;
+      else if (!identifying.sent_at || now - identifying.sent_at >= 100000) {
+        if (identifying.retries++ >= 4) {
+          layout_error(identifying.request_id, "Output did not respond; try again"); identifying.active = false;
+        } else {
+          std::vector<uint8_t> body; w::put(body, session, 8); w::put(body, identifying.wire_id, 4); w::put(body, identifying.driver, 4);
+          w::put(body, identifying.source, 4);
+          w::put(body, identifying.length, 4); w::put(body, identifying.reversed, 1);
+          send(peers[identifying.peer_index].mac, w::IDENTIFY, body); identifying.sent_at = now;
+        }
+      }
+    }
+    extend_default_layout();
     if (deployment && tx.peer_index < 0) {
       bool started = false;
       for (size_t i = 0; i < peer_count; ++i) {
         auto &p = peers[i];
         if (p.attempted || !available(p, now)) continue;
+        if (candidate->factory_default && std::none_of(candidate->layout.begin(), candidate->layout.end(),
+            [&](const auto &row) { return !memcmp(row.node_mac, p.mac, 6); })) continue;
         auto d = make_definitions(*candidate, p.mac, session, revision);
         if (!d) { p.attempted = true; error("Unable to allocate node definitions"); continue; }
         begin_transfer(i, 1, encode(mesh_interop_AnimationDefinitions_fields, d.get()));
@@ -688,6 +1148,8 @@ public:
       for (size_t i = 0; i < peer_count; ++i) {
         auto &p = peers[i];
         if (!available(p, now)) { p.ready = false; p.commands.clear(); continue; }
+        if (config->factory_default && std::none_of(config->layout.begin(), config->layout.end(),
+            [&](const auto &row) { return !memcmp(row.node_mac, p.mac, 6); })) continue;
         if (clock < activate_at && !p.retiring_commands.empty() &&
             (!p.retiring_retry || now - p.retiring_retry >= 100000)) {
           if (p.retiring_retries++ < 4) {
@@ -709,7 +1171,9 @@ public:
           if (!p.definitions) begin_transfer(i, 1, encode(mesh_interop_AnimationDefinitions_fields, d.get()));
           else {
             p.commands.clear(); p.retries = 0; p.last_retry = 0;
-            auto snapshot = std::make_unique<animation_snapshot>(ledger->snapshot(*d, p.sequence, activate_at));
+            auto snapshot = make_heap_object<animation_snapshot>();
+            if (!snapshot) { p.last_recover = now; error("Unable to allocate recovery snapshot"); continue; }
+            *snapshot = ledger->snapshot(*d, p.sequence, activate_at);
             begin_transfer(i, 2, encode(mesh_interop_AnimationSnapshot_fields, snapshot.get()));
           }
         }
@@ -738,7 +1202,12 @@ public:
       radio_rx.reset(); completed_transfer = 0; local_sequence = 0; revision = 0;
       gpio_events.clear(); gpio_sequence = 0; gpio_stream = 0;
       gpio_retries = 0; gpio_last_send = 0; gpio_degraded = false; last_hello = 0;
+      if (identify_driver) {
+        clear_identified_source();
+      }
+      identify_driver = 0; identify_source = 0; last_identify_id = 0;
       cleanup_gpio();
+      if (standalone_default && !install_standalone_default()) error("Unable to synchronize default matrix", true);
       gpio_event e;
       for (unsigned i = 0; i < 64 && xQueueReceive(gpio_queue, &e, 0) == pdTRUE; ++i) {}
     }
@@ -753,7 +1222,7 @@ public:
       if (mesh.nodes_count) {
         std::vector<uint8_t> b; w::put(b, session, 8);
         auto *advertised = pending_snapshot && pending_player ? pending_player.get() : local.get();
-        w::put(b, advertised ? advertised->definitions().revision : 0, 8); w::put(b, local_sequence, 4);
+        w::put(b, advertised && (!standalone_default || pending_snapshot) ? advertised->definitions().revision : 0, 8); w::put(b, local_sequence, 4);
         w::put(b, gpio_stream, 8); w::put(b, gpio_degraded ? 1 : 0, 1);
         send(mesh.nodes[0].mac, w::HELLO, b);
       }
@@ -765,7 +1234,8 @@ public:
     memcpy(mac, global_config::instance().get_mesh_mac(), 6);
     session = master_clock_manager::instance().session(); state.master_session = session;
     memcpy(state.master_mac, mac, 6);
-    if (master) load();
+    initialize_configuration();
+    log_memory();
     TickType_t next_frame = xTaskGetTickCount();
     for (;;) {
       uint64_t now = esp_timer_get_time();
@@ -806,19 +1276,57 @@ public:
     if (pending_snapshot && pending_player && clock >= pending_snapshot->activate_at_us) {
       if (local) local->blank();
       local = std::move(pending_player); revision = local->definitions().revision;
+      active_persisted = configuration_persisted;
+      if (!master) { standalone_default = false; config.reset(); }
       pending_snapshot.reset();
       retiring_config.reset(); retiring_ledger.reset();
       for (auto &p : peers) p.retiring_commands.clear();
       cleanup_gpio();
       if (master) state.stage = STAGE_ACTIVE;
+      ESP_LOGI("matrix", "Activated revision %llu", static_cast<unsigned long long>(revision));
+      log_memory();
     }
-    if (local && master_clock_manager::instance().is_synchronized()) {
-      auto err = local->tick(clock);
+    const uint64_t now = esp_timer_get_time();
+    const bool synchronized = master_clock_manager::instance().is_synchronized();
+    if (identify_driver && now >= identify_until) {
+      bool mapped = false;
+      if (local && synchronized) for (size_t i = 0; i < local->definitions().output_mappings_count; ++i)
+        if (local->definitions().output_mappings[i].driver == identify_driver &&
+            local->definitions().output_mappings[i].source_index == identify_source) mapped = true;
+      if (!mapped) {
+        clear_identified_source();
+      }
+      identify_driver = 0;
+    }
+    if (local && (synchronized || standalone_default)) {
+      auto err = local->tick(clock, true, identify_driver, identify_source);
       if (err != ESP_OK && !state.error[0]) error("Animation driver failed");
+    }
+    if (identify_driver) {
+      auto *driver = connected_lighting_drivers::find(identify_driver);
+      if (driver) {
+        const auto capacity = driver->get_layout_pixel_count(identify_source);
+        linear_lighting_driver_view source(*driver, 0, capacity, capacity, identify_source);
+        source.clear();
+        const uint64_t elapsed = 3000000 - (identify_until - now);
+        const uint32_t length = identify_length;
+        if (driver->get_kind() == lighting_driver_kind::RGB_LED_MODULE) {
+          if (elapsed / 250000 % 2 == 0) source.set_pixel(0, alpha_color(color(0, 255, 0)));
+        } else {
+          // Fill for two seconds, then hold the complete configured strip for
+          // one second. Leave any unused buffer tail off throughout the check.
+          const uint32_t filled = elapsed >= 2000000 ? length : 1 + elapsed * (length - 1) / 2000000;
+          for (uint32_t position = 0; position < filled; ++position) {
+            const uint32_t physical = identify_reversed ? length - 1 - position : position;
+            source.set_pixel(physical, alpha_color(position + 1 == length && length > 1 ? color(0, 64, 255) : color(0, 255, 0)));
+          }
+        }
+        source.show();
+      }
     }
   }
 };
-service *instance = nullptr;
+heap_object<service> instance;
 } // namespace
 
 esp_err_t init() {
@@ -826,9 +1334,10 @@ esp_err_t init() {
   radio_queue = xQueueCreate(16, sizeof(packet)); priority_queue = xQueueCreate(16, sizeof(packet));
   ble_queue = xQueueCreate(8, sizeof(packet)); gpio_queue = xQueueCreate(64, sizeof(gpio_event));
   if (!radio_queue || !priority_queue || !ble_queue || !gpio_queue) return ESP_ERR_NO_MEM;
-  instance = new (std::nothrow) service;
+  instance = make_heap_object<service>();
   if (!instance) return ESP_ERR_NO_MEM;
-  if (xTaskCreate([](void *) { instance->run(); }, "matrix", 12288, nullptr, 5, &worker_task) != pdPASS)
+  if (xTaskCreatePinnedToCore([](void *) { instance->run(); }, "matrix", 12288, nullptr, 5,
+      &worker_task, portNUM_PROCESSORS - 1) != pdPASS)
     return ESP_ERR_NO_MEM;
   initialized.store(true);
   return ESP_OK;
@@ -838,7 +1347,8 @@ bool receive(const uint8_t mac[6], const uint8_t *data, size_t size) {
   if (!initialized.load() || !matrix::wire::valid(data, size)) return true;
   packet p; memcpy(p.mac, mac, 6); memcpy(p.data, data, size); p.size = size;
   auto queue = data[5] == w::COMMAND || data[5] == w::COMMAND_ACK || data[5] == w::ACK ||
-      data[5] == w::GPIO_EVENT || data[5] == w::GPIO_EVENT_ACK ? priority_queue : radio_queue;
+      data[5] == w::GPIO_EVENT || data[5] == w::GPIO_EVENT_ACK || data[5] == w::IDENTIFY ||
+      data[5] == w::IDENTIFY_ACK ? priority_queue : radio_queue;
   if (xQueueSend(queue, &p, 0) != pdTRUE) overflow.store(true);
   if (worker_task) xTaskNotifyGive(worker_task);
   return true;
@@ -862,6 +1372,11 @@ size_t read_status(uint8_t *destination, size_t capacity) {
   std::lock_guard<std::mutex> lock(status_mutex);
   if (capacity < published_size) return 0;
   memcpy(destination, published_bytes.data(), published_size); return published_size;
+}
+size_t read_layout_response(uint8_t *destination, size_t capacity) {
+  std::lock_guard<std::mutex> lock(status_mutex);
+  if (capacity < layout_response_size) return 0;
+  memcpy(destination, layout_response_bytes.data(), layout_response_size); return layout_response_size;
 }
 void set_status_callback(void (*callback)()) { notify.store(callback); }
 } // namespace matrix_service

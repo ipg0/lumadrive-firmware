@@ -270,11 +270,31 @@ void test_linear_canvas_views() {
   block.clear(); assert(effect->render(high) == ESP_OK);
   assert(block.pixels[0].r == 255 && block.pixels[1].r == 0);
 }
+void test_rainbow_zero_offset_views() {
+  animation_test_driver strip, block; block.count = 1;
+  linear_lighting_driver_view strip_view(strip, 0, 4, 4), block_view(block, 0, 1, 4);
+  periodic_animation_options options; options.primary.alpha = 128; options.period_ms = 8000;
+  effect_owner effect(animation_effect_descriptor<animation_effect_type::RAINBOW>(options).create_instance());
+  assert(effect && effect->type() == animation_effect_type::RAINBOW);
+  assert(effect->render(strip_view) == ESP_OK && effect->render(block_view) == ESP_OK);
+  assert(strip.values[0].base_color.r == 255 && strip.values[0].base_color.g == 0);
+  assert(strip.values[2].base_color.g == 255 && strip.values[2].base_color.b == 255);
+  assert(block.values[0].base_color.r == strip.values[0].base_color.r && block.values[0].alpha == 128);
+  effect->seek(2000); effect->render(strip_view); effect->render(block_view);
+  assert(strip.values[0].base_color.b == 255 && strip.values[0].base_color.r == 128);
+  assert(block.values[0].base_color.r == strip.values[0].base_color.r);
+  options.reverse = true;
+  effect.reset(animation_effect_descriptor<animation_effect_type::RAINBOW>(options).create_instance());
+  effect->seek(2000); effect->render(strip_view);
+  assert(strip.values[0].base_color.g == 255 && strip.values[0].base_color.b == 0);
+  effect->seek(UINT64_C(1) << 40); assert(effect->render(strip_view) == ESP_OK && !effect->is_finished());
+}
 int main() {
   test_keyframe_segments_and_ownership(); test_keyframe_interpolation_and_validation();
   test_blink_and_breathe(); test_independent_pixel_tracks(); test_flowing_gradient();
   test_keyframed_motion_width_and_wrapping();
   test_animated_layers_blend_once_per_frame();
   test_linear_canvas_views();
+  test_rainbow_zero_offset_views();
   std::puts("Common animations: interpolation, timing, looping, blending, gradients, and validation passed.");
 }

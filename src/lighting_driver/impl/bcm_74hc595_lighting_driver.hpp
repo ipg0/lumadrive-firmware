@@ -1,19 +1,23 @@
 #pragma once
 
 #include "../lighting_driver.hpp"
-#include <cstring>
+#include <initializer_list>
 #include <driver/gpio.h>
+#include <driver/gptimer.h>
+#include <esp_attr.h>
 #include <esp_check.h>
 #include <esp_log.h>
-#include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/portmacro.h>
 
 struct hc595_led_config {
   uint8_t r_bit;
   uint8_t g_bit;
   uint8_t b_bit;
-  uint8_t com_bit;
-  bool common_is_anode; // true: COM→VCC (active-low channels), false: COM→GND
-                        // (active-high channels)
+  // The LED common is wired externally, never to a shift-register output.
+  // TPIC6B595 sinks current for a stored 1, so it uses active-high data even
+  // though its LEDs have common anodes connected to the positive supply.
+  bool channels_active_low = false;
 };
 
 struct hc595_driver_config {
@@ -28,51 +32,20 @@ struct hc595_driver_config {
 class bcm_74hc595_lighting_driver : public rgb_lighting_driver {
 public:
   explicit bcm_74hc595_lighting_driver(const hc595_driver_config &cfg)
-      : _cfg(cfg), _ready(false), _brightness(255), _bcm_plane(0),
-        _timer(nullptr) {
-    memset(_pixels, 0, sizeof(_pixels));
-  }
+      : _cfg(cfg), _pixels{}, _ready(false), _brightness(255) {}
 
-  esp_err_t init() override {
-    gpio_config_t io_conf = {};
-    io_conf.mode = GPIO_MODE_OUTPUT;
-    io_conf.pin_bit_mask = (1ULL << _cfg.ser_pin) | (1ULL << _cfg.srclk_pin) |
-                           (1ULL << _cfg.rclk_pin);
-    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-    io_conf.intr_type = GPIO_INTR_DISABLE;
-    ESP_RETURN_ON_ERROR(gpio_config(&io_conf), TAG, "gpio_config failed");
-
-    gpio_set_level(_cfg.ser_pin, 0);
-    gpio_set_level(_cfg.srclk_pin, 0);
-    gpio_set_level(_cfg.rclk_pin, 0);
-    shift_out(0);
-
-    esp_timer_create_args_t timer_args = {};
-    timer_args.callback = bcm_timer_cb;
-    timer_args.arg = this;
-    timer_args.dispatch_method = ESP_TIMER_TASK;
-    timer_args.name = "bcm_hc595";
-    timer_args.skip_unhandled_events = true;
-    ESP_RETURN_ON_ERROR(esp_timer_create(&timer_args, &_timer), TAG,
-                        "esp_timer_create failed");
-
-    _ready = true;
-    return esp_timer_start_once(_timer, _cfg.bcm_base_period_us);
-  }
-
-  esp_err_t deinit() override {
-    _ready = false;
-    if (_timer) {
-      esp_timer_stop(_timer);
-      esp_timer_delete(_timer);
-      _timer = nullptr;
-    }
-    shift_out(all_off_byte());
-    return ESP_OK;
-  }
+  esp_err_t init() override;
+  esp_err_t deinit() override;
 
   size_t get_pixel_count() const override { return _cfg.led_count; }
+  lighting_driver_kind get_kind() const override { return lighting_driver_kind::RGB_LED_MODULE; }
+  size_t get_layout_source_count() const override { return _cfg.led_count; }
+  size_t get_layout_pixel_count(uint32_t source) const override { return source < _cfg.led_count ? 1 : 0; }
+  size_t get_layout_pixel_offset(uint32_t source) const override { return source; }
+  bool uses_gpio(uint32_t pin) const {
+    return pin == static_cast<uint32_t>(_cfg.ser_pin) || pin == static_cast<uint32_t>(_cfg.srclk_pin) ||
+        pin == static_cast<uint32_t>(_cfg.rclk_pin);
+  }
 
   esp_err_t set_pixel(uint16_t index, alpha_color c) override {
     if (index >= _cfg.led_count)
@@ -95,9 +68,18 @@ public:
     return ESP_OK;
   }
 
-  // BCM runs continuously from the timer; pixels are picked up on the next
-  // bit-plane.
-  esp_err_t show() override { return ESP_OK; }
+  // Rendering edits only the working pixels. Publish complete bit planes,
+  // then let the ISR adopt them together at the next BCM cycle boundary.
+  esp_err_t show() override {
+    if (!_ready) return ESP_ERR_INVALID_STATE;
+    uint8_t planes[8];
+    for (uint8_t plane = 0; plane < 8; ++plane) planes[plane] = compute_byte(plane);
+    portENTER_CRITICAL(&_frame_lock);
+    for (unsigned plane = 0; plane < 8; ++plane) _pending_planes[plane] = planes[plane];
+    _pending_frame = true;
+    portEXIT_CRITICAL(&_frame_lock);
+    return ESP_OK;
+  }
 
   bool _is_ready() const override { return _ready; }
 
@@ -108,8 +90,24 @@ private:
   color _pixels[2];
   bool _ready;
   uint8_t _brightness;
-  uint8_t _bcm_plane;
-  esp_timer_handle_t _timer;
+  struct scheduler;
+  static scheduler _scheduler;
+  uint8_t _active_planes[8]{}, _pending_planes[8]{};
+  bool _pending_frame = false;
+  portMUX_TYPE _frame_lock = portMUX_INITIALIZER_UNLOCKED;
+
+  bool valid_config() const {
+    if (!_cfg.led_count || _cfg.led_count > 2 || !_cfg.bcm_base_period_us) return false;
+    uint8_t used = 0;
+    for (uint8_t i = 0; i < _cfg.led_count; ++i) {
+      const auto &led = _cfg.leds[i];
+      for (const auto bit : {led.r_bit, led.g_bit, led.b_bit}) {
+        if (bit >= 8 || (used & (1u << bit))) return false;
+        used |= (1u << bit);
+      }
+    }
+    return true;
+  }
 
   uint8_t apply_brightness(uint8_t ch) const {
     return static_cast<uint16_t>(ch) * _brightness / 255u;
@@ -123,16 +121,14 @@ private:
       const uint8_t g = apply_brightness(_pixels[i].g);
       const uint8_t b = apply_brightness(_pixels[i].b);
 
-      if (led.common_is_anode) {
-        // COM is held high and the LED channel is active-low:
-        // bit=1 => channel low (LED on), bit=0 => channel high (LED off).
-        byte |= (1u << led.com_bit);
+      if (led.channels_active_low) {
+        // Stored 0 turns the channel on (e.g. a directly driven common-anode
+        // LED on an ordinary 74HC595 with its common connected externally).
         if (((r >> plane) & 1u) == 0u) byte |= (1u << led.r_bit);
         if (((g >> plane) & 1u) == 0u) byte |= (1u << led.g_bit);
         if (((b >> plane) & 1u) == 0u) byte |= (1u << led.b_bit);
       } else {
-        // COM is held low and the LED channel is active-high:
-        // bit=1 => channel high (LED on), bit=0 => channel low (LED off).
+        // Stored 1 turns the channel on, including TPIC6B595 low-side sinks.
         if (((r >> plane) & 1u) != 0u) byte |= (1u << led.r_bit);
         if (((g >> plane) & 1u) != 0u) byte |= (1u << led.g_bit);
         if (((b >> plane) & 1u) != 0u) byte |= (1u << led.b_bit);
@@ -145,36 +141,14 @@ private:
     uint8_t byte = 0;
     for (uint8_t i = 0; i < _cfg.led_count; ++i) {
       const hc595_led_config &led = _cfg.leds[i];
-      if (led.common_is_anode) {
-        // Common-anode LEDs are off with COM high and each channel high.
-        byte |= (1u << led.r_bit) | (1u << led.g_bit) | (1u << led.b_bit) |
-                (1u << led.com_bit);
-      } else {
-        // Common-cathode LEDs are off with COM low and each channel low.
-        // Leave the byte at 0 for this case.
+      if (led.channels_active_low) {
+        byte |= (1u << led.r_bit) | (1u << led.g_bit) | (1u << led.b_bit);
       }
     }
     return byte;
   }
 
-  void shift_out(uint8_t data) const {
-    for (int8_t bit = 7; bit >= 0; --bit) {
-      gpio_set_level(_cfg.ser_pin, (data >> bit) & 1u);
-      gpio_set_level(_cfg.srclk_pin, 1);
-      gpio_set_level(_cfg.srclk_pin, 0);
-    }
-    gpio_set_level(_cfg.rclk_pin, 1);
-    gpio_set_level(_cfg.rclk_pin, 0);
-  }
-
-  static void bcm_timer_cb(void *arg) {
-    auto *self = static_cast<bcm_74hc595_lighting_driver *>(arg);
-    uint8_t plane = self->_bcm_plane;
-    uint8_t byte = self->compute_byte(plane);
-    self->shift_out(byte);
-    // hold this plane for 2^plane units, then move to the next
-    esp_timer_start_once(self->_timer,
-                         (1u << plane) * self->_cfg.bcm_base_period_us);
-    self->_bcm_plane = (plane + 1u) % 8u;
-  }
+  void IRAM_ATTR shift_out(uint8_t data) const;
+  static bool IRAM_ATTR bcm_timer_cb(gptimer_handle_t timer,
+                                    const gptimer_alarm_event_data_t *, void *arg);
 };
