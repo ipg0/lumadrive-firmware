@@ -41,7 +41,7 @@ endpoint; gaps remain part of that coordinate space.
 
 ```dart
 final config = MatrixConfig(
-  schemaVersion: 2,
+  schemaVersion: 0,
   layout: [
     MatrixLayout(nodeMac: stripNodeMac, driver: MatrixDriver.WS2812,
       from: 0, to: 60),

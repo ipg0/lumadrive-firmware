@@ -23,7 +23,7 @@ matrix_config fixture() {
   c.sources_count = 1; auto &s = c.sources[0];
   s.id = 2; s.kind = mesh_interop_MatrixSource_Kind_GPIO_EDGE; s.gpio = 12; s.rising = true;
   memcpy(s.node_mac, master_mac, 6);
-  c.conditions_count = 1; c.conditions[0] = {3, mesh_interop_MatrixCondition_Kind_ALWAYS};
+  c.conditions_count = 1; c.conditions[0] = {3, mesh_interop_MatrixCondition_Kind_ALWAYS, 0};
   c.entries_count = 1; auto &e = c.entries[0];
   e.id = 4; e.effect_id = 1; e.source_id = 2; e.condition_id = 3; e.priority = 10;
   c.layout_count = 1; memcpy(c.layout[0].node_mac, slave_mac, 6);
@@ -86,6 +86,17 @@ void test_transfer() {
   assert(wire::packet(wire::CHUNK, std::vector<uint8_t>(243)).empty());
 }
 void test_schema_validation() {
+  static_assert(SCHEMA_VERSION == 0 && wire::VERSION == 0);
+  matrix_config empty{};
+  auto empty_bytes = encode(mesh_interop_MatrixConfig_fields, &empty);
+  assert(empty_bytes == std::vector<uint8_t>({8, 0}));
+  assert(encode(mesh_interop_MatrixConfig_fields, &empty, 1).empty());
+  matrix_config empty_decoded{};
+  assert(decode(mesh_interop_MatrixConfig_fields, &empty_decoded, empty_bytes.data(), empty_bytes.size()));
+  assert(!validate(empty_decoded, master_mac));
+  auto frame = wire::packet(wire::HELLO, {});
+  assert(frame[4] == 0 && wire::valid(frame.data(), frame.size()));
+  frame[4] = 4; assert(!wire::valid(frame.data(), frame.size()));
   auto c = fixture(); assert(!validate(c, master_mac));
   auto bytes = encode(mesh_interop_MatrixConfig_fields, &c); matrix_config decoded{};
   assert(decode(mesh_interop_MatrixConfig_fields, &decoded, bytes.data(), bytes.size()));
@@ -143,6 +154,71 @@ void test_master_evaluation_and_recovery() {
   slave.tick(260000); red(false);
   snapshot.revision++; assert(!slave.restore(snapshot));
 }
+void test_boot_once_and_palette_roundtrip() {
+  auto config = fixture();
+  config.sources[0].kind = mesh_interop_MatrixSource_Kind_ON_BOOT;
+  assert(!validate(config, master_mac));
+  evaluator rules; rules.configure(&config, 10, 20, true);
+  std::vector<animation_command> commands;
+  auto sink = [](void *ptr, const animation_command &command) {
+    static_cast<std::vector<animation_command> *>(ptr)->push_back(command); return true;
+  };
+  auto reject = [](void *, const animation_command &) { return false; };
+  rules.tick(0, nullptr, 0, 0, reject, nullptr);
+  rules.tick(100, nullptr, 0, 100, sink, &commands);
+  assert(commands.size() == 1 && commands[0].effective_at_us == 100100);
+  rules.tick(1000000, nullptr, 0, 1000000, sink, &commands);
+  rules.tick(2000000, nullptr, 0, 2000000, sink, &commands);
+  assert(commands.size() == 1); // Expiring the finite effect must not retrigger it.
+  rules.configure(&config, 10, 21);
+  rules.tick(3000000, nullptr, 0, 3000000, sink, &commands);
+  assert(commands.size() == 1); // Applying a revision does not reboot the master.
+  rules.configure(&config, 11, 21, true);
+  rules.tick(0, nullptr, 0, 0, sink, &commands);
+  assert(commands.size() == 2 && commands.back().master_session == 11);
+
+  auto &effect = config.effects[0]; effect.kind = mesh_interop_MatrixEffect_Kind_FLOWING_GRADIENT;
+  effect.gradient_colors_count = 3;
+  effect.gradient_colors[0] = {255, 0, 0, 255};
+  effect.gradient_colors[1] = {0, 255, 0, 128};
+  effect.gradient_colors[2] = {0, 0, 255, 0};
+  assert(!validate(config, master_mac));
+  auto bytes = encode(mesh_interop_MatrixConfig_fields, &config);
+  matrix_config decoded{};
+  assert(decode(mesh_interop_MatrixConfig_fields, &decoded, bytes.data(), bytes.size()));
+  assert(decoded.effects[0].gradient_colors_count == 3);
+  assert(decoded.effects[0].gradient_colors[1].green == 255 && decoded.effects[0].gradient_colors[2].alpha == 0);
+  assert(decoded.sources[0].kind == mesh_interop_MatrixSource_Kind_ON_BOOT);
+  auto definitions = definitions_for(decoded, slave_mac, 11, 21);
+  player playback(resolve); assert(playback.prepare(definitions));
+  auto command = start(); command.master_session = 11; command.revision = 21;
+  assert(playback.enqueue(command)); playback.tick(100000); red(true);
+  effect.gradient_colors_count = 1; assert(validate(config, master_mac));
+  effect.gradient_colors_count = 9; assert(validate(config, master_mac));
+  effect.gradient_colors_count = 8; assert(!validate(config, master_mac));
+  effect.kind = mesh_interop_MatrixEffect_Kind_STATIC_COLOR; assert(validate(config, master_mac));
+}
+void test_modes() {
+  auto config = fixture();
+  config.modes_count = 2; config.modes[0].id = 1; strcpy(config.modes[0].name, "Day");
+  config.modes[1].id = 2; strcpy(config.modes[1].name, "Night");
+  config.active_mode_id = 1;
+  config.conditions[0].kind = mesh_interop_MatrixCondition_Kind_MODE; config.conditions[0].mode_id = 2;
+  config.sources[0].kind = mesh_interop_MatrixSource_Kind_ON_MODE_SWITCHED;
+  assert(!validate(config, master_mac));
+  evaluator rules; std::vector<animation_command> commands;
+  auto sink = [](void *p, const animation_command &c) { static_cast<std::vector<animation_command> *>(p)->push_back(c); return true; };
+  rules.configure(&config, 10, 1, true, false); rules.tick(100, nullptr, 0, 100, sink, &commands);
+  assert(commands.empty());
+  rules.configure(&config, 10, 2, false, true); rules.tick(200, nullptr, 0, 200, sink, &commands);
+  assert(commands.empty()); // The entry is restricted to mode 2.
+  config.active_mode_id = 2;
+  rules.configure(&config, 10, 3, false, true); rules.tick(300, nullptr, 0, 300, sink, &commands);
+  assert(commands.size() == 1 && commands[0].effective_at_us == 100300);
+  rules.tick(1000000, nullptr, 0, 1000000, sink, &commands); assert(commands.size() == 1);
+  config.active_mode_id = 3; assert(validate(config, master_mac));
+  config.active_mode_id = 2; config.conditions[0].mode_id = 3; assert(validate(config, master_mac));
+}
 void test_layering() {
   auto config = fixture(); auto d = definitions_for(config, slave_mac, 10, 20);
   d.layers[0].effect.duration_ms = 0;
@@ -155,6 +231,41 @@ void test_layering() {
   p.tick(110000); assert(output.shown.r == 127 && output.shown.b == 128);
   c.stop = true; c.effective_at_us = 120000; assert(p.enqueue(c));
   p.tick(120000); red(true);
+}
+void test_entry_background_opacity() {
+  auto config = fixture(); config.effects[0].duration_ms = 0;
+  config.effects_count = 2; config.effects[1].id = 8;
+  config.effects[1].kind = mesh_interop_MatrixEffect_Kind_BLINK;
+  config.effects[1].blue = 255; config.effects[1].alpha = 128;
+  config.effects[1].period_ms = 1000; config.effects[1].duration_ms = 1000;
+  config.entries_count = 2; config.entries[1] = config.entries[0];
+  config.entries[1].id = 5; config.entries[1].effect_id = 8;
+  config.entries[1].priority = 20; config.entries[1].opaque_background = true;
+  assert(!validate(config, master_mac));
+  auto definitions = definitions_for(config, slave_mac, 10, 20);
+  assert(definitions.layers[1].opaque_background);
+  auto bytes = encode(mesh_interop_AnimationDefinitions_fields, &definitions);
+  animation_definitions received{};
+  assert(decode(mesh_interop_AnimationDefinitions_fields, &received, bytes.data(), bytes.size()));
+  assert(received.layers[1].opaque_background);
+  player original(resolve), recovered(resolve);
+  assert(original.prepare(config, slave_mac, 10, 20) && recovered.prepare(received));
+  assert(original.enqueue(start())); auto overlay = start(); overlay.entry_id = 5;
+  assert(original.enqueue(overlay)); original.tick(100000);
+  assert(output.shown.r == 0 && output.shown.b == 128); // Alpha blends over black.
+  original.tick(600000); assert(output.shown.r == 0 && output.shown.b == 0); // Blink off is still opaque.
+  auto snapshot = original.snapshot(original.definitions(), 1, 0);
+  assert(recovered.restore(snapshot)); recovered.tick(600000);
+  assert(output.shown.r == 0 && output.shown.b == 0);
+  original.tick(1100000); red(true); // Finite layer expires and reveals the lower entry.
+  config.entries[1].opaque_background = false;
+  assert(original.prepare(config, slave_mac, 10, 20));
+  assert(original.enqueue(start()) && original.enqueue(overlay)); original.tick(100000);
+  assert(output.shown.r == 127 && output.shown.b == 128);
+  original.tick(600000); red(true); // Transparent blink off shows the lower entry.
+  config.entries[1].opaque_background = true;
+  config.sources[0].kind = mesh_interop_MatrixSource_Kind_DEFAULT_STATE;
+  assert(validate(config, master_mac));
 }
 void test_one_entry_two_drivers() {
   auto config = fixture();
@@ -236,6 +347,10 @@ void test_effect_validation_and_roundtrip() {
   c.effects[0].kind = mesh_interop_MatrixEffect_Kind_FLOWING_GRADIENT; assert(validate(c, master_mac));
   c.effects[0].has_secondary_color = true; c.effects[0].secondary_color = {0, 0, 255, 128};
   assert(!validate(c, master_mac));
+  c = fixture(); c.effects[0].kind = mesh_interop_MatrixEffect_Kind_FILL;
+  c.effects[0].duration_ms = 0; assert(validate(c, master_mac));
+  c.effects[0].duration_ms = 1000; assert(!validate(c, master_mac));
+  c.effects[0].loop = true; c.effects[0].duration_ms = 0; assert(!validate(c, master_mac));
   c = fixture(); c.effects[0].kind = static_cast<mesh_interop_MatrixEffect_Kind>(99);
   assert(validate(c, master_mac));
   c = keyframe_fixture(); c.effects[0].kind = mesh_interop_MatrixEffect_Kind_STATIC_COLOR;
@@ -309,6 +424,9 @@ void test_compact_config_and_direct_preparation() {
       player direct(mac ? resolve : nullptr);
       assert(direct.prepare(*c, mac, 10, 20));
       assert(direct.definition_bytes() == encode(mesh_interop_AnimationDefinitions_fields, expected.get()));
+      player compact_player(mac ? resolve : nullptr);
+      assert(compact_player.prepare(*compact, mac, 10, 20));
+      assert(compact_player.definition_bytes() == direct.definition_bytes());
     }
     auto copy = compact->to_wire();
     assert(copy && encode(mesh_interop_MatrixConfig_fields, copy.get()) == compact->encoded());
@@ -522,6 +640,35 @@ void test_shared_canvas_motion_and_gradient() {
     node_a.tick(100000 + elapsed * 1000); node_b.tick(100000 + elapsed * 1000);
     assert_canvas_projection(reference);
   }
+  effect.gradient_colors_count = 4;
+  effect.gradient_colors[0] = {255, 0, 0, 255}; effect.gradient_colors[1] = {0, 255, 0, 128};
+  effect.gradient_colors[2] = {0, 0, 255, 0}; effect.gradient_colors[3] = {255, 255, 255, 255};
+  options.gradient_color_count = 4;
+  for (size_t i = 0; i < 4; ++i) {
+    const auto &stop = effect.gradient_colors[i];
+    options.gradient_colors[i] = alpha_color(color(stop.red, stop.green, stop.blue), stop.alpha);
+  }
+  expected.reset(animation_effect_descriptor<animation_effect_type::FLOWING_GRADIENT>(options).create_instance());
+  a = make_definitions(c, slave_mac, 10, 20); b = make_definitions(c, master_mac, 10, 20);
+  assert(node_a.prepare(*a) && node_b.prepare(*b) && node_a.enqueue(start()) && node_b.enqueue(start()));
+  for (uint64_t elapsed : {0, 125, 250, 500, 750}) {
+    reference.clear(); expected->seek(elapsed); expected->render(reference);
+    node_a.tick(100000 + elapsed * 1000); node_b.tick(100000 + elapsed * 1000);
+    assert_canvas_projection(reference); // Preserve offsets, overlap and reversed outputs with multiple stops.
+  }
+  effect = {}; effect.id = 1; effect.kind = mesh_interop_MatrixEffect_Kind_FILL;
+  effect.red = 255; effect.alpha = 255; effect.duration_ms = 1000;
+  options = {}; options.primary = alpha_color(color(255, 0, 0)); options.period_ms = 1000;
+  expected.reset(animation_effect_descriptor<animation_effect_type::FILL>(options).create_instance());
+  a = make_definitions(c, slave_mac, 10, 20); b = make_definitions(c, master_mac, 10, 20);
+  assert(node_a.prepare(*a) && node_b.prepare(*b) && node_a.enqueue(start()) && node_b.enqueue(start()));
+  for (uint64_t elapsed : {0, 125, 250, 500, 750, 999}) {
+    reference.clear(); expected->seek(elapsed); expected->render(reference);
+    node_a.tick(100000 + elapsed * 1000); node_b.tick(100000 + elapsed * 1000);
+    assert_canvas_projection(reference);
+  }
+  effect = {}; effect.id = 1; effect.kind = mesh_interop_MatrixEffect_Kind_FLOWING_GRADIENT;
+  effect.red = 255; effect.alpha = 255; effect.has_secondary_color = true; effect.secondary_color = {0, 0, 255, 255};
   // Every layer reaches every configured output, even outputs overlapping others.
   c.effects_count = 2; c.effects[1].id = 8; c.effects[1].kind = mesh_interop_MatrixEffect_Kind_STATIC_COLOR;
   c.effects[1].blue = 255; c.effects[1].alpha = 128;
@@ -538,6 +685,9 @@ void test_shared_canvas_motion_and_gradient() {
 int main() {
   test_transfer(); test_schema_validation(); test_scheduled_player();
   test_master_evaluation_and_recovery(); test_layering();
+  test_entry_background_opacity();
+  test_modes();
+  test_boot_once_and_palette_roundtrip();
   test_one_entry_two_drivers();
   test_node_input_definitions();
   test_effect_validation_and_roundtrip(); test_animated_player_phase_and_snapshots();

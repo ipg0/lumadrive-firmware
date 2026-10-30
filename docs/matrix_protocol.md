@@ -2,6 +2,10 @@
 
 The master owns the full protobuf `MatrixConfig`, persisted in NVS as one
 versioned, checksummed record. Only the master evaluates sources and conditions.
+The matrix schema, ESP-NOW envelope, and NVS record format are development v0.
+Configuration revisions and master sessions still advance normally; they identify
+runtime state, not protocol formats. An obsolete saved record is replaced by the
+default matrix; corrupt records still report an error.
 Slaves receive `AnimationDefinitions` for their own fixed drivers and GPIO inputs,
 report edges, and execute timestamped commands. `matrix_service::init()` starts the worker and 10 ms
 playback loop after connected drivers and ESP-NOW have initialized.
@@ -21,7 +25,7 @@ messages retain Nanopb bounds checking; malformed edits leave playback unchanged
 
 ## Configuration
 
-Use schema version 2, nonzero IDs unique within each definition category, and
+Use schema version 0, nonzero IDs unique within each definition category, and
 valid effect/source/condition references. Limits are 32 entries, 32 definitions
 per category, six physical drivers per node, 84 placed light sources across up
 to 17 mesh nodes, and 16 KiB encoded bytes. The selected full-capacity target is
@@ -36,10 +40,16 @@ source. Layout/mapping identity includes `source_index`. Pin assignments remain
 in the static `connected_lighting_drivers` registry.
 
 Supported effects are static color, addressed RGBA keyframes, blink, breathe,
-flowing gradient, and rainbow; see [Animation effects](animations.md) for parameters.
+flowing gradient, rainbow, and fill; see [Animation effects](animations.md) for parameters.
+The matrix may include up to 32 named modes with stable nonzero IDs. The active
+mode is saved with the matrix; zero means no mode. A `MODE` condition matches
+its selected mode, while `ALWAYS` matches every mode. An `ON_MODE_SWITCHED`
+source triggers once when the active mode changes, at the new revision's shared
+activation time. It does not trigger when a revision keeps the same mode or on
+reboot. Switching replaces the runtime, stopping layers from the previous mode.
 Duration is in milliseconds; zero runs indefinitely. Sources include default
-state and local or slave GPIO edges, with always
-conditions. Set alpha explicitly: protobuf's default zero is transparent.
+state, on boot, mode changes, and local or slave GPIO edges. Set alpha explicitly:
+protobuf's default zero is transparent.
 GPIO inputs use external biasing, with internal pulls disabled. Role/discovery,
 flash, and connected-driver pins cannot be used as trigger inputs. GPIO sources
 identify the owning node's ESP-NOW MAC; remote source and layout nodes must be paired.
@@ -123,7 +133,7 @@ deployed. READ_ACTIVE_MATRIX returns the configuration currently playing on the
 master, retaining the previous revision until the shared activation boundary.
 Both documents include `active_revision`, `activation_pending`, and `persisted`
 (whether the returned configuration was saved in flash). At startup, before any
-revision is active, an active read returns an empty schema-2 matrix at revision
+revision is active, an active read returns an empty schema-0 matrix at revision
 zero. `MatrixClient.readCurrentMatrix()` and `MeshController.readCurrentMatrix()`
 expose this paged read without replacing an editor draft.
 The GPIO mask appended to inventory frames reports pins accepted by each node's
@@ -139,7 +149,7 @@ activation and reconnect recovery follow the existing deployment path.
 ## ESP-NOW framing and reliability
 
 New frames have an eight-byte header: little-endian magic `0x5854414d` (`MATX`),
-version byte `3`, type byte, and little-endian uint16 body length. Complete frames
+version byte `0`, type byte, and little-endian uint16 body length. Complete frames
 are at most 250 bytes. All participating nodes must run this protocol version;
 earlier matrix frames are rejected. Existing pairing and clock frames retain
 their formats. Types and bodies are:
@@ -216,12 +226,20 @@ from their original timestamp. Expired finite effects are skipped; backward
 clock corrections cannot underflow elapsed time. Priority increases toward the
 top layer; equal priorities preserve registration order, with one clear/show
 per participating driver each frame.
+Non-default-state entries can set `opaque_background` to hide lower layers with
+black while active. Otherwise transparent pixels reveal lower layers. The setting
+travels with each node's animation definitions and survives snapshot recovery.
 
 Per-node command streams are ordered and acknowledged. Sequence gaps, exhausted
 retries, and queue pressure request recovery snapshots containing active layers
 and pending transitions. Reconnecting slaves retain the original start times.
 Master reboot restores the matrix under a new session; slaves clear old-session
-state and await new definitions. Only the current configuration and protocol
+state and await new definitions. `ON_BOOT` sources start once at the first matrix
+activation after master reboot, at the shared activation timestamp. They do not
+repeat after finite durations, configuration saves, or slave reconnects. Failed
+command enqueue attempts retry until accepted. Use default-state sources for
+animations that should restart after ending.
+Only the current configuration and protocol
 formats are supported. During development, update all nodes and the control app
 together and discard incompatible saved configurations; no migration is provided.
 

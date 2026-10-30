@@ -289,7 +289,56 @@ void test_rainbow_zero_offset_views() {
   assert(strip.values[0].base_color.g == 255 && strip.values[0].base_color.b == 0);
   effect->seek(UINT64_C(1) << 40); assert(effect->render(strip_view) == ESP_OK && !effect->is_finished());
 }
+void test_multi_color_gradient() {
+  periodic_animation_options options;
+  options.period_ms = 1000; options.wavelength_pixels = 4;
+  options.gradient_color_count = 4;
+  options.gradient_colors[0] = alpha_color(color(255, 0, 0), 255);
+  options.gradient_colors[1] = alpha_color(color(0, 255, 0), 128);
+  options.gradient_colors[2] = alpha_color(color(0, 0, 255), 0);
+  options.gradient_colors[3] = alpha_color(color(255, 255, 255), 255);
+  using descriptor = animation_effect_descriptor<animation_effect_type::FLOWING_GRADIENT>;
+  effect_owner effect(descriptor(options).create_instance());
+  assert(effect);
+  animation_test_driver driver;
+  assert(effect->render(driver) == ESP_OK);
+  assert(driver.values[0].base_color.r == 255 && driver.values[1].base_color.g == 255);
+  assert(driver.values[2].base_color.b == 255 && driver.values[2].alpha == 0);
+  assert(driver.values[3].base_color.r == 255 && driver.values[3].base_color.g == 255);
+  effect->seek(125); effect->render(driver); // Seam interpolates last stop back to first.
+  assert(driver.values[0].base_color.r == 255 && driver.values[0].base_color.g == 128);
+  assert(driver.values[1].base_color.r == 128 && driver.values[1].base_color.g == 128);
+  assert(driver.values[1].alpha == 192);
+  options.reverse = true;
+  effect.reset(descriptor(options).create_instance()); effect->seek(250); effect->render(driver);
+  assert(driver.values[0].base_color.g == 255 && driver.values[0].alpha == 128);
+  options.gradient_color_count = 1; assert(!descriptor(options).create_instance());
+  options.gradient_color_count = 9; assert(!descriptor(options).create_instance());
+  options.gradient_color_count = 8; effect.reset(descriptor(options).create_instance()); assert(effect);
+}
+void test_fill_effect() {
+  periodic_animation_options options; options.primary = alpha_color(color(255, 0, 0), 128);
+  options.period_ms = 1000; options.duration_ms = 1000;
+  using descriptor = animation_effect_descriptor<animation_effect_type::FILL>;
+  effect_owner effect(descriptor(options).create_instance()); assert(effect);
+  animation_test_driver driver;
+  effect->seek(0); effect->render(driver); assert(driver.values[0].alpha == 0);
+  effect->seek(250); effect->render(driver);
+  assert(driver.values[0].alpha == 128 && driver.values[1].alpha == 0);
+  driver.clear(); effect->seek(500); effect->render(driver);
+  assert(driver.values[1].alpha == 128 && driver.values[2].alpha == 0);
+  driver.clear(); effect->seek(999); effect->render(driver); assert(driver.values[3].alpha == 128);
+  effect->seek(1000); assert(effect->is_finished());
+  options.reverse = true; effect.reset(descriptor(options).create_instance());
+  driver.clear(); effect->seek(250); effect->render(driver);
+  assert(driver.values[3].alpha == 128 && driver.values[2].alpha == 0);
+  options.loop = true; options.duration_ms = 0; effect.reset(descriptor(options).create_instance());
+  driver.clear(); effect->seek(1250); effect->render(driver);
+  assert(driver.values[3].alpha == 128 && driver.values[2].alpha == 0 && !effect->is_finished());
+}
 int main() {
+  test_fill_effect();
+  test_multi_color_gradient();
   test_keyframe_segments_and_ownership(); test_keyframe_interpolation_and_validation();
   test_blink_and_breathe(); test_independent_pixel_tracks(); test_flowing_gradient();
   test_keyframed_motion_width_and_wrapping();

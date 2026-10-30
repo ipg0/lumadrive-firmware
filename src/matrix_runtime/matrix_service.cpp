@@ -32,15 +32,17 @@ namespace matrix_service {
 namespace {
 using namespace matrix;
 namespace w = matrix::wire;
+constexpr uint32_t RECORD_VERSION = 0;
 // Decode an editor patch directly into the replacement matrix. Keeping a
 // maximum-sized LayoutUpdate/MatrixUpdate alongside it exhausts fragmented RAM
 // even for tiny edits. Nanopb still decodes and bounds every nested message.
-bool decode_editor_update(const std::vector<uint8_t> &bytes, bool layout,
+[[maybe_unused]] bool decode_editor_update(const std::vector<uint8_t> &bytes, bool layout,
     matrix_config &config, uint64_t &expected_revision, uint64_t &master_session) {
   if (bytes.size() > MAX_BYTES) return false;
   expected_revision = master_session = 0;
   if (layout) config.layout_count = 0;
-  else config.effects_count = config.sources_count = config.conditions_count = config.entries_count = 0;
+  else { config.effects_count = config.sources_count = config.conditions_count = config.entries_count = 0;
+    config.modes_count = 0; config.active_mode_id = 0; }
   auto stream = pb_istream_from_buffer(bytes.data(), bytes.size());
   while (stream.bytes_left) {
     pb_wire_type_t wire;
@@ -50,6 +52,11 @@ bool decode_editor_update(const std::vector<uint8_t> &bytes, bool layout,
     if (tag == 1 || tag == 2) {
       if (wire != PB_WT_VARINT || !pb_decode_varint(&stream, tag == 1 ? &expected_revision : &master_session)) return false;
       continue;
+    }
+    if (!layout && tag == mesh_interop_MatrixUpdate_active_mode_id_tag) {
+      uint64_t value;
+      if (wire != PB_WT_VARINT || !pb_decode_varint(&stream, &value) || value > UINT32_MAX) return false;
+      config.active_mode_id = value; continue;
     }
     const auto repeated = [&](const pb_msgdesc_t *fields, auto &values, auto &count) {
       if (wire != PB_WT_STRING || count >= std::size(values)) return false;
@@ -69,8 +76,103 @@ bool decode_editor_update(const std::vector<uint8_t> &bytes, bool layout,
       if (!repeated(mesh_interop_MatrixCondition_fields, config.conditions, config.conditions_count)) return false;
     } else if (!layout && tag == mesh_interop_MatrixUpdate_entries_tag) {
       if (!repeated(mesh_interop_MatrixEntry_fields, config.entries, config.entries_count)) return false;
+    } else if (!layout && tag == mesh_interop_MatrixUpdate_modes_tag) {
+      if (!repeated(mesh_interop_MatrixMode_fields, config.modes, config.modes_count)) return false;
     } else if (!pb_skip_field(&stream, wire)) return false;
   }
+  return true;
+}
+// Decode editor patches into populated vectors. The full Nanopb config has
+// fixed storage for every possible effect and output, even for a tiny update.
+bool decode_compact_editor_update(const std::vector<uint8_t> &bytes, bool layout,
+    runtime_config &config, uint64_t &expected_revision, uint64_t &master_session) {
+  if (bytes.size() > MAX_BYTES) return false;
+  expected_revision = master_session = 0;
+  if (layout) config.layout.clear();
+  else {
+    config.effects.clear(); config.sources.clear(); config.conditions.clear(); config.entries.clear();
+    config.modes.clear(); config.active_mode_id = 0;
+  }
+  auto stream = pb_istream_from_buffer(bytes.data(), bytes.size());
+  while (stream.bytes_left) {
+    pb_wire_type_t wire; uint32_t tag; bool eof;
+    if (!pb_decode_tag(&stream, &wire, &tag, &eof) || !tag) return false;
+    if (tag == 1 || tag == 2) {
+      if (wire != PB_WT_VARINT || !pb_decode_varint(&stream, tag == 1 ? &expected_revision : &master_session)) return false;
+      continue;
+    }
+    if (!layout && tag == mesh_interop_MatrixUpdate_active_mode_id_tag) {
+      uint64_t value;
+      if (wire != PB_WT_VARINT || !pb_decode_varint(&stream, &value) || value > UINT32_MAX) return false;
+      config.active_mode_id = value; continue;
+    }
+    const auto repeated = [&](const pb_msgdesc_t *fields, auto &values, size_t limit) {
+      if (wire != PB_WT_STRING || values.size() >= limit) return false;
+      typename std::decay_t<decltype(values)>::value_type item{};
+      pb_istream_t message;
+      if (!pb_make_string_substream(&stream, &message) || !pb_decode(&message, fields, &item) ||
+          !pb_close_string_substream(&stream, &message)) return false;
+      values.push_back(item); return true;
+    };
+    if (layout && tag == mesh_interop_LayoutUpdate_layout_tag) {
+      if (!repeated(mesh_interop_MatrixLayout_fields, config.layout, MAX_LAYOUT_SOURCES)) return false;
+    } else if (!layout && tag == mesh_interop_MatrixUpdate_effects_tag) {
+      if (!repeated(mesh_interop_MatrixEffect_fields, config.effects, 32)) return false;
+    } else if (!layout && tag == mesh_interop_MatrixUpdate_sources_tag) {
+      if (!repeated(mesh_interop_MatrixSource_fields, config.sources, 32)) return false;
+    } else if (!layout && tag == mesh_interop_MatrixUpdate_conditions_tag) {
+      if (!repeated(mesh_interop_MatrixCondition_fields, config.conditions, 32)) return false;
+    } else if (!layout && tag == mesh_interop_MatrixUpdate_entries_tag) {
+      if (!repeated(mesh_interop_MatrixEntry_fields, config.entries, 32)) return false;
+    } else if (!layout && tag == mesh_interop_MatrixUpdate_modes_tag) {
+      if (!repeated(mesh_interop_MatrixMode_fields, config.modes, 32)) return false;
+    } else if (!pb_skip_field(&stream, wire)) return false;
+  }
+  config.effects_count = config.effects.size(); config.sources_count = config.sources.size();
+  config.conditions_count = config.conditions.size(); config.entries_count = config.entries.size();
+  config.layout_count = config.layout.size(); config.modes_count = config.modes.size();
+  return true;
+}
+bool decode_compact_config(const std::vector<uint8_t> &bytes, runtime_config &config) {
+  if (bytes.size() > MAX_BYTES) return false;
+  auto stream = pb_istream_from_buffer(bytes.data(), bytes.size());
+  while (stream.bytes_left) {
+    pb_wire_type_t wire; uint32_t tag; bool eof;
+    if (!pb_decode_tag(&stream, &wire, &tag, &eof) || !tag) return false;
+    if (tag == mesh_interop_MatrixConfig_schema_version_tag || tag == mesh_interop_MatrixConfig_factory_default_tag ||
+        tag == mesh_interop_MatrixConfig_active_mode_id_tag) {
+      uint64_t value;
+      if (wire != PB_WT_VARINT || !pb_decode_varint(&stream, &value) || value > UINT32_MAX) return false;
+      if (tag == mesh_interop_MatrixConfig_schema_version_tag) config.schema_version = value;
+      else if (tag == mesh_interop_MatrixConfig_factory_default_tag) config.factory_default = value != 0;
+      else config.active_mode_id = value;
+      continue;
+    }
+    const auto repeated = [&](const pb_msgdesc_t *fields, auto &values, size_t limit) {
+      if (wire != PB_WT_STRING || values.size() >= limit) return false;
+      typename std::decay_t<decltype(values)>::value_type item{};
+      pb_istream_t message;
+      if (!pb_make_string_substream(&stream, &message) || !pb_decode(&message, fields, &item) ||
+          !pb_close_string_substream(&stream, &message)) return false;
+      values.push_back(item); return true;
+    };
+    if (tag == mesh_interop_MatrixConfig_effects_tag) {
+      if (!repeated(mesh_interop_MatrixEffect_fields, config.effects, 32)) return false;
+    } else if (tag == mesh_interop_MatrixConfig_sources_tag) {
+      if (!repeated(mesh_interop_MatrixSource_fields, config.sources, 32)) return false;
+    } else if (tag == mesh_interop_MatrixConfig_conditions_tag) {
+      if (!repeated(mesh_interop_MatrixCondition_fields, config.conditions, 32)) return false;
+    } else if (tag == mesh_interop_MatrixConfig_entries_tag) {
+      if (!repeated(mesh_interop_MatrixEntry_fields, config.entries, 32)) return false;
+    } else if (tag == mesh_interop_MatrixConfig_layout_tag) {
+      if (!repeated(mesh_interop_MatrixLayout_fields, config.layout, MAX_LAYOUT_SOURCES)) return false;
+    } else if (tag == mesh_interop_MatrixConfig_modes_tag) {
+      if (!repeated(mesh_interop_MatrixMode_fields, config.modes, 32)) return false;
+    } else if (!pb_skip_field(&stream, wire)) return false;
+  }
+  config.effects_count = config.effects.size(); config.sources_count = config.sources.size();
+  config.conditions_count = config.conditions.size(); config.entries_count = config.entries.size();
+  config.layout_count = config.layout.size(); config.modes_count = config.modes.size();
   return true;
 }
 constexpr auto STAGE_RECEIVING = mesh_interop_MatrixStatus_Stage_RECEIVING;
@@ -191,6 +293,7 @@ public:
   heap_object<player> retiring_ledger;
   heap_object<animation_snapshot> pending_snapshot;
   evaluator rules;
+  bool boot_pending = true;
   evaluator retiring_rules;
   receiver ble_rx, radio_rx;
   std::array<peer, 16> peers{};
@@ -239,7 +342,7 @@ public:
   bool available(const peer &p, uint64_t now) const {
     return p.seen && (now <= p.seen || now - p.seen < 4000000);
   }
-  const char *platform_validate(const matrix_config &c, bool check_peers) {
+  template <typename config_type> const char *platform_validate(const config_type &c, bool check_peers) {
     if (auto e = validate(c, mac)) return e;
     for (size_t i = 0; i < c.layout_count; ++i) {
       const auto &m = c.layout[i];
@@ -321,7 +424,7 @@ public:
   }
   bool save(const std::vector<uint8_t> &bytes, uint64_t rev) {
     std::vector<uint8_t> record;
-    w::put(record, w::MAGIC, 4); w::put(record, 1, 4); w::put(record, rev, 8);
+    w::put(record, w::MAGIC, 4); w::put(record, RECORD_VERSION, 4); w::put(record, rev, 8);
     w::put(record, crc32(bytes.data(), bytes.size()), 4); w::put(record, bytes.size(), 4);
     record.insert(record.end(), bytes.begin(), bytes.end());
     nvs_handle_t handle;
@@ -330,13 +433,13 @@ public:
     if (err == ESP_OK) err = nvs_commit(handle);
     nvs_close(handle); return err == ESP_OK;
   }
-  bool prepare_runtime(const matrix_config &c, uint64_t rev) {
+  template <typename config_type> bool prepare_runtime(const config_type &c, uint64_t rev) {
     auto next_ledger = make_heap_object<player>();
-    if (!next_ledger) return false;
-    if (!next_ledger->prepare(c, nullptr, session, rev)) return false;
+    if (!next_ledger) { ESP_LOGW("matrix", "Unable to allocate replacement ledger"); return false; }
+    if (!next_ledger->prepare(c, nullptr, session, rev)) { ESP_LOGW("matrix", "Unable to prepare replacement ledger"); return false; }
     auto next_local = make_heap_object<player>(connected_lighting_drivers::find);
-    if (!next_local) return false;
-    if (!next_local->prepare(c, mac, session, rev)) return false;
+    if (!next_local) { ESP_LOGW("matrix", "Unable to allocate replacement local player"); return false; }
+    if (!next_local->prepare(c, mac, session, rev)) { ESP_LOGW("matrix", "Unable to prepare replacement local player"); return false; }
     prepared_ledger = std::move(next_ledger); prepared_local = std::move(next_local);
     return true;
   }
@@ -354,9 +457,13 @@ public:
     nvs_close(handle);
     if (err == ESP_ERR_NVS_NOT_FOUND) return false;
     if (record.empty() || err != ESP_OK || w::get(record.data(), 4) != w::MAGIC ||
-        w::get(record.data() + 4, 4) != 1 || w::get(record.data() + 20, 4) != size - 24 ||
+        w::get(record.data() + 20, 4) != size - 24 ||
         crc32(record.data() + 24, size - 24) != w::get(record.data() + 16, 4)) {
       error("Saved matrix record is invalid", true); return true;
+    }
+    if (w::get(record.data() + 4, 4) != RECORD_VERSION) {
+      ESP_LOGW("matrix", "Discarding obsolete development matrix record");
+      return false;
     }
     auto c = make_heap_object<matrix_config>();
     if (!c || !decode(mesh_interop_MatrixConfig_fields, c.get(), record.data() + 24, size - 24) ||
@@ -424,14 +531,17 @@ public:
     }
     configuration_persisted = true; ++revision; start_deployment(std::move(next));
   }
-  void start_deployment(heap_object<matrix_config> c) {
-    auto compact = make_heap_object<runtime_config>(*c);
-    if (!compact) { error("Unable to retain prepared matrix", true); return; }
+  void start_deployment(heap_object<runtime_config> compact) {
     candidate = std::move(compact); deployment = true; state.stage = STAGE_DISTRIBUTING;
     state.revision = revision; tx = outbound{};
     for (auto &p : peers) {
       p.attempted = false; p.replacement_prepared = false;
     }
+  }
+  void start_deployment(heap_object<matrix_config> c) {
+    auto compact = make_heap_object<runtime_config>(*c);
+    if (!compact) { error("Unable to retain prepared matrix", true); return; }
+    start_deployment(std::move(compact));
   }
   size_t own_outputs(mesh_interop_LayoutOutput *outputs) {
     size_t count = 0;
@@ -668,35 +778,43 @@ public:
     } else if (u.which_operation == mesh_interop_MatrixUpload_commit_tag) {
       if (!ble_rx.complete(u.operation.commit)) { error("Upload is incomplete or CRC32 failed", true); return; }
       state.stage = mesh_interop_MatrixStatus_Stage_VALIDATING;
-      auto c = make_heap_object<matrix_config>();
-      if (!c) { error("Unable to allocate matrix", true); ble_rx.reset(); return; }
+      heap_object<runtime_config> compact;
       if (upload_is_layout || upload_is_matrix) {
-        if (config) config->copy_to(*c); else c->schema_version = SCHEMA_VERSION;
+        compact = config ? make_heap_object<runtime_config>(*config) : make_heap_object<runtime_config>();
+        if (!compact) { error("Unable to allocate matrix", true); ble_rx.reset(); return; }
         uint64_t expected_revision, master_session;
-        if (!decode_editor_update(ble_rx.bytes(), upload_is_layout, *c, expected_revision, master_session)) {
+        if (!decode_compact_editor_update(ble_rx.bytes(), upload_is_layout, *compact, expected_revision, master_session)) {
           error(upload_is_layout ? "Invalid layout protobuf" : "Invalid matrix update protobuf", true); ble_rx.reset(); return;
         }
         if (expected_revision != revision || master_session != session) {
           error("Configuration changed on controller; reload before applying", true); ble_rx.reset(); return;
         }
-      } else if (!decode(mesh_interop_MatrixConfig_fields, c.get(), ble_rx.bytes().data(), ble_rx.bytes().size())) {
-        error("Invalid matrix protobuf", true); ble_rx.reset(); return;
+      } else {
+        compact = make_heap_object<runtime_config>();
+        if (!compact) { error("Unable to allocate matrix", true); ble_rx.reset(); return; }
+        if (!decode_compact_config(ble_rx.bytes(), *compact)) {
+          error("Invalid matrix protobuf", true); ble_rx.reset(); return;
+        }
       }
-      c->factory_default = false;
-      if (auto e = platform_validate(*c, true)) { error(e, true); ble_rx.reset(); return; }
-      auto canonical = encode(mesh_interop_MatrixConfig_fields, c.get());
-      if (canonical.empty()) { error("Configuration exceeds 16 KiB", true); ble_rx.reset(); return; }
-      if (revision == UINT64_MAX || !prepare_runtime(*c, revision + 1)) {
+      compact->factory_default = false;
+      if (auto e = platform_validate(*compact, true)) { error(e, true); ble_rx.reset(); return; }
+      if (!compact->reencode()) { error("Configuration exceeds 16 KiB", true); ble_rx.reset(); return; }
+      ble_rx.reset();
+      if (revision == UINT64_MAX || !prepare_runtime(*compact, revision + 1)) {
+        log_memory();
         error("Unable to prepare replacement runtime", true); ble_rx.reset(); return;
       }
-      if (!prepare_gpio(*c)) { error("Unable to configure matrix GPIOs", true); ble_rx.reset(); return; }
-      if (revision == UINT64_MAX || !save(canonical, revision + 1)) {
+      if (!prepare_gpio(playback_definitions(*compact, mac, session, revision + 1))) {
+        prepared_ledger.reset(); prepared_local.reset();
+        error("Unable to configure matrix GPIOs", true); return;
+      }
+      if (revision == UINT64_MAX || !save(compact->encoded(), revision + 1)) {
         prepared_ledger.reset(); prepared_local.reset();
         cleanup_gpio();
         error("Unable to persist matrix", true); ble_rx.reset(); return;
       }
       configuration_persisted = true;
-      ++revision; ble_rx.reset(); start_deployment(std::move(c));
+      ++revision; start_deployment(std::move(compact));
     } else error("Unknown upload operation", true);
   }
   void begin_transfer(int index, uint8_t kind, std::vector<uint8_t> bytes) {
@@ -1038,7 +1156,9 @@ public:
     // Reserve a shared epoch far enough ahead to transfer initial snapshots.
     activate_at = now + LEAD_US + peer_count * 500000;
     pending_snapshot->activate_at_us = activate_at;
-    rules.configure(config.get(), session, revision);
+    const bool mode_switched = retiring_config && retiring_config->active_mode_id != config->active_mode_id;
+    rules.configure(config.get(), session, revision, boot_pending, mode_switched);
+    boot_pending = false;
     rules.tick(activate_at - LEAD_US, nullptr, 0, now, emit, this);
     deployment = false;
   }

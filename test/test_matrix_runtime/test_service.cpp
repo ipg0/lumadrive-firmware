@@ -128,6 +128,12 @@ void test_deploy_recover_persist() {
   assert(after.states[0].started_at_us == before.states[0].started_at_us); red(true);
 
   const auto original_record = stored;
+  assert(w::get(stored.data() + 4, 4) == 0);
+  stored[4] = 1;
+  service obsolete; configure_node(obsolete, true); obsolete.initialize_configuration();
+  assert(obsolete.candidate && obsolete.candidate->factory_default && obsolete.revision == 1);
+  assert(w::get(stored.data() + 4, 4) == 0);
+  stored = original_record;
   auto invalid = c; invalid.entries[0].effect_id = 999;
   upload(master, invalid, 2);
   assert(master.state.stage == mesh_interop_MatrixStatus_Stage_FAILED);
@@ -271,6 +277,71 @@ void test_animated_deployment_and_reconnect() {
   upload(master, invalid, 71);
   assert(master.state.stage == mesh_interop_MatrixStatus_Stage_FAILED);
   assert(master.revision == 1 && master.local && stored == saved);
+}
+void test_boot_palette_deployment_and_restore() {
+  stored.clear(); staged.clear(); network.clear();
+  service master, slave; configure_node(master, true); configure_node(slave, false);
+  auto config = fixture(); config.sources[0].kind = mesh_interop_MatrixSource_Kind_ON_BOOT;
+  auto &effect = config.effects[0]; effect.kind = mesh_interop_MatrixEffect_Kind_FLOWING_GRADIENT;
+  effect.duration_ms = 5000; effect.period_ms = 1000; effect.gradient_colors_count = 3;
+  effect.gradient_colors[0] = {255, 0, 0, 255};
+  effect.gradient_colors[1] = {0, 255, 0, 128};
+  effect.gradient_colors[2] = {0, 0, 255, 255};
+  upload(master, config, 75); cycles(master, slave, 200);
+  assert(slave.local && master.peers[0].ready);
+  const auto started = master.activate_at;
+  auto snapshot = slave.local->snapshot(slave.local->definitions(), 0, 0);
+  assert(snapshot.states[0].active && snapshot.states[0].started_at_us == started);
+  auto received = std::make_unique<animation_definitions>();
+  const auto &bytes = slave.local->definition_bytes();
+  assert(decode(mesh_interop_AnimationDefinitions_fields, received.get(), bytes.data(), bytes.size()));
+  assert(received->layers[0].effect.gradient_colors_count == 3);
+  assert(received->layers[0].effect.gradient_colors[1].green == 255);
+  slave.local.reset(); slave.pending_player.reset(); slave.pending_snapshot.reset();
+  slave.completed_transfer = 0; slave.radio_rx.reset(); slave.local_sequence = 0;
+  master.peers[0].ready = false; master.peers[0].definitions = false;
+  cycles(master, slave, 150);
+  assert(master.peers[0].ready && slave.local);
+  snapshot = slave.local->snapshot(slave.local->definitions(), 0, 0);
+  assert(snapshot.states[0].active && snapshot.states[0].started_at_us == started);
+  periodic_animation_options options; options.gradient_color_count = 3;
+  options.gradient_colors[0] = alpha_color(color(255, 0, 0), 255);
+  options.gradient_colors[1] = alpha_color(color(0, 255, 0), 128);
+  options.gradient_colors[2] = alpha_color(color(0, 0, 255), 255);
+  std::unique_ptr<animation_effect_instance_base> expected(
+      animation_effect_descriptor<animation_effect_type::FLOWING_GRADIENT>(options).create_instance());
+  fake_driver reference; expected->seek((fake_now - started) / 1000); expected->render(reference);
+  assert(output.shown.r == reference.pixel.r && output.shown.g == reference.pixel.g && output.shown.b == reference.pixel.b);
+  cycles(master, slave, 500); red(false);
+  upload(master, config, 76); cycles(master, slave, 200);
+  snapshot = slave.local->snapshot(slave.local->definitions(), 0, 0);
+  assert(!snapshot.states[0].active); // A save must not replay a boot trigger.
+  service rebooted; configure_node(rebooted, true); assert(rebooted.load());
+  cycles(rebooted, slave, 200);
+  snapshot = slave.local->snapshot(slave.local->definitions(), 0, 0);
+  assert(snapshot.states[0].active && snapshot.states[0].started_at_us == rebooted.activate_at);
+  assert(snapshot.states[0].started_at_us != started);
+  stored.clear(); staged.clear(); network.clear();
+}
+void test_mode_switch_deployment() {
+  stored.clear(); staged.clear(); network.clear();
+  service master, slave; configure_node(master, true); configure_node(slave, false);
+  auto config = fixture(); config.modes_count = 2;
+  config.modes[0].id = 1; strcpy(config.modes[0].name, "Day");
+  config.modes[1].id = 2; strcpy(config.modes[1].name, "Night");
+  config.active_mode_id = 1;
+  config.conditions[0].kind = mesh_interop_MatrixCondition_Kind_MODE; config.conditions[0].mode_id = 2;
+  config.sources[0].kind = mesh_interop_MatrixSource_Kind_ON_MODE_SWITCHED;
+  config.effects[0].duration_ms = 5000;
+  upload(master, config, 601); cycles(master, slave, 200);
+  assert(slave.local && !slave.local->snapshot(slave.local->definitions(), 0, 0).states[0].active);
+  config.active_mode_id = 2;
+  upload(master, config, 602); cycles(master, slave, 200);
+  const auto snapshot = slave.local->snapshot(slave.local->definitions(), 0, 0);
+  assert(snapshot.states[0].active && snapshot.states[0].started_at_us == master.activate_at);
+  service restored; configure_node(restored, true); assert(restored.load());
+  assert(restored.candidate && restored.candidate->active_mode_id == 2 && restored.candidate->modes_count == 2);
+  stored.clear(); staged.clear(); network.clear();
 }
 void slave_tick(service &slave) {
   fake_mesh_master = false; slave.slave_step(fake_now); fake_mesh_master = true;
@@ -515,6 +586,9 @@ void test_editor_patch_decoding() {
   assert(matrix_service::decode_editor_update(bytes, true, *config, revision, session));
   assert(revision == 300 && session == UINT64_MAX && config->layout_count == MAX_LAYOUT_SOURCES);
   assert(config->effects_count == 1 && config->effects[0].red == 255 && config->entries_count == 1);
+  runtime_config compact_layout(fixture());
+  assert(matrix_service::decode_compact_editor_update(bytes, true, compact_layout, revision, session));
+  assert(compact_layout.reencode() && compact_layout.encoded() == encode(mesh_interop_MatrixConfig_fields, config.get()));
   for (size_t i = 0; i < config->layout_count; ++i)
     assert(encode(mesh_interop_MatrixLayout_fields, &config->layout[i]) == encode(mesh_interop_MatrixLayout_fields, &update->layout[i]));
   // Unknown protobuf fields remain forward-compatible; malformed ones fail.
@@ -532,6 +606,8 @@ void test_editor_patch_decoding() {
   *config = fixture();
   auto matrix = make_heap_object<mesh_interop_MatrixUpdate>();
   matrix->expected_revision = 400; matrix->master_session = UINT64_MAX - 1;
+  matrix->modes_count = 2; matrix->modes[0].id = 1; strcpy(matrix->modes[0].name, "Day");
+  matrix->modes[1].id = 2; strcpy(matrix->modes[1].name, "Night"); matrix->active_mode_id = 2;
   matrix->effects_count = matrix->sources_count = matrix->conditions_count = matrix->entries_count = 32;
   for (size_t i = 0; i < 32; ++i) {
     matrix->effects[i] = config->effects[0]; matrix->effects[i].id = i + 1;
@@ -544,14 +620,31 @@ void test_editor_patch_decoding() {
   assert(revision == 400 && session == UINT64_MAX - 1 && config->layout_count == 1);
   assert(config->effects_count == 32 && config->sources_count == 32 && config->conditions_count == 32 && config->entries_count == 32);
   assert(config->effects[31].id == 32 && config->sources[31].id == 32 && config->conditions[31].id == 32 && config->entries[31].id == 32);
+  assert(config->modes_count == 2 && config->active_mode_id == 2 && !strcmp(config->modes[1].name, "Night"));
+  runtime_config compact_matrix(fixture());
+  assert(matrix_service::decode_compact_editor_update(bytes, false, compact_matrix, revision, session));
+  assert(compact_matrix.reencode() && compact_matrix.encoded() == encode(mesh_interop_MatrixConfig_fields, config.get()));
+  assert(compact_matrix.modes_count == 2 && compact_matrix.active_mode_id == 2);
   bytes.insert(bytes.end(), {0x1a, 2, 0x08, 33}); // A 33rd effect.
   assert(!matrix_service::decode_editor_update(bytes, false, *config, revision, session));
+  assert(!matrix_service::decode_compact_editor_update(bytes, false, compact_matrix, revision, session));
   // Empty repeated fields replace the edited portion, preserving the other half.
   assert(matrix_service::decode_editor_update({0x08, 1, 0x10, 2}, false, *config, revision, session));
   assert(!config->effects_count && !config->sources_count && !config->conditions_count && !config->entries_count && config->layout_count == 1);
+  assert(!config->modes_count && !config->active_mode_id);
   *config = fixture();
   assert(matrix_service::decode_editor_update({0x08, 1, 0x10, 2}, true, *config, revision, session));
   assert(!config->layout_count && config->effects_count == 1 && config->entries_count == 1);
+  auto original = fixture(); original.modes_count = 1; original.modes[0].id = 1;
+  strcpy(original.modes[0].name, "Night"); original.active_mode_id = 1;
+  const auto full = encode(mesh_interop_MatrixConfig_fields, &original);
+  runtime_config compact_full;
+  assert(matrix_service::decode_compact_config(full, compact_full));
+  assert(compact_full.reencode() && compact_full.encoded() == full);
+  assert(!validate(compact_full, master_mac));
+  auto truncated = full; truncated.pop_back();
+  runtime_config bad;
+  assert(!matrix_service::decode_compact_config(truncated, bad));
 }
 void layout_request(service &s, uint32_t request_id, uint32_t snapshot_id = 0, uint32_t offset = 0,
                     bool identify = false, uint32_t output_index = 0, bool matrix = false, bool active = false,
@@ -697,6 +790,15 @@ void test_matrix_editor_service() {
   const auto accepted = stored; update->expected_revision = 2; update->effects[0].blue = 255;
   fail_commit = true; upload_editor(master, mesh_interop_MatrixUpdate_fields, update.get(), 104, true); fail_commit = false;
   assert(master.revision == 2 && stored == accepted && master.config->effects[0].blue == c.effects[0].blue);
+  update->effects[0].blue = c.effects[0].blue;
+  update->modes_count = 2; update->modes[0].id = 1; strcpy(update->modes[0].name, "Day");
+  update->modes[1].id = 2; strcpy(update->modes[1].name, "Night");
+  for (unsigned i = 0; i < 8; ++i) {
+    update->expected_revision = master.revision; update->active_mode_id = 1 + i % 2;
+    upload_editor(master, mesh_interop_MatrixUpdate_fields, update.get(), 105 + i, true);
+    assert(master.deployment); cycles(master, slave, 200);
+    assert(master.config->active_mode_id == update->active_mode_id && master.config->modes_count == 2);
+  }
   network.clear();
 }
 std::unique_ptr<mesh_interop_MatrixDocument> read_document(service &node, bool active = false) {
@@ -888,6 +990,8 @@ int main() {
   test_old_matrix_evaluates_until_shared_boundary();
   test_command_retry_gap_and_snapshot_overflow();
   test_animated_deployment_and_reconnect();
+  test_boot_palette_deployment_and_restore();
+  test_mode_switch_deployment();
   test_remote_gpio_delivery();
   test_remote_gpio_source_only_and_replacement();
   test_remote_gpio_time_queues_and_sessions();

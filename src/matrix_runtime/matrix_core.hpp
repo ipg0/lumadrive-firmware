@@ -14,7 +14,7 @@ constexpr size_t MAX_DRIVERS_PER_NODE = 6;
 constexpr size_t MAX_SOURCES_PER_NODE = 12;
 constexpr size_t MAX_LAYOUT_SOURCES = 84;
 constexpr size_t MAX_INVENTORY_SOURCES = 204;
-constexpr uint32_t SCHEMA_VERSION = 2;
+constexpr uint32_t SCHEMA_VERSION = 0;
 constexpr uint64_t LEAD_US = 100000;
 constexpr uint64_t TRANSFER_TIMEOUT_US = 5000000;
 using matrix_config = mesh_interop_MatrixConfig;
@@ -28,18 +28,23 @@ using driver_resolver = rgb_lighting_driver *(*)(uint32_t);
 // Retain only populated definitions between uploads. A Nanopb MatrixConfig
 // reserves every effect/layout slot even for a tiny matrix; use it for staging.
 struct runtime_config {
+  runtime_config() : schema_version(SCHEMA_VERSION), factory_default(false),
+      effects_count(0), sources_count(0), conditions_count(0), entries_count(0), layout_count(0), modes_count(0), active_mode_id(0) {}
   explicit runtime_config(const matrix_config &config);
   void copy_to(matrix_config &config) const;
   heap_object<matrix_config> to_wire() const;
   const std::vector<uint8_t> &encoded() const { return _encoded; }
+  bool reencode();
   uint32_t schema_version;
   bool factory_default;
-  size_t effects_count, sources_count, conditions_count, entries_count, layout_count;
+  size_t effects_count, sources_count, conditions_count, entries_count, layout_count, modes_count;
+  uint32_t active_mode_id;
   std::vector<matrix_effect> effects;
   std::vector<mesh_interop_MatrixSource> sources;
   std::vector<mesh_interop_MatrixCondition> conditions;
   std::vector<mesh_interop_MatrixEntry> entries;
   std::vector<mesh_interop_MatrixLayout> layout;
+  std::vector<mesh_interop_MatrixMode> modes;
 private:
   std::vector<uint8_t> _encoded;
 };
@@ -48,11 +53,14 @@ private:
 // has room for 32 layers with 16 keyframes each, even for a one-layer rainbow.
 struct playback_layer {
   uint32_t entry_id = 0, priority = 0, order = 0;
+  bool opaque_background = false;
 };
 struct playback_definitions {
   playback_definitions() = default;
   playback_definitions(const animation_definitions &definitions);
   playback_definitions(const matrix_config &config, const uint8_t *node_mac,
+                       uint64_t session, uint64_t revision);
+  playback_definitions(const runtime_config &config, const uint8_t *node_mac,
                        uint64_t session, uint64_t revision);
   uint64_t master_session = 0, revision = 0;
   uint32_t canvas_size = 0;
@@ -88,6 +96,7 @@ private:
 // Validate structural references here; platform code additionally validates
 // paired MACs and GPIO capabilities. Returns nullptr on success.
 const char *validate(const matrix_config &config, const uint8_t master_mac[6]);
+const char *validate(const runtime_config &config, const uint8_t master_mac[6]);
 animation_definitions definitions_for(const matrix_config &config, const uint8_t *node_mac,
                             uint64_t session, uint64_t revision);
 // Heap-backed to keep keyframe buffers off the worker stack; nullptr on allocation failure.
@@ -102,6 +111,8 @@ public:
   explicit player(driver_resolver resolver = nullptr) : _resolver(resolver) {}
   bool prepare(const animation_definitions &definitions);
   bool prepare(const matrix_config &config, const uint8_t *node_mac,
+               uint64_t session, uint64_t revision);
+  bool prepare(const runtime_config &config, const uint8_t *node_mac,
                uint64_t session, uint64_t revision);
   bool prepare(const player &source);
   bool enqueue(const animation_command &command);
@@ -135,14 +146,19 @@ class evaluator {
 public:
   using command_sink = bool (*)(void *, const animation_command &);
   template <typename config_type>
-  void configure(const config_type *config, uint64_t session, uint64_t revision) {
+  void configure(const config_type *config, uint64_t session, uint64_t revision, bool boot = false, bool mode_switched = false) {
     _entries = config ? std::data(config->entries) : nullptr;
     _sources = config ? std::data(config->sources) : nullptr;
     _effects = config ? std::data(config->effects) : nullptr;
+    _conditions = config ? std::data(config->conditions) : nullptr;
     _entries_count = config ? config->entries_count : 0;
     _sources_count = config ? config->sources_count : 0;
     _effects_count = config ? config->effects_count : 0;
+    _conditions_count = config ? config->conditions_count : 0;
+    _mode = config ? config->active_mode_id : 0;
     _session = session; _revision = revision; _starts.fill(0); _active.fill(false);
+    _boot = boot; _boot_fired.fill(false);
+    _mode_switched = mode_switched; _mode_fired.fill(false);
   }
   void tick(uint64_t now, const trigger_gpio_edge_t *edges, size_t edge_count,
             uint64_t edge_time, command_sink sink, void *arg);
@@ -150,9 +166,15 @@ private:
   const mesh_interop_MatrixEntry *_entries = nullptr;
   const mesh_interop_MatrixSource *_sources = nullptr;
   const matrix_effect *_effects = nullptr;
+  const mesh_interop_MatrixCondition *_conditions = nullptr;
   size_t _entries_count = 0, _sources_count = 0, _effects_count = 0;
+  size_t _conditions_count = 0;
+  uint32_t _mode = 0;
   uint64_t _session = 0, _revision = 0;
   std::array<uint64_t, 32> _starts{};
   std::array<bool, 32> _active{};
+  std::array<bool, 32> _boot_fired{};
+  std::array<bool, 32> _mode_fired{};
+  bool _boot = false, _mode_switched = false;
 };
 } // namespace matrix

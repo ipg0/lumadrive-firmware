@@ -42,7 +42,7 @@ inline heap_object<matrix_config> make_default_config(const uint8_t mac[6], driv
   snprintf(effect.name, sizeof(effect.name), "Rainbow");
   config->sources_count = 1; config->sources[0].id = 1;
   config->sources[0].kind = mesh_interop_MatrixSource_Kind_DEFAULT_STATE;
-  config->conditions_count = 1; config->conditions[0] = {1, mesh_interop_MatrixCondition_Kind_ALWAYS};
+  config->conditions_count = 1; config->conditions[0] = {1, mesh_interop_MatrixCondition_Kind_ALWAYS, 0};
   config->entries_count = 1; auto &entry = config->entries[0];
   entry.id = entry.effect_id = entry.source_id = entry.condition_id = 1;
   snprintf(entry.name, sizeof(entry.name), "Default rainbow");

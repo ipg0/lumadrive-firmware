@@ -5,7 +5,7 @@
 
 namespace matrix::wire {
 constexpr uint32_t MAGIC = 0x5854414d;
-constexpr uint8_t VERSION = 3;
+constexpr uint8_t VERSION = 0;
 constexpr size_t HEADER_SIZE = 8, CHUNK_SIZE = 200, PACKET_LIMIT = 250;
 enum type : uint8_t {
   BEGIN = 1, CHUNK, FINISH, ACK, COMMAND, COMMAND_ACK, SNAPSHOT_REQUEST, HELLO,
