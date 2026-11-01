@@ -1,5 +1,6 @@
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <vector>
 #include <array>
@@ -10,6 +11,16 @@ struct strip { size_t symbols; };
 size_t rmt_used = 0;
 std::vector<size_t> allocations;
 std::vector<uint8_t> last_pixels;
+std::array<uint8_t, driver_provisioning::MAX_IMAGE_SIZE> partition_bytes{};
+esp_partition_t partition{partition_bytes.size()};
+bool partition_present = true;
+}
+const esp_partition_t *esp_partition_find_first(esp_partition_type_t, esp_partition_subtype_t, const char *) {
+  return partition_present ? &partition : nullptr;
+}
+esp_err_t esp_partition_read(const esp_partition_t *, size_t offset, void *data, size_t size) {
+  if (offset + size > partition_bytes.size()) return ESP_ERR_INVALID_SIZE;
+  memcpy(data, partition_bytes.data() + offset, size); return ESP_OK;
 }
 esp_err_t rmt_new_tx_channel(const rmt_tx_channel_config_t *cfg, rmt_channel_handle_t *handle) {
   assert(cfg->mem_block_symbols && cfg->mem_block_symbols % 64 == 0);
@@ -66,40 +77,48 @@ esp_err_t gptimer_disable(gptimer_handle_t) { return ESP_OK; }
 esp_err_t gptimer_del_timer(gptimer_handle_t) { return ESP_OK; }
 
 int main() {
-  assert(connected_lighting_drivers::init() == ESP_OK);
+  using namespace driver_provisioning;
+  configuration config{}; config.count = 2;
+  config.drivers[0] = {.id = 1, .type = WS2812, .data_pin = 19, .default_pixels = 60};
+  config.drivers[1] = {.id = 2, .type = HC595, .data_pin = 23, .clock_pin = 18,
+      .latch_pin = 5, .led_count = 1, .bcm_base_period_us = 10, .leds = {{{0, 1, 2, false}, {}}}};
+  assert(encode(config, partition_bytes.data(), partition_bytes.size()));
+  assert(init_registered_drivers() == ESP_OK);
   assert(allocations.back() == 512);
-  assert(connected_lighting_drivers::find(1) == &led_strip_driver && connected_lighting_drivers::find(2) == &rgb_module_driver);
+  auto *led_strip_driver = connected_lighting_drivers::find(1);
+  assert(led_strip_driver && connected_lighting_drivers::find(2));
   assert(connected_lighting_drivers::uses_gpio(19) && connected_lighting_drivers::uses_gpio(23));
   assert(!connected_lighting_drivers::uses_gpio(12));
-  led_strip_driver.set_pixel(0, alpha_color(color(10, 20, 30)));
+  led_strip_driver->set_pixel(0, alpha_color(color(10, 20, 30)));
   const auto initial_allocations = allocations.size();
-  assert(led_strip_driver.reserve_layout_pixels(0, 120) == ESP_OK);
-  assert(led_strip_driver.get_pixel_count() == 120 && allocations.size() == initial_allocations);
-  led_strip_driver.show(); assert(last_pixels.size() == 360);
+  assert(led_strip_driver->reserve_layout_pixels(0, 120) == ESP_OK);
+  assert(led_strip_driver->get_pixel_count() == 120 && allocations.size() == initial_allocations);
+  led_strip_driver->show(); assert(last_pixels.size() == 360);
   assert(last_pixels[0] == 20 && last_pixels[1] == 10 && last_pixels[2] == 30 && last_pixels.back() == 0);
-  assert(led_strip_driver.reserve_layout_pixels(0, ws2812_lighting_driver::MAX_PIXELS + 1) == ESP_ERR_INVALID_ARG);
-  assert(led_strip_driver.reserve_layout_pixels(1, 10) == ESP_ERR_INVALID_ARG);
-  assert(led_strip_driver.get_pixel_count() == 120);
-  led_strip_driver.deinit(); rgb_module_driver.deinit();
-  std::array<std::unique_ptr<ws2812_lighting_driver>, 6> strips;
-  std::array<driver_registration, 6> entries{};
+  assert(led_strip_driver->reserve_layout_pixels(0, ws2812_lighting_driver::MAX_PIXELS + 1) == ESP_ERR_INVALID_ARG);
+  assert(led_strip_driver->reserve_layout_pixels(1, 10) == ESP_ERR_INVALID_ARG);
+  assert(led_strip_driver->get_pixel_count() == 120);
+  for (auto &driver : drivers) if (driver) { driver->deinit(); driver.reset(); }
   const int pins[] = {19, 21, 22, 25, 26, 27};
-  for (size_t i = 0; i < strips.size(); ++i) {
-    strips[i] = std::make_unique<ws2812_lighting_driver>(ws2812_driver_config{static_cast<gpio_num_t>(pins[i]), 60});
-    entries[i] = register_driver(i + 1, *strips[i]);
-  }
-  auto invalid = entries; invalid[5].id = 1;
-  assert(init_registered_drivers(invalid.data(), invalid.size()) == ESP_ERR_INVALID_ARG);
-  invalid = entries; invalid[5] = register_driver(6, *strips[0]);
-  assert(init_registered_drivers(invalid.data(), invalid.size()) == ESP_ERR_INVALID_ARG);
-  assert(init_registered_drivers(entries.data(), 7) == ESP_ERR_INVALID_ARG);
+  config = {}; config.count = 6;
+  for (size_t i = 0; i < config.count; ++i)
+    config.drivers[i] = {.id = uint8_t(i + 1), .type = WS2812, .data_pin = uint8_t(pins[i]), .default_pixels = 60};
+  assert(encode(config, partition_bytes.data(), partition_bytes.size()));
   const auto start = allocations.size();
-  assert(init_registered_drivers(entries.data(), entries.size()) == ESP_OK);
+  assert(init_registered_drivers() == ESP_OK);
   assert(rmt_used == 384 && allocations.size() == start + 6);
   for (size_t i = start; i < allocations.size(); ++i) assert(allocations[i] == 64);
-  for (auto &driver : strips) { assert(driver->get_kind() == lighting_driver_kind::LED_STRIP); driver->deinit(); }
-  const driver_registration sparse[] = {entries[0], entries[5]};
-  assert(init_registered_drivers(sparse, 2) == ESP_OK);
-  assert(rmt_used == 512); strips[0]->deinit(); strips[5]->deinit(); assert(rmt_used == 0);
-  std::puts("Static registry: six strips, shared RMT budget, sparse slots, type independence, and conflicting pins/IDs passed.");
+  for (auto &driver : drivers) if (driver) { driver->deinit(); driver.reset(); }
+  config.drivers[1] = config.drivers[5]; config.count = 2;
+  assert(encode(config, partition_bytes.data(), partition_bytes.size()));
+  assert(init_registered_drivers() == ESP_OK);
+  assert(connected_lighting_drivers::find(1) && connected_lighting_drivers::find(6));
+  assert(!connected_lighting_drivers::find(2) && rmt_used == 512);
+  for (auto &driver : drivers) if (driver) { driver->deinit(); driver.reset(); }
+  assert(rmt_used == 0);
+  partition_bytes[16] ^= 1;
+  assert(init_registered_drivers() == ESP_ERR_INVALID_ARG && !connected_lighting_drivers::find(1));
+  partition_present = false;
+  assert(init_registered_drivers() == ESP_ERR_NOT_FOUND && !connected_lighting_drivers::find(1));
+  std::puts("Provisioned registry: image validation, six strips, RMT budget and sparse slots passed.");
 }

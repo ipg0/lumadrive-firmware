@@ -5,11 +5,14 @@
 #include "mesh_interop/mesh_interop.hpp"
 #include "matrix_runtime/matrix_service.hpp"
 #include <esp_err.h>
+#include <esp_log.h>
 
 extern "C" {
 void app_main() {
   // Clear retained LED frames before initializing storage, networking or mesh.
-  ESP_ERROR_CHECK(connected_lighting_drivers::init());
+  const auto lighting_status = connected_lighting_drivers::init();
+  if (lighting_status != ESP_OK)
+    ESP_LOGE("main", "Driver provisioning unavailable or invalid: %s", esp_err_to_name(lighting_status));
   global_config::instance();
   master_clock_manager::instance();
   mesh_interop::instance();

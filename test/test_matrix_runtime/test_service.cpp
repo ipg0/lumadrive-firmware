@@ -52,6 +52,8 @@ mesh_interop::mesh_interop_state_result_t mesh_interop::get_state() {
   s.nodes[0].last_synced_at = fake_now; return s;
 }
 namespace connected_lighting_drivers {
+esp_err_t fake_status = ESP_OK;
+esp_err_t status() { return fake_status; }
 driver_resolver configured_resolver = resolve;
 rgb_lighting_driver *find(uint32_t id) { return configured_resolver(id); }
 bool uses_gpio(uint32_t pin) { return pin == 5 || pin == 18 || pin == 19 || pin == 23; }
@@ -1046,6 +1048,14 @@ void test_local_layout_validation_errors() {
   assert(!master.platform_validate(c, true));
   connected_lighting_drivers::configured_resolver = resolve;
 }
+void test_missing_provisioning_reports_error() {
+  connected_lighting_drivers::fake_status = ESP_ERR_INVALID_STATE;
+  service master, slave; configure_node(master, true); configure_node(slave, false);
+  master.initialize_configuration(); slave.initialize_configuration();
+  assert(!master.candidate && !master.local && !slave.local);
+  assert(strstr(master.state.error, "provisioning") && strstr(slave.state.error, "provisioning"));
+  connected_lighting_drivers::fake_status = ESP_OK;
+}
 int main() {
   matrix_core_tests_main();
   matrix_service::gpio_queue = xQueueCreate(64, sizeof(matrix_service::gpio_event));
@@ -1067,6 +1077,7 @@ int main() {
   test_six_driver_inventory_and_independent_remote_leds();
   test_configurable_strip_and_identify_preview();
   test_local_layout_validation_errors();
+  test_missing_provisioning_reports_error();
   test_only_current_hello_format();
   delete matrix_service::gpio_queue;
   test_callback_queue_limits();

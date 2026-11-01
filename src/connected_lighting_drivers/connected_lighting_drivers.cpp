@@ -1,131 +1,105 @@
 #include "connected_lighting_drivers.hpp"
+#include "driver_provisioning.hpp"
 #include "../lighting_driver/impl/bcm_74hc595_lighting_driver.hpp"
 #include "../lighting_driver/impl/ws2812_lighting_driver.hpp"
-#include <esp_check.h>
+#include <esp_log.h>
+#include <esp_partition.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
-#include <iterator>
-#include <type_traits>
+#include <array>
+#include <memory>
+#include <new>
 
 namespace {
-
 constexpr const char *TAG = "connected_lighting_drivers";
+using namespace driver_provisioning;
+std::array<std::unique_ptr<rgb_lighting_driver>, MAX_DRIVERS> drivers;
+configuration wiring;
+esp_err_t initialization_status = ESP_ERR_INVALID_STATE;
 
-// Connected hardware: update these pins and bit mappings to match the board.
-constexpr ws2812_driver_config WS2812_CFG = {
-    .data_pin = GPIO_NUM_19,
-    .led_count = 60, // default, can be changed in app
-};
-
-// TPIC6B595N: LED common anodes connect directly to +12 V. A stored 1 enables
-// the corresponding low-side sink. DRAIN3–7 are unused.
-constexpr hc595_driver_config HC595_CFG = {
-    .ser_pin = GPIO_NUM_23,
-    .srclk_pin = GPIO_NUM_18,
-    .rclk_pin = GPIO_NUM_5,
-    .led_count = 1,
-    .leds =
-        {
-            {.r_bit = 0,
-             .g_bit = 1,
-             .b_bit = 2,
-             .channels_active_low = false},
-        },
-    // 255 weighted units per cycle: ~392 Hz before ISR/shift overhead.
-    .bcm_base_period_us = 10,
-};
-
-// Add static instances and register up to six of them below. IDs are stable
-// layout references, independent of driver type. Multiple strips/modules work.
-ws2812_lighting_driver led_strip_driver(WS2812_CFG);
-bcm_74hc595_lighting_driver rgb_module_driver(HC595_CFG);
-struct driver_registration {
-  uint32_t id;
-  rgb_lighting_driver *instance;
-  bool (*uses_gpio)(const rgb_lighting_driver *, uint32_t);
-  void (*configure_rmt)(rgb_lighting_driver *, size_t);
-};
-template <typename driver_type>
-constexpr driver_registration register_driver(uint32_t id, driver_type &instance) {
-  return {id, &instance,
-      [](const rgb_lighting_driver *base, uint32_t pin) { return static_cast<const driver_type *>(base)->uses_gpio(pin); },
-      [](rgb_lighting_driver *base, size_t symbols) {
-        if constexpr (std::is_same_v<driver_type, ws2812_lighting_driver>)
-          static_cast<driver_type *>(base)->set_rmt_memory_symbols(symbols);
-      }};
+esp_err_t read_wiring(configuration &config) {
+  const auto *partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+      static_cast<esp_partition_subtype_t>(0x40), "drivercfg");
+  if (!partition || partition->size < HEADER_SIZE) return ESP_ERR_NOT_FOUND;
+  std::array<uint8_t, MAX_IMAGE_SIZE> bytes{};
+  auto err = esp_partition_read(partition, 0, bytes.data(), HEADER_SIZE);
+  if (err != ESP_OK) return err;
+  const auto length = get(bytes.data() + 8, 4);
+  if (length < HEADER_SIZE || length > bytes.size() || length > partition->size) return ESP_ERR_INVALID_SIZE;
+  err = esp_partition_read(partition, HEADER_SIZE, bytes.data() + HEADER_SIZE, length - HEADER_SIZE);
+  if (err != ESP_OK) return err;
+  return decode(bytes.data(), length, config) ? ESP_OK : ESP_ERR_INVALID_ARG;
 }
-constexpr driver_registration DRIVERS[] = {
-    register_driver(1, led_strip_driver),
-    // register_driver(2, rgb_module_driver),
-};
-static_assert(std::size(DRIVERS) <= connected_lighting_drivers::MAX_DRIVERS, "At most six physical drivers per node");
 
-esp_err_t init_registered_drivers(const driver_registration *entries = DRIVERS, size_t count = std::size(DRIVERS)) {
-  if (count > connected_lighting_drivers::MAX_DRIVERS) return ESP_ERR_INVALID_ARG;
+esp_err_t init_registered_drivers() {
+  configuration config{};
+  auto err = read_wiring(config);
+  if (err != ESP_OK) return err;
   size_t strips = 0;
-  for (size_t i = 0; i < count; ++i) {
-    const auto &entry = entries[i];
-    if (!entry.id || entry.id > connected_lighting_drivers::MAX_DRIVERS) return ESP_ERR_INVALID_ARG;
-    if (entry.instance->get_kind() != lighting_driver_kind::LED_STRIP &&
-        entry.instance->get_kind() != lighting_driver_kind::RGB_LED_MODULE) return ESP_ERR_INVALID_ARG;
-    strips += entry.instance->get_kind() == lighting_driver_kind::LED_STRIP;
-    for (size_t j = 0; j < i; ++j) {
-      if (entry.id == entries[j].id) return ESP_ERR_INVALID_ARG;
-      for (uint32_t pin = 0; pin < 40; ++pin)
-        if (entry.uses_gpio(entry.instance, pin) && entries[j].uses_gpio(entries[j].instance, pin)) return ESP_ERR_INVALID_ARG;
-    }
-  }
-  // The ESP32 has eight shared 64-symbol RMT blocks. Keep one strip's full
-  // buffer, then divide the bank among all configured strips (up to six).
+  for (size_t i = 0; i < config.count; ++i) strips += config.drivers[i].type == WS2812;
   const size_t symbols = strips ? (8 / strips) * 64 : 64;
-  for (size_t i = 0; i < count; ++i) {
-    const auto &entry = entries[i];
-    entry.configure_rmt(entry.instance, symbols);
-    ESP_RETURN_ON_ERROR(entry.instance->init(), TAG, "Driver %u failed to initialize", unsigned(entry.id));
-    // Addressable LEDs retain their last latched frame across an MCU reset.
-    ESP_RETURN_ON_ERROR(entry.instance->clear(), TAG, "Driver %u failed to clear", unsigned(entry.id));
-    ESP_RETURN_ON_ERROR(entry.instance->show(), TAG, "Driver %u failed to blank", unsigned(entry.id));
+  size_t initialized = 0;
+  std::array<uint8_t, MAX_DRIVERS> order{};
+  for (size_t i = 0; i < config.count; ++i) {
+    const auto &d = config.drivers[i];
+    auto &entry = drivers[d.id - 1];
+    if (d.type == WS2812) {
+      ws2812_driver_config cfg{};
+      cfg.data_pin = static_cast<gpio_num_t>(d.data_pin); cfg.led_count = d.default_pixels;
+      cfg.rmt_mem_block_symbols = symbols;
+      entry.reset(new (std::nothrow) ws2812_lighting_driver(cfg));
+    } else {
+      hc595_driver_config cfg{};
+      cfg.ser_pin = static_cast<gpio_num_t>(d.data_pin); cfg.srclk_pin = static_cast<gpio_num_t>(d.clock_pin);
+      cfg.rclk_pin = static_cast<gpio_num_t>(d.latch_pin); cfg.led_count = d.led_count;
+      cfg.bcm_base_period_us = d.bcm_base_period_us;
+      for (size_t j = 0; j < d.led_count; ++j)
+        cfg.leds[j] = {d.leds[j].red, d.leds[j].green, d.leds[j].blue, d.leds[j].active_low};
+      entry.reset(new (std::nothrow) bcm_74hc595_lighting_driver(cfg));
+    }
+    if (!entry) { err = ESP_ERR_NO_MEM; break; }
+    err = entry->init();
+    if (err != ESP_OK) { entry.reset(); break; }
+    order[initialized++] = d.id;
+    err = entry->clear();
+    if (err == ESP_OK) err = entry->show();
+    if (err != ESP_OK) break;
   }
+  if (err != ESP_OK) {
+    while (initialized) { auto &d = drivers[order[--initialized] - 1]; d->deinit(); d.reset(); }
+    return err;
+  }
+  wiring = config;
   return ESP_OK;
 }
-
 } // namespace
 
 namespace connected_lighting_drivers {
-
 bool uses_gpio(uint32_t pin) {
-  for (const auto &entry : DRIVERS) if (entry.uses_gpio(entry.instance, pin)) return true;
+  for (size_t i = 0; i < wiring.count; ++i) {
+    const auto &d = wiring.drivers[i];
+    if (pin == d.data_pin || (d.type == HC595 && (pin == d.clock_pin || pin == d.latch_pin))) return true;
+  }
   return false;
 }
-
 rgb_lighting_driver *find(uint32_t id) {
-  for (const auto &entry : DRIVERS) if (entry.id == id) return entry.instance;
-  return nullptr;
+  return id && id <= MAX_DRIVERS ? drivers[id - 1].get() : nullptr;
 }
-
+esp_err_t status() { return initialization_status; }
 esp_err_t init() {
-  // RMT binds its interrupt to the CPU that allocates the channel. Keep that
-  // allocation on the lighting core; Wi-Fi and BLE run on core 0.
-  struct initialization {
-    SemaphoreHandle_t complete;
-    esp_err_t result = ESP_FAIL;
-  } request{xSemaphoreCreateBinary()};
+  struct initialization { SemaphoreHandle_t complete; esp_err_t result = ESP_FAIL; } request{xSemaphoreCreateBinary()};
   if (!request.complete) return ESP_ERR_NO_MEM;
   const auto created = xTaskCreatePinnedToCore([](void *arg) {
     auto &request = *static_cast<initialization *>(arg);
     request.result = init_registered_drivers();
     ESP_LOGI(TAG, "Lighting initialized on core %u: %s", unsigned(xPortGetCoreID()), esp_err_to_name(request.result));
-    xSemaphoreGive(request.complete);
-    vTaskDelete(nullptr);
+    xSemaphoreGive(request.complete); vTaskDelete(nullptr);
   }, "lighting_init", 4096, &request, 5, nullptr, portNUM_PROCESSORS - 1);
-  if (created != pdPASS) {
-    vSemaphoreDelete(request.complete);
-    return ESP_ERR_NO_MEM;
-  }
+  if (created != pdPASS) { vSemaphoreDelete(request.complete); return ESP_ERR_NO_MEM; }
   xSemaphoreTake(request.complete, portMAX_DELAY);
   vSemaphoreDelete(request.complete);
-  return request.result;
+  initialization_status = request.result;
+  return initialization_status;
 }
-
 } // namespace connected_lighting_drivers

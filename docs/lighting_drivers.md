@@ -1,26 +1,45 @@
 # Connected lighting drivers
 
-Board wiring lives in `src/connected_lighting_drivers/connected_lighting_drivers.cpp`.
-Driver ID 1 is the 60-pixel WS2812 strip on GPIO19. Driver ID 2 remains `HC595` in
-the protocol and exposes one RGB pixel through the TPIC6B595N; its layout indices
-and animation behavior are unchanged.
+Board wiring is provisioned per node in a dedicated flash partition. Firmware and
+the app contain no default pin assignments. Copy `provisioning/example_driver_config.hpp`
+to a file for each node and edit its `DRIVER_CONFIGURATION`. Keep driver IDs 1–6
+stable because saved layouts reference each node's MAC, driver ID and source index.
 
-## Static registry
+## USB provisioning
 
-`DRIVERS` in the C++ file registers up to six physical instances using stable
-slot IDs 1–6. Driver type is inferred from the instance; IDs do not encode type.
-Add the configuration, static instance, and registry entry in that same file:
+The new partition table moves the application and requires a **one-time USB flash**
+of the bootloader, partition table and firmware on every node. NVS and PHY retain
+their offsets; do not use `erase_flash` if pairing and saved configuration must be
+preserved. Back up important data before migration. For each node, with the correct
+header and serial port:
 
-```cpp
-constexpr ws2812_driver_config REAR_CFG = {.data_pin = GPIO_NUM_21, .led_count = 30};
-ws2812_lighting_driver rear_strip(REAR_CFG);
-// In DRIVERS, alongside the current entries:
-register_driver(3, rear_strip),
+```sh
+pio run -e esp32dev -t upload --upload-port /dev/ttyUSB0
+LUMADRIVE_DRIVER_CONFIG=/path/to/my_node.hpp pio run -e esp32dev -t provision-drivers --upload-port /dev/ttyUSB0
 ```
 
-Slots may be sparse. Duplicate IDs or overlapping output pins are rejected.
-`uses_gpio()` derives reserved pins from every registered instance. Keep wiring
-specific to each board's build; the master uses each node's actual inventory.
+The second command validates the header, generates an image, and writes only the
+`drivercfg` partition at `0x12000`. Repeat it to change wiring; the firmware does
+not write this partition. Never include a configuration image in a firmware/OTA
+package. Re-provisioning is not power-fail atomic: if interrupted, rerun the USB
+command. The header can instead be specified with `custom_driver_config` in
+`platformio.ini`; `LUMADRIVE_DRIVER_CONFIG` takes precedence for one run. A port
+is required, either via `--upload-port` or the `upload_port` setting. The target
+is independent of `upload` and never runs during a normal firmware build. To
+generate an image without flashing:
+
+```sh
+bash provisioning/build_driver_image.sh /path/to/my_node.hpp /tmp/my_node.bin
+```
+
+The versioned record is checksummed and validated on the host and device. Invalid
+or missing records leave all lighting drivers disabled, log the error, and keep
+mesh networking and the master's BLE available for diagnosis. An intentionally empty configuration
+is allowed. Output pins must be valid ESP32 output GPIOs; flash, serial, role GPIO4
+and discovery GPIO16 are reserved. Duplicate IDs, overlapping pins, invalid RGB
+bit mappings, and conflicting shared BCM timer periods are rejected. `uses_gpio()`
+derives reserved pins from the loaded registry; the master uses each node's actual
+inventory. The app cannot edit wiring.
 
 One 595 driver configured with `led_count = 2` exposes two independent layout
 sources, each length one, addressed by `(node_mac, driver, source_index)`.
@@ -29,7 +48,7 @@ Configure both RGB bit mappings in `leds`; no COM output is used.
 
 ## TPIC6B595N
 
-SER IN connects to GPIO23, SRCK to GPIO18, and RCK to GPIO5. RGB pixel 0 uses
+In the example wiring, SER IN connects to GPIO23, SRCK to GPIO18, and RCK to GPIO5. RGB pixel 0 uses
 DRAIN0/1/2. DRAIN3–7 are spare and are always
 shifted as zero. The LED common anodes connect directly to the positive LED supply
 (+12 V for this board), not to shift-register outputs. Each cathode is switched by

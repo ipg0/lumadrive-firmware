@@ -8,3 +8,4 @@ generated/**
 !generated/.gitkeep
 
 managed_components/**
+.configs/**

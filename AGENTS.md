@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This repository contains ESP32 lighting firmware built with PlatformIO and ESP-IDF. `src/main.cpp` provides `app_main()` and initializes services and connected lighting drivers. `src/connected_lighting_drivers/` owns board wiring, persistent driver instances, and initialization. Other feature directories under `src/` separate BLE communication (`ble_interop/`), mesh networking (`mesh_interop/`), clock synchronization (`master_clock_manager/`), configuration, color utilities, lighting drivers, and animation triggers. Keep concrete driver and trigger implementations in their existing `impl/` directories.
+This repository contains ESP32 lighting firmware built with PlatformIO and ESP-IDF. `src/main.cpp` provides `app_main()` and initializes services and connected lighting drivers. `src/connected_lighting_drivers/` loads provisioned wiring and owns driver instances and initialization; `provisioning/` contains the per-node header template and USB tools. Other feature directories under `src/` separate BLE communication (`ble_interop/`), mesh networking (`mesh_interop/`), clock synchronization (`master_clock_manager/`), configuration, color utilities, lighting drivers, and animation triggers. Keep concrete driver and trigger implementations in their existing `impl/` directories.
 
 `src/matrix_runtime/` contains the master evaluator, node player, transfer worker, and persistence. `include/` and `lib/` are reserved for shared headers and private libraries. Host tests live in `test/`; `generated/` holds ignored Nanopb output. Protocol definitions live in the sibling `../proto/` repository.
 
@@ -16,10 +16,11 @@ Run these commands from the repository root with PlatformIO Core installed:
 - `pio run -e esp32dev -t clean`: remove build outputs.
 - `bash test/test_animation_trigger_table/run.sh`: run trigger-matrix host tests with a C++20 compiler.
 - `bash test/test_matrix_runtime/run.sh`: test distributed playback, transfers, persistence, and clock synchronization with host adapters.
+- `bash test/test_driver_provisioning/run.sh`: test the provisioning format and wiring validation.
 
 Before building, ensure `generated/mesh.pb.c` and its header exist. With `protoc` and its Nanopb and Dart plugins on `PATH`, run `bash ../proto/generate.sh` to regenerate bindings for both projects. The script creates the output directories and writes firmware bindings to `generated/`, matching `src/CMakeLists.txt`.
 
-The build uses size optimization (`-Os`) and a custom `partitions.csv`: one 1.5 MiB app slot within a 2 MiB flash layout, preserving NVS and PHY offsets. OTA is not configured. SoftAP, enterprise Wi-Fi, WPA3 connection features, and IPv6 are disabled; ESP-NOW and BLE security/bond storage remain enabled.
+The build uses size optimization (`-Os`) and a custom 2 MiB `partitions.csv`: two 960 KiB OTA app slots, OTA metadata and a separate read-only driver provisioning partition, preserving NVS and PHY offsets. OTA upload is not implemented. Provision each node over USB as described in `docs/lighting_drivers.md`; normal firmware images must never include its wiring partition. SoftAP, enterprise Wi-Fi, WPA3 connection features, and IPv6 are disabled; ESP-NOW and BLE security/bond storage remain enabled.
 
 ## Coding Style & Naming Conventions
 

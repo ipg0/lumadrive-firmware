@@ -489,6 +489,10 @@ public:
     return true;
   }
   void initialize_configuration() {
+    if (connected_lighting_drivers::status() != ESP_OK) {
+      error("Driver provisioning missing or invalid; lighting disabled", true);
+      return;
+    }
     // The master owns configuration and startup animation timing. Slaves wait
     // for its synchronized snapshot rather than displaying an unrelated default.
     if (!master) return;
