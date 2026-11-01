@@ -15,7 +15,7 @@ constexpr const char *TAG = "connected_lighting_drivers";
 // Connected hardware: update these pins and bit mappings to match the board.
 constexpr ws2812_driver_config WS2812_CFG = {
     .data_pin = GPIO_NUM_19,
-    .led_count = 60,
+    .led_count = 60, // default, can be changed in app
 };
 
 // TPIC6B595N: LED common anodes connect directly to +12 V. A stored 1 enables
@@ -57,7 +57,7 @@ constexpr driver_registration register_driver(uint32_t id, driver_type &instance
 }
 constexpr driver_registration DRIVERS[] = {
     register_driver(1, led_strip_driver),
-    register_driver(2, rgb_module_driver),
+    // register_driver(2, rgb_module_driver),
 };
 static_assert(std::size(DRIVERS) <= connected_lighting_drivers::MAX_DRIVERS, "At most six physical drivers per node");
 
@@ -83,6 +83,9 @@ esp_err_t init_registered_drivers(const driver_registration *entries = DRIVERS, 
     const auto &entry = entries[i];
     entry.configure_rmt(entry.instance, symbols);
     ESP_RETURN_ON_ERROR(entry.instance->init(), TAG, "Driver %u failed to initialize", unsigned(entry.id));
+    // Addressable LEDs retain their last latched frame across an MCU reset.
+    ESP_RETURN_ON_ERROR(entry.instance->clear(), TAG, "Driver %u failed to clear", unsigned(entry.id));
+    ESP_RETURN_ON_ERROR(entry.instance->show(), TAG, "Driver %u failed to blank", unsigned(entry.id));
   }
   return ESP_OK;
 }

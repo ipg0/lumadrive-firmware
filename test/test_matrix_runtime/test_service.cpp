@@ -817,15 +817,13 @@ void test_preconfigured_rainbow_and_current_read() {
   stored.clear(); staged.clear(); network.clear();
   service master, slave; configure_node(master, true); configure_node(slave, false);
   fake_synchronized = false; slave.initialize_configuration();
-  assert(slave.standalone_default && slave.config->factory_default && slave.config->layout_count == 2);
-  for (size_t i = 0; i < slave.config->layout_count; ++i) assert(slave.config->layout[i].from == 0);
-  slave.playback_step(0); assert(output.shown.r == 255 && output_secondary.shown.r == 255);
-  slave.playback_step(2000000); assert(output.shown.b == 255 && output_secondary.shown.b == 255);
+  assert(!slave.local && !slave.config);
+  slave.playback_step(0); assert(!slave.local);
   fake_synchronized = true;
   master.initialize_configuration(); assert(master.candidate && master.candidate->factory_default && !stored.empty());
   cycles(master, slave, 400);
   assert(master.config && master.config->factory_default && master.config->layout_count == 4);
-  assert(!slave.standalone_default && !slave.config && slave.local->definitions().output_mappings_count == 2);
+  assert(!slave.config && slave.local->definitions().output_mappings_count == 2);
   for (size_t i = 0; i < master.config->layout_count; ++i) assert(master.config->layout[i].from == 0 && master.config->layout[i].to == 1);
   auto document = read_document(master);
   assert(document->revision == master.revision && document->active_revision == master.revision && document->persisted && !document->activation_pending);
@@ -863,6 +861,42 @@ void test_preconfigured_rainbow_and_current_read() {
   service volatile_default; configure_node(volatile_default, true); volatile_default.initialize_configuration();
   assert(volatile_default.candidate && !volatile_default.configuration_persisted && stored.empty());
   fail_commit = false; network.clear();
+}
+void test_boot_and_default_start_together() {
+  stored.clear(); staged.clear(); network.clear();
+  service master, slave; configure_node(master, true); configure_node(slave, false);
+  slave.initialize_configuration();
+  assert(!slave.local && !slave.pending_player);
+  auto c = fixture();
+  c.sources[0].kind = mesh_interop_MatrixSource_Kind_DEFAULT_STATE;
+  c.effects[0].duration_ms = 0;
+  c.effects_count = 2; c.effects[1] = c.effects[0]; c.effects[1].id = 5;
+  c.effects[1].red = 0; c.effects[1].blue = 255; c.effects[1].duration_ms = 5000;
+  c.sources_count = 2; c.sources[1] = c.sources[0]; c.sources[1].id = 6;
+  c.sources[1].kind = mesh_interop_MatrixSource_Kind_ON_BOOT;
+  c.entries_count = 2; c.entries[1] = c.entries[0]; c.entries[1].id = 7;
+  c.entries[1].source_id = 6; c.entries[1].effect_id = 5; c.entries[1].priority = 20;
+  c.layout_count = 2;
+  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 0, 1);
+  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_WS2812, 1, 2);
+  upload(master, c, 202);
+  for (unsigned i = 0; i < 250 && (!master.local || !slave.local); ++i) {
+    cycles(master, slave, 1);
+    if (master.pending_snapshot && fake_now < master.activate_at) assert(!master.local);
+    if (slave.pending_snapshot && fake_now < slave.pending_snapshot->activate_at_us) assert(!slave.local);
+  }
+  assert(master.local && slave.local);
+  for (auto *node : {&master, &slave}) {
+    auto snapshot = node->local->snapshot(node->local->definitions(), 0, 0);
+    assert(snapshot.states_count == 2);
+    assert(snapshot.states[0].active && snapshot.states[1].active);
+    assert(snapshot.states[0].started_at_us == master.activate_at);
+    assert(snapshot.states[1].started_at_us == master.activate_at);
+  }
+  assert(output.shown.b == 255 && output.shown.r == 0);
+  cycles(master, slave, 520);
+  assert(output.shown.r == 255 && output.shown.b == 0);
+  stored.clear(); staged.clear(); network.clear();
 }
 void test_six_driver_inventory_and_independent_remote_leds() {
   stored.clear(); staged.clear(); network.clear();
@@ -983,6 +1017,35 @@ void test_configurable_strip_and_identify_preview() {
   assert(restored.prepare_runtime(c, 2) && growing_output.get_pixel_count() == 12);
   connected_lighting_drivers::configured_resolver = resolve; network.clear(); stored.clear();
 }
+class layout_capacity_driver : public fake_driver {
+public:
+  size_t get_layout_max_pixel_count(uint32_t source) const override { return source ? 0 : 2048; }
+} layout_capacity_output;
+rgb_lighting_driver *resolve_layout_capacity(uint32_t id) {
+  return id == 1 ? &layout_capacity_output : nullptr;
+}
+void test_local_layout_validation_errors() {
+  service master; configure_node(master, true);
+  auto c = fixture();
+  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 0, 1);
+  assert(!master.platform_validate(c, true));
+  c.layout[0].driver = mesh_interop_MatrixDriver_DRIVER_3;
+  assert(!strcmp(master.platform_validate(c, true), "Layout references a missing local driver"));
+  c.layout[0].driver = mesh_interop_MatrixDriver_WS2812;
+  c.layout[0].source_index = 1;
+  assert(!strcmp(master.platform_validate(c, true), "Layout references a missing local driver source"));
+  c.layout[0].source_index = 0;
+  c.layout[0].to = 2;
+  assert(!strcmp(master.platform_validate(c, true), "Layout span exceeds local driver capacity"));
+  c.layout[0].from = 2; c.layout[0].to = 1;
+  assert(!master.platform_validate(c, true));
+  connected_lighting_drivers::configured_resolver = resolve_layout_capacity;
+  c.layout_count = 2;
+  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 0, 24);
+  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_WS2812, 24, 84);
+  assert(!master.platform_validate(c, true));
+  connected_lighting_drivers::configured_resolver = resolve;
+}
 int main() {
   matrix_core_tests_main();
   matrix_service::gpio_queue = xQueueCreate(64, sizeof(matrix_service::gpio_event));
@@ -1000,8 +1063,10 @@ int main() {
   test_layout_editor_service();
   test_matrix_editor_service();
   test_preconfigured_rainbow_and_current_read();
+  test_boot_and_default_start_together();
   test_six_driver_inventory_and_independent_remote_leds();
   test_configurable_strip_and_identify_preview();
+  test_local_layout_validation_errors();
   test_only_current_hello_format();
   delete matrix_service::gpio_queue;
   test_callback_queue_limits();

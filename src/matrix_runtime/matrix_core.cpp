@@ -212,6 +212,7 @@ animation_effect_instance_base *create_effect(const matrix_effect &e) {
     options.gradient_colors[i] = alpha_color(color(stop.red, stop.green, stop.blue), stop.alpha);
   }
   options.wavelength_pixels = e.wavelength_pixels; options.reverse = e.reverse;
+  options.fill_from_center = e.fill_from_center;
   switch (e.kind) {
   case mesh_interop_MatrixEffect_Kind_BLINK:
     return animation_effect_descriptor<animation_effect_type::BLINK>(options).create_instance();

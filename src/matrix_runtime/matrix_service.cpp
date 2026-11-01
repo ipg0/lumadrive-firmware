@@ -254,7 +254,6 @@ public:
   uint8_t inbound_kind = 0;
   uint64_t inbound_revision = 0;
   bool deployment = false;
-  bool standalone_default = false;
   bool default_layout_dirty = false;
   bool configuration_persisted = false, active_persisted = false;
   bool upload_is_layout = false;
@@ -348,9 +347,22 @@ public:
       const auto &m = c.layout[i];
       if (!memcmp(m.node_mac, mac, 6)) {
         auto *driver = connected_lighting_drivers::find(m.driver);
-        if (!driver || m.source_index >= driver->get_layout_source_count() ||
-            std::max(m.from, m.to) - std::min(m.from, m.to) > driver->get_layout_max_pixel_count(m.source_index))
+        if (!driver) {
+          ESP_LOGE("matrix", "Layout references missing local driver %u", unsigned(m.driver));
+          return "Layout references a missing local driver";
+        }
+        if (m.source_index >= driver->get_layout_source_count()) {
+          ESP_LOGE("matrix", "Layout references missing source %u on local driver %u",
+              unsigned(m.source_index), unsigned(m.driver));
+          return "Layout references a missing local driver source";
+        }
+        const auto span = std::max(m.from, m.to) - std::min(m.from, m.to);
+        const auto maximum = driver->get_layout_max_pixel_count(m.source_index);
+        if (span > maximum) {
+          ESP_LOGE("matrix", "Local driver %u source %u layout length %u exceeds maximum %u",
+              unsigned(m.driver), unsigned(m.source_index), unsigned(span), unsigned(maximum));
           return "Layout span exceeds local driver capacity";
+        }
       } else if (check_peers && !mesh_interop::instance().slave_node_exists(m.node_mac))
         return "Layout node is not paired";
       else {
@@ -476,30 +488,10 @@ public:
     start_deployment(std::move(c));
     return true;
   }
-  bool install_standalone_default() {
-    auto c = make_default_config(mac, connected_lighting_drivers::find);
-    if (!c) return false;
-    auto definitions = make_definitions(*c, mac, session, 1);
-    auto next = make_heap_object<player>(connected_lighting_drivers::find);
-    if (!definitions || !next || !next->prepare(*definitions)) return false;
-    auto snapshot = make_heap_object<animation_snapshot>();
-    if (!snapshot) return false;
-    snapshot->master_session = session; snapshot->revision = 1;
-    snapshot->states_count = 1; snapshot->states[0] = {1, 0, true};
-    if (!next->restore(*snapshot)) return false;
-    if (local) local->blank();
-    auto compact = make_heap_object<runtime_config>(*c);
-    if (!compact) return false;
-    config = std::move(compact); local = std::move(next); revision = 1; standalone_default = true;
-    configuration_persisted = active_persisted = false;
-    state.stage = STAGE_ACTIVE; state.revision = revision;
-    return true;
-  }
   void initialize_configuration() {
-    if (!master) {
-      if (!install_standalone_default()) error("Unable to prepare default matrix", true);
-      return;
-    }
+    // The master owns configuration and startup animation timing. Slaves wait
+    // for its synchronized snapshot rather than displaying an unrelated default.
+    if (!master) return;
     if (load()) return;
     auto c = make_default_config(mac, connected_lighting_drivers::find);
     if (!c || validate(*c, mac) || !prepare_runtime(*c, 1)) {
@@ -877,11 +869,11 @@ public:
       auto d = make_heap_object<animation_definitions>();
       if (!d || !decode(mesh_interop_AnimationDefinitions_fields, d.get(), radio_rx.bytes().data(), radio_rx.bytes().size()) ||
           d->master_session != session || d->revision != inbound_revision) return false;
-      if (!standalone_default && local && d->revision < local->definitions().revision) return false;
+      if (local && d->revision < local->definitions().revision) return false;
       if (pending_player && d->revision < pending_player->definitions().revision) return false;
       auto p = make_heap_object<player>(connected_lighting_drivers::find);
       if (!p || !p->prepare(*d)) return false;
-      const auto *existing = pending_player ? pending_player.get() : !standalone_default && local ? local.get() : nullptr;
+      const auto *existing = pending_player ? pending_player.get() : local.get();
       if (existing && existing->definitions().revision == d->revision)
         return existing->definition_bytes() == radio_rx.bytes();
       if (!prepare_gpio(*d)) return false;
@@ -1081,8 +1073,7 @@ public:
     } else if (type == w::COMMAND) {
       animation_command c{};
       if (!decode(mesh_interop_AnimationCommand_fields, &c, b, n) || c.master_session != session) return;
-      if (standalone_default && !pending_snapshot) return;
-      const bool previous = !standalone_default && local && pending_snapshot && pending_player &&
+      const bool previous = local && pending_snapshot && pending_player &&
           c.revision == local->definitions().revision && c.revision != pending_player->definitions().revision;
       auto *p = previous ? local.get() : pending_snapshot && pending_player ? pending_player.get() : local.get();
       if (!p || c.revision != p->definitions().revision) return;
@@ -1327,7 +1318,6 @@ public:
       }
       identify_driver = 0; identify_source = 0; last_identify_id = 0;
       cleanup_gpio();
-      if (standalone_default && !install_standalone_default()) error("Unable to synchronize default matrix", true);
       gpio_event e;
       for (unsigned i = 0; i < 64 && xQueueReceive(gpio_queue, &e, 0) == pdTRUE; ++i) {}
     }
@@ -1342,7 +1332,7 @@ public:
       if (mesh.nodes_count) {
         std::vector<uint8_t> b; w::put(b, session, 8);
         auto *advertised = pending_snapshot && pending_player ? pending_player.get() : local.get();
-        w::put(b, advertised && (!standalone_default || pending_snapshot) ? advertised->definitions().revision : 0, 8); w::put(b, local_sequence, 4);
+        w::put(b, advertised ? advertised->definitions().revision : 0, 8); w::put(b, local_sequence, 4);
         w::put(b, gpio_stream, 8); w::put(b, gpio_degraded ? 1 : 0, 1);
         send(mesh.nodes[0].mac, w::HELLO, b);
       }
@@ -1397,7 +1387,7 @@ public:
       if (local) local->blank();
       local = std::move(pending_player); revision = local->definitions().revision;
       active_persisted = configuration_persisted;
-      if (!master) { standalone_default = false; config.reset(); }
+      if (!master) config.reset();
       pending_snapshot.reset();
       retiring_config.reset(); retiring_ledger.reset();
       for (auto &p : peers) p.retiring_commands.clear();
@@ -1418,7 +1408,7 @@ public:
       }
       identify_driver = 0;
     }
-    if (local && (synchronized || standalone_default)) {
+    if (local && synchronized) {
       auto err = local->tick(clock, true, identify_driver, identify_source);
       if (err != ESP_OK && !state.error[0]) error("Animation driver failed");
     }

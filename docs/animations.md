@@ -82,7 +82,7 @@ defaults to 1000 ms; explicit periods must be at least 2 ms. Rendering runs at
 | `BREATHE` | Smoothly vary primary alpha from zero to its configured value and back, peaking halfway through `period_ms`. |
 | `FLOWING_GRADIENT` | Move 2–8 RGBA stops from `gradient_colors` along canvas indices, equally spaced and wrapping last → first. `wavelength_pixels: 0` fits one cycle to the full canvas; a positive value sets its spatial length. `reverse: true` flows toward decreasing indices. |
 | `RAINBOW` | Move a repeating saturated RGB spectrum along canvas indices. Uses primary alpha for opacity, with the same wavelength and reverse controls as flowing gradient. Primary RGB and secondary color are ignored. |
-| `FILL` | Fill the shared canvas with primary RGBA, leaving unfilled pixels transparent. With `loop: false`, `duration_ms` (at least 2) sets the time for one pass; with `loop: true`, `period_ms` sets the pass time and duration limits total playback. `reverse` fills toward lower indices. A finite effect ends at its duration; default-state triggers restart it. |
+| `FILL` | Fill the shared canvas with primary RGBA, leaving unfilled pixels transparent. With `loop: false`, `duration_ms` (at least 2) sets the time for one pass; with `loop: true`, `period_ms` sets the pass time and duration limits total playback. `reverse` starts at the end; `fill_from_center` expands in both directions from the shared canvas center. A finite effect ends at its duration; default-state triggers restart it. |
 
 These parametric types cover the whole canvas. Blink/breathe off phases reveal
 lower layers. Gradient interpolation includes alpha and uses logical RGB pixels

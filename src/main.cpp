@@ -8,10 +8,11 @@
 
 extern "C" {
 void app_main() {
+  // Clear retained LED frames before initializing storage, networking or mesh.
+  ESP_ERROR_CHECK(connected_lighting_drivers::init());
   global_config::instance();
   master_clock_manager::instance();
   mesh_interop::instance();
-  ESP_ERROR_CHECK(connected_lighting_drivers::init());
   ESP_ERROR_CHECK(matrix_service::init());
   ble_interop::instance();
 }

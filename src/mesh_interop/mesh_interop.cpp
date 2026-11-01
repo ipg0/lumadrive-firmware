@@ -156,7 +156,15 @@ void mesh_interop::finish_discovery_timer_cb(void *arg) {
 esp_err_t mesh_interop::start_discovery_impl() {
   this->_discovery_mode = true;
 
-  this->clear_saved_state();
+  const esp_err_t clear_err = this->clear_saved_state();
+  if (clear_err != ESP_OK) {
+    ESP_LOGW("mesh_interop", "Failed to clear saved mesh state: %s",
+             esp_err_to_name(clear_err));
+  }
+  // Discovery must begin with the current role even if there was no NVS key,
+  // or erasing it failed. Otherwise a fresh master's zero-initialized role
+  // is saved as a slave and cannot be restored on the next boot.
+  this->init_state();
 
   if (global_config::instance().is_master_node()) {
     this->_state.is_configured = false;
@@ -217,7 +225,11 @@ esp_err_t mesh_interop::finish_discovery_impl() {
 
   if (this->_state.is_configured) {
     ESP_LOGI("mesh_interop", "Interop is configured, saving _state to NVS");
-    this->save_state();
+    const esp_err_t save_err = this->save_state();
+    if (save_err != ESP_OK) {
+      ESP_LOGE("mesh_interop", "Failed to save mesh state: %s",
+               esp_err_to_name(save_err));
+    }
   } else {
     ESP_LOGW("mesh_interop",
              "Interop is not configured, not saving _state in NVS, reboot!");
@@ -468,6 +480,14 @@ esp_err_t mesh_interop::load_state() {
     return ESP_ERR_INVALID_STATE;
   }
 
+  if (this->_state.nodes_count > MESH_INTEROP_SLAVE_NODES_MAX ||
+      (!this->_state.is_master_state && this->_state.is_configured &&
+       this->_state.nodes_count != 1)) {
+    ESP_LOGE("mesh_interop", "Invalid saved mesh node count: %u",
+             this->_state.nodes_count);
+    return ESP_ERR_INVALID_STATE;
+  }
+
   for (size_t i = 0; i < MESH_INTEROP_SLAVE_NODES_MAX; i++) {
     this->_node_last_synced_at[i] = 0;
   }
@@ -485,6 +505,7 @@ esp_err_t mesh_interop::save_state() {
   }
 
   this->_state.magic = mesh_interop::MESH_INTEROP_NVS_MAGIC;
+  this->_state.is_master_state = global_config::instance().is_master_node();
 
   nvs_err =
       nvs_set_blob(nvs_handle, "_state", &this->_state, sizeof(this->_state));
@@ -517,6 +538,10 @@ esp_err_t mesh_interop::clear_saved_state() {
   }
 
   nvs_err = nvs_erase_key(nvs_handle, "_state");
+  if (nvs_err == ESP_ERR_NVS_NOT_FOUND) {
+    nvs_close(nvs_handle);
+    return ESP_OK;
+  }
   if (nvs_err != ESP_OK) {
     ESP_LOGE("mesh_interop", "Failed to erase _state from NVS: %s",
              esp_err_to_name(nvs_err));
@@ -534,7 +559,6 @@ esp_err_t mesh_interop::clear_saved_state() {
 
   nvs_close(nvs_handle);
 
-  init_state();
   return ESP_OK;
 }
 

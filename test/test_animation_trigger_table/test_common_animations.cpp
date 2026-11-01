@@ -335,6 +335,23 @@ void test_fill_effect() {
   options.loop = true; options.duration_ms = 0; effect.reset(descriptor(options).create_instance());
   driver.clear(); effect->seek(1250); effect->render(driver);
   assert(driver.values[3].alpha == 128 && driver.values[2].alpha == 0 && !effect->is_finished());
+  options.fill_from_center = true; options.reverse = false;
+  effect.reset(descriptor(options).create_instance());
+  driver.clear(); effect->seek(250); effect->render(driver);
+  assert(driver.values[0].alpha == 0 && driver.values[1].alpha == 128 &&
+         driver.values[2].alpha == 128 && driver.values[3].alpha == 0);
+  driver.clear(); effect->seek(999); effect->render(driver);
+  for (const auto &value : driver.values) assert(value.alpha == 128);
+  driver.count = 3;
+  driver.clear(); effect->seek(250); effect->render(driver);
+  assert(driver.values[0].alpha == 0 && driver.values[1].alpha == 128 && driver.values[2].alpha == 0);
+  driver.clear(); effect->seek(999); effect->render(driver);
+  for (size_t i = 0; i < 3; ++i) assert(driver.values[i].alpha == 128);
+  driver.count = 4;
+  linear_lighting_driver_view right(driver, 6, 2, 8);
+  driver.clear(); effect->seek(250); effect->render(right);
+  assert(driver.values[0].alpha == 0 && driver.values[1].alpha == 128 &&
+         driver.values[2].alpha == 128 && driver.values[3].alpha == 0);
 }
 int main() {
   test_fill_effect();

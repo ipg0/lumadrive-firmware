@@ -350,6 +350,17 @@ void test_effect_validation_and_roundtrip() {
   c = fixture(); c.effects[0].kind = mesh_interop_MatrixEffect_Kind_FILL;
   c.effects[0].duration_ms = 0; assert(validate(c, master_mac));
   c.effects[0].duration_ms = 1000; assert(!validate(c, master_mac));
+  c.effects[0].fill_from_center = true;
+  auto encoded_fill = encode(mesh_interop_MatrixConfig_fields, &c);
+  matrix_config decoded_fill{};
+  assert(decode(mesh_interop_MatrixConfig_fields, &decoded_fill, encoded_fill.data(), encoded_fill.size()));
+  assert(decoded_fill.effects[0].fill_from_center);
+  auto center_definitions = definitions_for(decoded_fill, slave_mac, 10, 20);
+  auto encoded_definitions = encode(mesh_interop_AnimationDefinitions_fields, &center_definitions);
+  animation_definitions decoded_definitions{};
+  assert(decode(mesh_interop_AnimationDefinitions_fields, &decoded_definitions,
+                encoded_definitions.data(), encoded_definitions.size()));
+  assert(decoded_definitions.layers[0].effect.fill_from_center);
   c.effects[0].loop = true; c.effects[0].duration_ms = 0; assert(!validate(c, master_mac));
   c = fixture(); c.effects[0].kind = static_cast<mesh_interop_MatrixEffect_Kind>(99);
   assert(validate(c, master_mac));
