@@ -39,6 +39,8 @@ struct runtime_config {
   bool factory_default;
   size_t effects_count, sources_count, conditions_count, entries_count, layout_count, modes_count;
   uint32_t active_mode_id;
+  bool has_center_index = false;
+  uint32_t center_index = 0;
   std::vector<matrix_effect> effects;
   std::vector<mesh_interop_MatrixSource> sources;
   std::vector<mesh_interop_MatrixCondition> conditions;
@@ -64,6 +66,7 @@ struct playback_definitions {
                        uint64_t session, uint64_t revision);
   uint64_t master_session = 0, revision = 0;
   uint32_t canvas_size = 0;
+  uint32_t center_index = 0;
   size_t layers_count = 0, output_mappings_count = 0, gpio_inputs_count = 0;
   std::array<playback_layer, 32> layers{};
   std::array<output_mapping, MAX_SOURCES_PER_NODE> output_mappings{};

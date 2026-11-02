@@ -15,11 +15,13 @@ public:
   std::array<alpha_color, 4> values{};
   std::array<color, 4> pixels{};
   size_t count = 4;
+  size_t center = SIZE_MAX;
   int failure_pixel = -1;
   unsigned clears = 0, shows = 0;
   esp_err_t init() override { return ESP_OK; }
   esp_err_t deinit() override { return ESP_OK; }
   size_t get_pixel_count() const override { return count; }
+  size_t get_canvas_center() const override { return center == SIZE_MAX ? count / 2 : center; }
   esp_err_t set_pixel(uint16_t pixel, alpha_color value) override {
     if (pixel == failure_pixel) return ESP_FAIL;
     assert(pixel < count && pixel < pixels.size());
@@ -348,6 +350,10 @@ void test_fill_effect() {
   driver.clear(); effect->seek(999); effect->render(driver);
   for (size_t i = 0; i < 3; ++i) assert(driver.values[i].alpha == 128);
   driver.count = 4;
+  driver.center = 1;
+  driver.clear(); effect->seek(250); effect->render(driver);
+  assert(driver.values[0].alpha == 128 && driver.values[1].alpha == 128 && driver.values[2].alpha == 0);
+  driver.center = SIZE_MAX;
   linear_lighting_driver_view right(driver, 6, 2, 8);
   driver.clear(); effect->seek(250); effect->render(right);
   assert(driver.values[0].alpha == 0 && driver.values[1].alpha == 128 &&

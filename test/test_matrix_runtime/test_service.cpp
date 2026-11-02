@@ -14,6 +14,7 @@ uint64_t fake_now = 1000000;
 int64_t fake_clock_offset = 0;
 uint64_t fake_session = 10;
 bool fake_synchronized = true, fake_mesh_master = true;
+bool fake_peer_online = true;
 bool fail_commit = false;
 std::vector<uint8_t> stored, staged;
 struct transmission { uint8_t mac[6]; std::vector<uint8_t> bytes; };
@@ -49,7 +50,7 @@ bool mesh_interop::master_node_matches(const uint8_t *mac) { return !memcmp(mac,
 mesh_interop::mesh_interop_state_result_t mesh_interop::get_state() {
   mesh_interop_state_result_t s{}; s.nodes_count = 1;
   memcpy(s.nodes[0].mac, fake_mesh_master ? slave_mac : master_mac, 6);
-  s.nodes[0].last_synced_at = fake_now; return s;
+  s.nodes[0].last_synced_at = fake_peer_online ? fake_now : 0; return s;
 }
 namespace connected_lighting_drivers {
 esp_err_t fake_status = ESP_OK;
@@ -186,6 +187,42 @@ void test_only_current_hello_format() {
   assert(peer.ready && peer.definitions && peer.seen == 123 && !peer.gpio_stream);
   w::put(body, 456, 8); w::put(body, 0, 1); submit();
   assert(peer.ready && peer.seen == fake_now && peer.gpio_stream == 456);
+}
+void test_slave_reboot_after_offline_timeout() {
+  stored.clear(); staged.clear(); network.clear();
+  service master, slave; configure_node(master, true); configure_node(slave, false);
+  auto c = fixture(); c.effects[0].duration_ms = 0;
+  c.sources[0].kind = mesh_interop_MatrixSource_Kind_DEFAULT_STATE;
+  upload(master, c, 11); cycles(master, slave, 250);
+  fake_mesh_master = false; slave.slave_step(fake_now); fake_mesh_master = true;
+  bool drop = false; deliver(master, slave, drop);
+  assert(master.peers[0].ready && master.peers[0].definitions && master.peers[0].gpio_stream);
+  const auto previous_stream = master.peers[0].gpio_stream;
+  fake_peer_online = false;
+  cycles(master, slave, 420);
+  assert(!master.peers[0].ready && master.peers[0].definitions);
+
+  service rebooted; configure_node(rebooted, false);
+  fake_peer_online = true;
+  fake_mesh_master = false; rebooted.slave_step(fake_now); fake_mesh_master = true;
+  deliver(master, rebooted, drop);
+  assert(master.peers[0].gpio_stream != previous_stream);
+  assert(!master.peers[0].ready && !master.peers[0].definitions);
+  cycles(master, rebooted, 250);
+  assert(master.peers[0].ready && rebooted.local);
+  auto state = rebooted.local->snapshot(rebooted.local->definitions(), 0, 0);
+  assert(state.states[0].active && state.states[0].started_at_us == master.activate_at);
+
+  // Even if the previous stream was never observed, rejection of a snapshot
+  // must cause definitions to be resent instead of retrying snapshots forever.
+  service unknown_reboot; configure_node(unknown_reboot, false);
+  master.peers[0].ready = false; master.peers[0].definitions = true;
+  master.peers[0].gpio_stream = 0; master.peers[0].last_recover = 0;
+  fake_mesh_master = false; unknown_reboot.slave_step(fake_now); fake_mesh_master = true;
+  deliver(master, unknown_reboot, drop);
+  cycles(master, unknown_reboot, 350);
+  assert(master.peers[0].ready && unknown_reboot.local);
+  fake_peer_online = true; stored.clear(); staged.clear(); network.clear();
 }
 void test_old_matrix_evaluates_until_shared_boundary() {
   service master, slave; configure_node(master, true); configure_node(slave, false);
@@ -900,6 +937,32 @@ void test_boot_and_default_start_together() {
   assert(output.shown.r == 255 && output.shown.b == 0);
   stored.clear(); staged.clear(); network.clear();
 }
+void test_boot_waits_for_first_slave_heartbeat() {
+  stored.clear(); staged.clear(); network.clear(); fake_peer_online = false;
+  service master, slave; configure_node(master, true); configure_node(slave, false);
+  auto c = fixture();
+  c.sources[0].kind = mesh_interop_MatrixSource_Kind_ON_BOOT;
+  c.effects[0].duration_ms = 500;
+  c.layout_count = 2;
+  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 0, 1);
+  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_WS2812, 1, 2);
+  upload(master, c, 203);
+  cycles(master, slave, 100);
+  assert(master.deployment && !master.local && !slave.local);
+  fake_peer_online = true;
+  for (unsigned i = 0; i < 180 && (!master.local || !slave.local); ++i) cycles(master, slave, 1);
+  assert(master.local && slave.local && master.peers[0].ready);
+  const auto snapshot = slave.local->snapshot(slave.local->definitions(), 0, 0);
+  assert(snapshot.states[0].active && snapshot.states[0].started_at_us == master.activate_at);
+
+  // A missing slave delays startup only for the bounded grace period.
+  fake_peer_online = false; network.clear();
+  service offline_master, offline_slave; configure_node(offline_master, true); configure_node(offline_slave, false);
+  upload(offline_master, c, 204);
+  cycles(offline_master, offline_slave, 205);
+  assert(!offline_master.deployment && offline_master.activate_at > 0);
+  fake_peer_online = true; stored.clear(); staged.clear(); network.clear();
+}
 void test_six_driver_inventory_and_independent_remote_leds() {
   stored.clear(); staged.clear(); network.clear();
   connected_lighting_drivers::configured_resolver = resolve_six;
@@ -1074,11 +1137,13 @@ int main() {
   test_matrix_editor_service();
   test_preconfigured_rainbow_and_current_read();
   test_boot_and_default_start_together();
+  test_boot_waits_for_first_slave_heartbeat();
   test_six_driver_inventory_and_independent_remote_leds();
   test_configurable_strip_and_identify_preview();
   test_local_layout_validation_errors();
   test_missing_provisioning_reports_error();
   test_only_current_hello_format();
+  test_slave_reboot_after_offline_timeout();
   delete matrix_service::gpio_queue;
   test_callback_queue_limits();
   std::puts("Matrix worker: deployment, recovery, persistence, remote GPIO timing/retries/fencing, and queue limits passed.");

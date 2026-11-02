@@ -33,6 +33,9 @@ namespace {
 using namespace matrix;
 namespace w = matrix::wire;
 constexpr uint32_t RECORD_VERSION = 0;
+// Give paired outputs time to receive the first heartbeat after a master boot.
+// Offline nodes must not prevent the rest of the installation from starting.
+constexpr uint64_t BOOT_PEER_GRACE_US = 2000000;
 // Decode an editor patch directly into the replacement matrix. Keeping a
 // maximum-sized LayoutUpdate/MatrixUpdate alongside it exhausts fragmented RAM
 // even for tiny edits. Nanopb still decodes and bounds every nested message.
@@ -40,7 +43,7 @@ constexpr uint32_t RECORD_VERSION = 0;
     matrix_config &config, uint64_t &expected_revision, uint64_t &master_session) {
   if (bytes.size() > MAX_BYTES) return false;
   expected_revision = master_session = 0;
-  if (layout) config.layout_count = 0;
+  if (layout) { config.layout_count = 0; config.has_center_index = false; config.center_index = 0; }
   else { config.effects_count = config.sources_count = config.conditions_count = config.entries_count = 0;
     config.modes_count = 0; config.active_mode_id = 0; }
   auto stream = pb_istream_from_buffer(bytes.data(), bytes.size());
@@ -57,6 +60,11 @@ constexpr uint32_t RECORD_VERSION = 0;
       uint64_t value;
       if (wire != PB_WT_VARINT || !pb_decode_varint(&stream, &value) || value > UINT32_MAX) return false;
       config.active_mode_id = value; continue;
+    }
+    if (layout && tag == mesh_interop_LayoutUpdate_center_index_tag) {
+      uint64_t value;
+      if (wire != PB_WT_VARINT || !pb_decode_varint(&stream, &value) || value > UINT32_MAX) return false;
+      config.has_center_index = true; config.center_index = value; continue;
     }
     const auto repeated = [&](const pb_msgdesc_t *fields, auto &values, auto &count) {
       if (wire != PB_WT_STRING || count >= std::size(values)) return false;
@@ -88,7 +96,7 @@ bool decode_compact_editor_update(const std::vector<uint8_t> &bytes, bool layout
     runtime_config &config, uint64_t &expected_revision, uint64_t &master_session) {
   if (bytes.size() > MAX_BYTES) return false;
   expected_revision = master_session = 0;
-  if (layout) config.layout.clear();
+  if (layout) { config.layout.clear(); config.has_center_index = false; config.center_index = 0; }
   else {
     config.effects.clear(); config.sources.clear(); config.conditions.clear(); config.entries.clear();
     config.modes.clear(); config.active_mode_id = 0;
@@ -105,6 +113,11 @@ bool decode_compact_editor_update(const std::vector<uint8_t> &bytes, bool layout
       uint64_t value;
       if (wire != PB_WT_VARINT || !pb_decode_varint(&stream, &value) || value > UINT32_MAX) return false;
       config.active_mode_id = value; continue;
+    }
+    if (layout && tag == mesh_interop_LayoutUpdate_center_index_tag) {
+      uint64_t value;
+      if (wire != PB_WT_VARINT || !pb_decode_varint(&stream, &value) || value > UINT32_MAX) return false;
+      config.has_center_index = true; config.center_index = value; continue;
     }
     const auto repeated = [&](const pb_msgdesc_t *fields, auto &values, size_t limit) {
       if (wire != PB_WT_STRING || values.size() >= limit) return false;
@@ -140,11 +153,12 @@ bool decode_compact_config(const std::vector<uint8_t> &bytes, runtime_config &co
     pb_wire_type_t wire; uint32_t tag; bool eof;
     if (!pb_decode_tag(&stream, &wire, &tag, &eof) || !tag) return false;
     if (tag == mesh_interop_MatrixConfig_schema_version_tag || tag == mesh_interop_MatrixConfig_factory_default_tag ||
-        tag == mesh_interop_MatrixConfig_active_mode_id_tag) {
+        tag == mesh_interop_MatrixConfig_active_mode_id_tag || tag == mesh_interop_MatrixConfig_center_index_tag) {
       uint64_t value;
       if (wire != PB_WT_VARINT || !pb_decode_varint(&stream, &value) || value > UINT32_MAX) return false;
       if (tag == mesh_interop_MatrixConfig_schema_version_tag) config.schema_version = value;
       else if (tag == mesh_interop_MatrixConfig_factory_default_tag) config.factory_default = value != 0;
+      else if (tag == mesh_interop_MatrixConfig_center_index_tag) { config.has_center_index = true; config.center_index = value; }
       else config.active_mode_id = value;
       continue;
     }
@@ -293,6 +307,7 @@ public:
   heap_object<animation_snapshot> pending_snapshot;
   evaluator rules;
   bool boot_pending = true;
+  uint64_t boot_wait_started = 0;
   evaluator retiring_rules;
   receiver ble_rx, radio_rx;
   std::array<peer, 16> peers{};
@@ -589,6 +604,7 @@ public:
     const auto *saved = candidate ? candidate.get() : config.get();
     if (saved) {
       snapshot.layout_count = saved->layout_count;
+      snapshot.has_center_index = saved->has_center_index; snapshot.center_index = saved->center_index;
       std::copy_n(saved->layout.data(), saved->layout_count, snapshot.layout);
     }
     snapshot.outputs_count = own_outputs(snapshot.outputs);
@@ -845,6 +861,9 @@ public:
     auto &p = peers[index];
     if (b[9] != 0) {
       p.ready = false; p.snapshotting = false; p.attempted = true;
+      // The slave may have rebooted before its new stream was observed. A
+      // rejected snapshot can mean its RAM-only definitions are gone.
+      if (tx.kind == 2) p.definitions = false;
       tx = outbound{}; error("Slave rejected transferred data"); return;
     }
     size_t offset = w::get(b + 4, 4);
@@ -904,6 +923,16 @@ public:
     if (!stream) return false;
     if (p.gpio_stream == stream) return true;
     for (auto retired : p.retired_gpio_streams) if (retired == stream) return false;
+    if (p.gpio_stream) {
+      // A new stream identifies a rebooted slave, which has lost all of its
+      // RAM-only definitions even if it was already marked unavailable.
+      const auto index = static_cast<int>(&p - peers.data());
+      if (tx.peer_index == index) tx = outbound{};
+      p.ready = false; p.definitions = false; p.snapshotting = false;
+      p.replacement_prepared = false; p.attempted = false;
+      p.commands.clear(); p.retiring_commands.clear();
+      p.last_retry = 0; p.retries = 0; p.last_recover = 0;
+    }
     p.retired_gpio_streams[p.retired_gpio_index++ % p.retired_gpio_streams.size()] = p.gpio_stream;
     p.gpio_stream = stream; p.gpio_sequence = 0; p.gpio_degraded = false;
     p.catalog_at = 0; p.catalog_retry = 0;
@@ -1250,7 +1279,25 @@ public:
         begin_transfer(i, 1, encode(mesh_interop_AnimationDefinitions_fields, d.get()));
         started = true; break;
       }
-      if (!started) activate(clock);
+      if (!started) {
+        const bool has_boot = boot_pending && std::any_of(candidate->sources.begin(), candidate->sources.end(),
+            [](const auto &source) { return source.kind == mesh_interop_MatrixSource_Kind_ON_BOOT; });
+        bool waiting = false;
+        if (has_boot) {
+          if (!boot_wait_started) boot_wait_started = now;
+          if (now - boot_wait_started < BOOT_PEER_GRACE_US) {
+            for (size_t i = 0; i < peer_count; ++i) {
+              const auto &p = peers[i];
+              if (!p.attempted && !available(p, now) &&
+                  std::any_of(candidate->layout.begin(), candidate->layout.end(),
+                      [&](const auto &row) { return !memcmp(row.node_mac, p.mac, 6); })) {
+                waiting = true; break;
+              }
+            }
+          }
+        }
+        if (!waiting) activate(clock);
+      }
     }
     collect_gpio(clock);
     if (config && ledger) {

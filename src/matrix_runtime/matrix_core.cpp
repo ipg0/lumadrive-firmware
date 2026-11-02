@@ -42,6 +42,7 @@ runtime_config::runtime_config(const matrix_config &c)
     : schema_version(c.schema_version), factory_default(c.factory_default),
       effects_count(c.effects_count), sources_count(c.sources_count), conditions_count(c.conditions_count),
       entries_count(c.entries_count), layout_count(c.layout_count), modes_count(c.modes_count), active_mode_id(c.active_mode_id),
+      has_center_index(c.has_center_index), center_index(c.center_index),
       effects(c.effects, c.effects + c.effects_count), sources(c.sources, c.sources + c.sources_count),
       conditions(c.conditions, c.conditions + c.conditions_count), entries(c.entries, c.entries + c.entries_count),
       layout(c.layout, c.layout + c.layout_count), modes(c.modes, c.modes + c.modes_count),
@@ -64,7 +65,8 @@ bool runtime_config::reencode() {
       messages(mesh_interop_MatrixConfig_layout_tag, mesh_interop_MatrixLayout_fields, layout) &&
       scalar(mesh_interop_MatrixConfig_factory_default_tag, factory_default) &&
       messages(mesh_interop_MatrixConfig_modes_tag, mesh_interop_MatrixMode_fields, modes) &&
-      scalar(mesh_interop_MatrixConfig_active_mode_id_tag, active_mode_id);
+      scalar(mesh_interop_MatrixConfig_active_mode_id_tag, active_mode_id) &&
+      (!has_center_index || (pb_encode_tag(&stream, PB_WT_VARINT, mesh_interop_MatrixConfig_center_index_tag) && pb_encode_varint(&stream, center_index)));
   };
   pb_ostream_t size = PB_OSTREAM_SIZING;
   if (!write(size) || size.bytes_written > MAX_BYTES) return false;
@@ -80,6 +82,7 @@ void runtime_config::copy_to(matrix_config &c) const {
   c.effects_count = effects_count; c.sources_count = sources_count; c.conditions_count = conditions_count;
   c.entries_count = entries_count; c.layout_count = layout_count;
   c.modes_count = modes_count; c.active_mode_id = active_mode_id;
+  c.has_center_index = has_center_index; c.center_index = center_index;
   std::copy(effects.begin(), effects.end(), c.effects);
   std::copy(sources.begin(), sources.end(), c.sources);
   std::copy(conditions.begin(), conditions.end(), c.conditions);
@@ -269,6 +272,9 @@ const char *validate_config(const config_type &c, const uint8_t master_mac[6]) {
       if (!memcmp(m.node_mac, c.layout[j].node_mac, 6) && m.driver == c.layout[j].driver && m.source_index == c.layout[j].source_index)
         return "Duplicate layout node/driver/source";
   }
+  uint32_t extent = 0;
+  for (size_t i = 0; i < c.layout_count; ++i) extent = std::max(extent, std::max(c.layout[i].from, c.layout[i].to));
+  if (c.has_center_index && c.center_index > extent) return "Center is outside the layout";
   size_t node_count = 0;
   for (size_t i = 0; i < c.layout_count; ++i) {
     bool first = true;
@@ -303,6 +309,23 @@ const char *validate_config(const config_type &c, const uint8_t master_mac[6]) {
 const char *validate(const matrix_config &c, const uint8_t master_mac[6]) { return validate_config(c, master_mac); }
 const char *validate(const runtime_config &c, const uint8_t master_mac[6]) { return validate_config(c, master_mac); }
 template <typename config_type>
+uint32_t resolved_center(const config_type &c, uint32_t extent) {
+  if (c.has_center_index) return c.center_index;
+  bool left = false, right = false; uint32_t left_edge = 0, right_edge = extent;
+  for (size_t i = 0; i < c.layout_count; ++i) {
+    const auto &row = c.layout[i];
+    if (row.car_position == mesh_interop_CarPosition_DASH_LEFT) {
+      left = true; left_edge = std::max(left_edge, std::max(row.from, row.to));
+    } else if (row.car_position == mesh_interop_CarPosition_DASH_RIGHT) {
+      right = true; right_edge = std::min(right_edge, std::min(row.from, row.to));
+    }
+  }
+  if (left && right) return (left_edge + right_edge) / 2;
+  if (left) return left_edge;
+  if (right) return right_edge;
+  return extent / 2;
+}
+template <typename config_type>
 void fill_definitions(const config_type &c, const uint8_t *mac,
                       uint64_t session, uint64_t revision, animation_definitions &d) {
   d.schema_version = SCHEMA_VERSION; d.master_session = session; d.revision = revision;
@@ -312,6 +335,7 @@ void fill_definitions(const config_type &c, const uint8_t *mac,
     if (mac && !memcmp(m.node_mac, mac, 6))
       d.output_mappings[d.output_mappings_count++] = {m.driver, m.from, m.to, m.source_index};
   }
+  d.has_center_index = true; d.center_index = resolved_center(c, d.canvas_size);
   for (size_t i = 0; mac && i < c.sources_count; ++i) {
     const auto &s = c.sources[i];
     if (s.kind != mesh_interop_MatrixSource_Kind_GPIO_EDGE || memcmp(s.node_mac, mac, 6)) continue;
@@ -349,6 +373,7 @@ heap_object<animation_definitions> make_definitions(const runtime_config &c,
 
 playback_definitions::playback_definitions(const animation_definitions &d)
     : master_session(d.master_session), revision(d.revision), canvas_size(d.canvas_size),
+      center_index(d.has_center_index ? d.center_index : d.canvas_size / 2),
       layers_count(d.layers_count), output_mappings_count(d.output_mappings_count),
       gpio_inputs_count(d.gpio_inputs_count) {
   for (size_t i = 0; i < std::min(layers_count, layers.size()); ++i)
@@ -379,6 +404,7 @@ void populate_playback(playback_definitions &d, const config_type &c, const uint
       ++output_mappings_count;
     }
   }
+  d.center_index = resolved_center(c, canvas_size);
   for (size_t i = 0; mac && i < c.sources_count; ++i) {
     const auto &s = c.sources[i];
     if (s.kind != mesh_interop_MatrixSource_Kind_GPIO_EDGE || memcmp(s.node_mac, mac, 6)) continue;
@@ -422,6 +448,8 @@ bool write_playback_definitions(pb_ostream_t &stream, const playback_definitions
   for (size_t i = 0; i < d.output_mappings_count; ++i)
     if (!pb_encode_tag(&stream, PB_WT_STRING, mesh_interop_AnimationDefinitions_output_mappings_tag) ||
         !pb_encode_submessage(&stream, mesh_interop_AnimationOutputMapping_fields, &d.output_mappings[i])) return false;
+  if (!pb_encode_tag(&stream, PB_WT_VARINT, mesh_interop_AnimationDefinitions_center_index_tag) ||
+      !pb_encode_varint(&stream, d.center_index)) return false;
   return true;
 }
 template <typename config_type>
@@ -466,7 +494,7 @@ bool player::prepare(const runtime_config &c, const uint8_t *mac, uint64_t sessi
 bool player::prepare(const playback_definitions &d, const std::array<const matrix_effect *, 32> &effects) {
   if (!d.master_session || !d.revision || d.layers_count > 32 ||
       d.gpio_inputs_count > 32 || d.canvas_size > 65536 || d.output_mappings_count > MAX_SOURCES_PER_NODE ||
-      (!d.canvas_size && (d.output_mappings_count || d.layers_count)) ||
+      d.center_index > d.canvas_size || (!d.canvas_size && (d.output_mappings_count || d.layers_count)) ||
       (_resolver && d.layers_count && !d.output_mappings_count))
     return false;
   for (size_t i = 0; i < d.output_mappings_count; ++i) {
@@ -612,7 +640,7 @@ esp_err_t player::tick(uint64_t now, bool render, uint32_t excluded_driver, uint
         const auto &mapping = _definitions.output_mappings[k];
         if (mapping.driver == excluded_driver && mapping.source_index == excluded_source) continue;
         auto *driver = _resolver(mapping.driver);
-        linear_lighting_driver_view view(*driver, mapping.from, mapping.to, _definitions.canvas_size, mapping.source_index);
+        linear_lighting_driver_view view(*driver, mapping.from, mapping.to, _definitions.canvas_size, mapping.source_index, _definitions.center_index);
         if (_definitions.layers[i].opaque_background) {
           auto err = view.fill(alpha_color(color(0, 0, 0), 255));
           if (err != ESP_OK) return err;

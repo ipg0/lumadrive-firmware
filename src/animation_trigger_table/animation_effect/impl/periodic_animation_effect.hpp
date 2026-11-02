@@ -52,11 +52,15 @@ public:
       if (count > size_t(UINT16_MAX) + 1 || render_count > size_t(UINT16_MAX) + 1) return ESP_ERR_INVALID_ARG;
       const uint64_t elapsed = _options.loop ? time : std::min<uint64_t>(_elapsed_ms, _options.period_ms);
       const size_t filled = (elapsed * count + _options.period_ms - 1) / _options.period_ms;
-      const size_t radius = (elapsed * ((count + 1) / 2) + _options.period_ms - 1) / _options.period_ms;
+      const size_t center = std::min(driver.get_canvas_center(), count);
+      const bool middle_pixel = count % 2 && center == count / 2;
+      const size_t span = middle_pixel ? center + 1 : std::max(center, count - center);
+      const size_t radius = (elapsed * span + _options.period_ms - 1) / _options.period_ms;
       for (size_t local = 0; local < render_count; ++local) {
         const auto pixel = driver.get_render_pixel_index(static_cast<uint16_t>(local));
         if (pixel >= count) return ESP_ERR_INVALID_ARG;
-        const size_t distance = pixel < count / 2 ? (count - 1) / 2 - pixel : pixel - count / 2;
+        const size_t distance = middle_pixel ? (pixel < center ? center - pixel : pixel - center) :
+            (pixel < center ? center - 1 - pixel : pixel - center);
         if (_options.fill_from_center ? distance < radius :
             (!_options.reverse ? pixel < filled : pixel >= count - filled)) {
           auto err = driver.set_pixel(pixel, _options.primary);

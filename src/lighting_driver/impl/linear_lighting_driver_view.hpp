@@ -8,8 +8,10 @@
 class linear_lighting_driver_view : public rgb_lighting_driver {
 public:
   linear_lighting_driver_view(rgb_lighting_driver &driver, uint32_t from,
-                              uint32_t to, uint32_t canvas_size, uint32_t source_index = 0)
-      : _driver(driver), _from(from), _to(to), _canvas_size(canvas_size), _source_index(source_index) {}
+                              uint32_t to, uint32_t canvas_size, uint32_t source_index = 0,
+                              uint32_t center_index = UINT32_MAX)
+      : _driver(driver), _from(from), _to(to), _canvas_size(canvas_size), _source_index(source_index),
+        _center_index(center_index == UINT32_MAX ? canvas_size / 2 : center_index) {}
 
   bool valid() const {
     return _canvas_size && _canvas_size <= 65536 && _from != _to &&
@@ -20,6 +22,7 @@ public:
   esp_err_t init() override { return valid() ? ESP_OK : ESP_ERR_INVALID_ARG; }
   esp_err_t deinit() override { return ESP_OK; }
   size_t get_pixel_count() const override { return _canvas_size; }
+  size_t get_canvas_center() const override { return _center_index; }
   size_t get_render_pixel_count() const override { return valid() ? std::max(_from, _to) - std::min(_from, _to) : 0; }
   uint16_t get_render_pixel_index(uint16_t pixel) const override {
     return static_cast<uint16_t>(_from < _to ? _from + pixel : _from - 1 - pixel);
@@ -46,5 +49,5 @@ public:
   bool _is_ready() const override { return valid() && _driver._is_ready(); }
 private:
   rgb_lighting_driver &_driver;
-  uint32_t _from, _to, _canvas_size, _source_index;
+  uint32_t _from, _to, _canvas_size, _source_index, _center_index;
 };

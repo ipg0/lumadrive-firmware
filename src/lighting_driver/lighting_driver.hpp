@@ -13,6 +13,7 @@ public:
   virtual esp_err_t init() = 0;
   virtual esp_err_t deinit() = 0;
   virtual size_t get_pixel_count() const = 0;
+  virtual size_t get_canvas_center() const { return get_pixel_count() / 2; }
   virtual lighting_driver_kind get_kind() const { return lighting_driver_kind::UNKNOWN; }
   virtual size_t get_layout_source_count() const { return 1; }
   virtual size_t get_layout_pixel_count(uint32_t source) const { return source ? 0 : get_pixel_count(); }

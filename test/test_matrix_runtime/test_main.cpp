@@ -399,6 +399,24 @@ void test_animated_player_phase_and_snapshots() {
     red(false); assert(output.shown.b == 0); // Finite animations already expired on arrival.
   }
 }
+void test_layout_center_distribution() {
+  auto c = fixture(); c.layout_count = 2;
+  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 0, 10);
+  c.layout[0].car_position = mesh_interop_CarPosition_DASH_LEFT;
+  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_WS2812, 12, 30);
+  c.layout[1].car_position = mesh_interop_CarPosition_DASH_RIGHT;
+  auto d = definitions_for(c, slave_mac, 10, 2);
+  assert(d.has_center_index && d.center_index == 11);
+  c.has_center_index = true; c.center_index = 3;
+  runtime_config compact(c); assert(compact.reencode());
+  auto copy = compact.to_wire(); assert(copy && copy->has_center_index && copy->center_index == 3);
+  matrix_config decoded{};
+  assert(decode(mesh_interop_MatrixConfig_fields, &decoded, compact.encoded().data(), compact.encoded().size()));
+  assert(decoded.has_center_index && decoded.center_index == 3);
+  d = definitions_for(*copy, slave_mac, 10, 2);
+  assert(d.has_center_index && d.center_index == 3);
+  c.center_index = 31; assert(validate(c, master_mac));
+}
 void test_compact_player_definition_ownership() {
   player recovered(resolve);
   animation_snapshot snapshot{};
@@ -702,6 +720,7 @@ int main() {
   test_one_entry_two_drivers();
   test_node_input_definitions();
   test_effect_validation_and_roundtrip(); test_animated_player_phase_and_snapshots();
+  test_layout_center_distribution();
   test_compact_player_definition_ownership();
   test_compact_config_and_direct_preparation();
   test_motion_phase_recovery();
