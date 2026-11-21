@@ -4,6 +4,7 @@
 #include "default_matrix.hpp"
 #include "../lighting_driver/impl/linear_lighting_driver_view.hpp"
 #include "../connected_lighting_drivers/connected_lighting_drivers.hpp"
+#include "../hardware_config/hardware_config.hpp"
 #include "../global_config/global_config.hpp"
 #include "../master_clock_manager/master_clock_manager.hpp"
 #include "../mesh_interop/mesh_interop.hpp"
@@ -16,6 +17,7 @@
 #include <new>
 #include <type_traits>
 #include <esp_log.h>
+#include <esp_app_desc.h>
 #include <esp_now.h>
 #include <esp_random.h>
 #include <esp_timer.h>
@@ -246,6 +248,7 @@ struct peer {
   std::array<mesh_interop_LayoutOutput, MAX_SOURCES_PER_NODE> outputs{};
   uint64_t catalog_at = 0, catalog_retry = 0;
   uint64_t gpio_mask = 0;
+  char firmware_version[32]{};
 };
 struct outbound {
   int peer_index = -1;
@@ -394,26 +397,28 @@ public:
     for (size_t i = 0; i < c.sources_count; ++i) {
       auto &s = c.sources[i];
       if (s.kind != mesh_interop_MatrixSource_Kind_GPIO_EDGE) continue;
-      if (!memcmp(s.node_mac, mac, 6) && !valid_input(s.gpio)) return "GPIO is invalid or reserved by firmware";
+      if (!memcmp(s.node_mac, mac, 6) && !valid_input(s.gpio)) return "GPIO input is not provisioned on this node";
       if (check_peers && memcmp(s.node_mac, mac, 6) &&
           !mesh_interop::instance().slave_node_exists(s.node_mac)) return "GPIO source node is not paired";
       const auto owner = memcmp(s.node_mac, mac, 6) ? find_peer(s.node_mac) : -1;
       if (owner >= 0 && peers[owner].catalog_known &&
-          !(peers[owner].gpio_mask & (1ULL << s.gpio))) return "GPIO is reserved on the source node";
+          !(peers[owner].gpio_mask & (1ULL << s.gpio))) return "GPIO input is not provisioned on the source node";
     }
     return nullptr;
   }
   static void gpio_isr(void *arg) {
-    gpio_event e{uint64_t(esp_timer_get_time()), uint32_t(uintptr_t(arg)), false};
-    e.rising = gpio_get_level(static_cast<gpio_num_t>(e.pin));
+    const auto input = uintptr_t(arg);
+    gpio_event e{uint64_t(esp_timer_get_time()), uint32_t(input & 0x3f), false};
+    e.rising = bool(gpio_get_level(static_cast<gpio_num_t>(e.pin))) != bool(input & 0x40);
     BaseType_t wake = pdFALSE;
     if (xQueueSendFromISR(gpio_queue, &e, &wake) != pdTRUE) gpio_overflow.store(true);
     if (worker_task) vTaskNotifyGiveFromISR(worker_task, &wake);
     if (wake) portYIELD_FROM_ISR();
   }
   static bool valid_input(uint32_t pin) {
-    return pin <= 39 && GPIO_IS_VALID_GPIO(static_cast<int>(pin)) &&
-        pin != CONFIG_ROLE_GPIO && pin != CONFIG_DISCOVERY_GPIO &&
+    uint8_t pull = 0;
+    return pin <= 39 && connected_lighting_drivers::gpio_input(pin, pull) && GPIO_IS_VALID_GPIO(static_cast<int>(pin)) &&
+        pin != CONFIG_DISCOVERY_GPIO &&
         !connected_lighting_drivers::uses_gpio(pin) && !(pin >= 6 && pin <= 11);
   }
   static uint64_t input_mask() {
@@ -434,9 +439,14 @@ public:
       gpio_config_t cfg{};
       cfg.pin_bit_mask = 1ULL << pin; cfg.mode = GPIO_MODE_INPUT;
       cfg.intr_type = GPIO_INTR_ANYEDGE;
+      uint8_t pull = hardware_config::PULL_NONE;
+      bool inverted = false;
+      if (!connected_lighting_drivers::gpio_input(pin, pull, &inverted)) return false;
+      cfg.pull_up_en = pull == hardware_config::PULL_UP ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE;
+      cfg.pull_down_en = pull == hardware_config::PULL_DOWN ? GPIO_PULLDOWN_ENABLE : GPIO_PULLDOWN_DISABLE;
       if (gpio_config(&cfg) != ESP_OK ||
           gpio_isr_handler_add(static_cast<gpio_num_t>(pin), gpio_isr,
-                               reinterpret_cast<void *>(uintptr_t(pin))) != ESP_OK) {
+                               reinterpret_cast<void *>(uintptr_t(pin) | (inverted ? 0x40 : 0))) != ESP_OK) {
         for (uint32_t j = 0; j < 40; ++j) if (added[j]) {
           gpio_isr_handler_remove(static_cast<gpio_num_t>(j)); configured_pins[j] = false;
         }
@@ -505,7 +515,7 @@ public:
   }
   void initialize_configuration() {
     if (connected_lighting_drivers::status() != ESP_OK) {
-      error("Driver provisioning missing or invalid; lighting disabled", true);
+      error("Hardware configuration missing or invalid; lighting disabled", true);
       return;
     }
     // The master owns configuration and startup animation timing. Slaves wait
@@ -582,6 +592,12 @@ public:
       w::put(body, driver->get_layout_max_pixel_count(0), 4);
     }
     w::put(body, input_mask(), 8);
+    // Older controllers require the original inventory length.
+    send(destination, w::INVENTORY, body);
+    const auto *version = esp_app_get_description()->version;
+    const auto length = strnlen(version, 31);
+    w::put(body, length, 1);
+    body.insert(body.end(), version, version + length);
     send(destination, w::INVENTORY, body);
   }
   void publish_layout(mesh_interop_LayoutResponse &response) {
@@ -646,17 +662,20 @@ public:
     document->persisted = active ? active_persisted : configuration_persisted;
     document->revision = active ? document->active_revision : revision;
     document->master_session = session; memcpy(document->master_mac, mac, 6);
+    snprintf(document->master_firmware_version, sizeof(document->master_firmware_version), "%.*s", 31,
+        esp_app_get_description()->version);
     auto mesh = mesh_interop::instance().get_state();
     for (size_t i = 0; i < mesh.nodes_count; ++i) find_peer(mesh.nodes[i].mac);
-    auto add = [&](const uint8_t *address, uint64_t mask, bool known, bool online) {
+    auto add = [&](const uint8_t *address, uint64_t mask, bool known, bool online, const char *version) {
       auto &node = document->nodes[document->nodes_count++]; memcpy(node.node_mac, address, 6);
       node.known = known; node.online = online;
+      snprintf(node.firmware_version, sizeof(node.firmware_version), "%.*s", 31, version);
       for (uint32_t pin = 0; pin < 40; ++pin) if (mask & (1ULL << pin)) node.gpios[node.gpios_count++] = pin;
     };
-    add(mac, input_mask(), true, true);
+    add(mac, input_mask(), true, true, document->master_firmware_version);
     for (size_t i = 0; i < peer_count && document->nodes_count < 17; ++i)
       if (mesh_interop::instance().slave_node_exists(peers[i].mac))
-        add(peers[i].mac, peers[i].gpio_mask, peers[i].catalog_known, available(peers[i], now));
+        add(peers[i].mac, peers[i].gpio_mask, peers[i].catalog_known, available(peers[i], now), peers[i].firmware_version);
     layout_snapshot_bytes = encode(mesh_interop_MatrixDocument_fields, document.get(), 32768);
     snapshot_outputs.clear(); snapshot_is_matrix = true; snapshot_is_active = active;
     layout_snapshot_id = esp_random(); if (!layout_snapshot_id) layout_snapshot_id = 1;
@@ -936,6 +955,7 @@ public:
     p.retired_gpio_streams[p.retired_gpio_index++ % p.retired_gpio_streams.size()] = p.gpio_stream;
     p.gpio_stream = stream; p.gpio_sequence = 0; p.gpio_degraded = false;
     p.catalog_at = 0; p.catalog_retry = 0;
+    p.firmware_version[0] = '\0';
     return true;
   }
   bool evaluate_gpio(const uint8_t *source_mac, const gpio_event &e, uint64_t rev, uint64_t clock) {
@@ -995,7 +1015,16 @@ public:
       if (!mesh_interop::instance().slave_node_exists(packet.mac)) return;
       int index = find_peer(packet.mac); if (index < 0) return;
       auto &p = peers[index];
-      if (type == w::INVENTORY && n >= 17 && w::get(b, 8) == session && b[8] <= MAX_DRIVERS_PER_NODE && n == size_t(17 + b[8] * 14)) {
+      if (type == w::INVENTORY && n >= 17 && w::get(b, 8) == session && b[8] <= MAX_DRIVERS_PER_NODE) {
+        const size_t base_size = 17 + b[8] * 14;
+        if (n < base_size) return;
+        size_t version_length = 0;
+        if (n > base_size) {
+          version_length = b[base_size];
+          if (version_length > 31 || n != base_size + 1 + version_length) return;
+          for (size_t i = 0; i < version_length; ++i)
+            if (b[base_size + 1 + i] < 0x20 || b[base_size + 1 + i] > 0x7e) return;
+        }
         std::array<mesh_interop_LayoutOutput, MAX_SOURCES_PER_NODE> outputs{};
         std::array<uint32_t, MAX_DRIVERS_PER_NODE> ids{};
         size_t output_count = 0;
@@ -1020,6 +1049,10 @@ public:
         }
         const auto mask = w::get(b + 9 + b[8] * 14, 8);
         if (mask >> 40) return;
+        if (n > base_size) {
+          if (version_length) memcpy(p.firmware_version, b + base_size + 1, version_length);
+          p.firmware_version[version_length] = '\0';
+        }
         p.gpio_mask = mask; p.outputs = outputs; p.outputs_count = output_count; p.catalog_known = true; p.catalog_at = now;
         default_layout_dirty = true;
       } else if (type == w::IDENTIFY_ACK && n == 13 && w::get(b, 8) == session && identifying.active &&

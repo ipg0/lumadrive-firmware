@@ -14,7 +14,7 @@ public:
   static constexpr uint8_t ESP_NOW_CHANNEL = 6;
   static constexpr uint8_t MESH_INTEROP_SLAVE_NODES_MAX = 16;
   static constexpr uint32_t MESH_INTEROP_HEARTBEAT_INTERVAL_US = 1000000;
-  static constexpr uint32_t MESH_INTEROP_MASTER_DISCOVERY_TIMEOUT_US = 20000000;
+  static constexpr uint32_t MESH_INTEROP_MASTER_DISCOVERY_TIMEOUT_US = 60000000;
 
   typedef struct {
     uint8_t mac[ESP_NOW_ETH_ALEN];

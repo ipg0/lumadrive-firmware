@@ -3,7 +3,6 @@
 #include <esp_err.h>
 #include <mutex>
 #include "esp_mac.h"
-#define CONFIG_ROLE_GPIO GPIO_NUM_4
 
 class global_config {
 public:

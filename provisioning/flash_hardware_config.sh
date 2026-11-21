@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ $# != 2 ]]; then
-  printf 'Usage: bash provisioning/flash_driver_config.sh CONFIG.hpp SERIAL_PORT\n' >&2
+  printf 'Usage: bash provisioning/flash_hardware_config.sh CONFIG.hpp SERIAL_PORT\n' >&2
   exit 2
 fi
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-image_path="$(mktemp "${TMPDIR:-/tmp}/lumadrive-drivers.XXXXXX")"
+image_path="$(mktemp "${TMPDIR:-/tmp}/lumadrive-hardware.XXXXXX")"
 trap 'rm -f -- "$image_path"' EXIT
-bash "$project_dir/provisioning/build_driver_image.sh" "$1" "$image_path"
+bash "$project_dir/provisioning/build_hardware_image.sh" "$1" "$image_path"
 esptool_path="${PLATFORMIO_CORE_DIR:-$HOME/.platformio}/packages/tool-esptoolpy/esptool.py"
 if [[ ! -f "$esptool_path" ]]; then
   printf 'PlatformIO esptool not found: %s. Build firmware first or set PLATFORMIO_CORE_DIR.\n' "$esptool_path" >&2

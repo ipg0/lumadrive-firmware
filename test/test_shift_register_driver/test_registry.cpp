@@ -11,11 +11,13 @@ struct strip { size_t symbols; };
 size_t rmt_used = 0;
 std::vector<size_t> allocations;
 std::vector<uint8_t> last_pixels;
-std::array<uint8_t, driver_provisioning::MAX_IMAGE_SIZE> partition_bytes{};
+std::array<gpio_config_t, 40> gpio_configs{};
+std::array<uint8_t, hardware_config::MAX_IMAGE_SIZE> partition_bytes{};
 esp_partition_t partition{partition_bytes.size()};
 bool partition_present = true;
 }
-const esp_partition_t *esp_partition_find_first(esp_partition_type_t, esp_partition_subtype_t, const char *) {
+const esp_partition_t *esp_partition_find_first(esp_partition_type_t, esp_partition_subtype_t, const char *name) {
+  assert(!strcmp(name, "hardwarecfg"));
   return partition_present ? &partition : nullptr;
 }
 esp_err_t esp_partition_read(const esp_partition_t *, size_t offset, void *data, size_t size) {
@@ -64,7 +66,11 @@ esp_err_t rmt_transmit(rmt_channel_handle_t, rmt_encoder_handle_t handle, const 
   }
   return ESP_OK;
 }
-esp_err_t gpio_config(const gpio_config_t *) { return ESP_OK; }
+esp_err_t gpio_config(const gpio_config_t *config) {
+  for (size_t i = 0; i < gpio_configs.size(); ++i)
+    if (config->pin_bit_mask & (uint64_t(1) << i)) gpio_configs[i] = *config;
+  return ESP_OK;
+}
 esp_err_t gpio_set_level(gpio_num_t, uint32_t) { return ESP_OK; }
 esp_err_t gptimer_new_timer(const gptimer_config_t *, gptimer_handle_t *handle) { *handle = reinterpret_cast<void *>(1); return ESP_OK; }
 esp_err_t gptimer_register_event_callbacks(gptimer_handle_t, const gptimer_event_callbacks_t *, void *) { return ESP_OK; }
@@ -77,18 +83,24 @@ esp_err_t gptimer_disable(gptimer_handle_t) { return ESP_OK; }
 esp_err_t gptimer_del_timer(gptimer_handle_t) { return ESP_OK; }
 
 int main() {
-  using namespace driver_provisioning;
-  configuration config{}; config.count = 2;
+  using namespace hardware_config;
+  configuration config{}; config.count = 2; config.role = NODE_MASTER;
   config.drivers[0] = {.id = 1, .type = WS2812, .data_pin = 19, .default_pixels = 60};
   config.drivers[1] = {.id = 2, .type = HC595, .data_pin = 23, .clock_pin = 18,
       .latch_pin = 5, .led_count = 1, .bcm_base_period_us = 10, .leds = {{{0, 1, 2, false}, {}}}};
+  config.gpio_count = 2; config.gpios[0] = {12, PULL_UP}; config.gpios[1] = {13, PULL_DOWN};
   assert(encode(config, partition_bytes.data(), partition_bytes.size()));
   assert(init_registered_drivers() == ESP_OK);
+  assert(connected_lighting_drivers::node_role() == NODE_MASTER);
   assert(allocations.back() == 512);
   auto *led_strip_driver = connected_lighting_drivers::find(1);
   assert(led_strip_driver && connected_lighting_drivers::find(2));
   assert(connected_lighting_drivers::uses_gpio(19) && connected_lighting_drivers::uses_gpio(23));
   assert(!connected_lighting_drivers::uses_gpio(12));
+  uint8_t pull = 0;
+  assert(connected_lighting_drivers::gpio_input(12, pull) && pull == PULL_UP);
+  assert(gpio_configs[12].mode == GPIO_MODE_INPUT && gpio_configs[12].pull_up_en == GPIO_PULLUP_ENABLE);
+  assert(gpio_configs[13].pull_down_en == GPIO_PULLDOWN_ENABLE && gpio_configs[13].intr_type == GPIO_INTR_DISABLE);
   led_strip_driver->set_pixel(0, alpha_color(color(10, 20, 30)));
   const auto initial_allocations = allocations.size();
   assert(led_strip_driver->reserve_layout_pixels(0, 120) == ESP_OK);
@@ -100,12 +112,13 @@ int main() {
   assert(led_strip_driver->get_pixel_count() == 120);
   for (auto &driver : drivers) if (driver) { driver->deinit(); driver.reset(); }
   const int pins[] = {19, 21, 22, 25, 26, 27};
-  config = {}; config.count = 6;
+  config = {}; config.count = 6; config.role = NODE_SLAVE;
   for (size_t i = 0; i < config.count; ++i)
     config.drivers[i] = {.id = uint8_t(i + 1), .type = WS2812, .data_pin = uint8_t(pins[i]), .default_pixels = 60};
   assert(encode(config, partition_bytes.data(), partition_bytes.size()));
   const auto start = allocations.size();
   assert(init_registered_drivers() == ESP_OK);
+  assert(connected_lighting_drivers::node_role() == NODE_SLAVE);
   assert(rmt_used == 384 && allocations.size() == start + 6);
   for (size_t i = start; i < allocations.size(); ++i) assert(allocations[i] == 64);
   for (auto &driver : drivers) if (driver) { driver->deinit(); driver.reset(); }

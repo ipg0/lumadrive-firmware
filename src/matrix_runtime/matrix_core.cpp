@@ -3,6 +3,9 @@
 #include "../animation_trigger_table/animation_effect/impl/keyframe_animation_effect.hpp"
 #include "../animation_trigger_table/animation_effect/impl/periodic_animation_effect.hpp"
 #include "../lighting_driver/impl/linear_lighting_driver_view.hpp"
+#include "../animation_trigger_table/trigger_condition/impl/always_trigger_condition.hpp"
+#include "../animation_trigger_table/trigger_condition/impl/mode_trigger_condition.hpp"
+#include "../animation_trigger_table/trigger_condition/impl/composite_trigger_condition.hpp"
 #include <algorithm>
 #include <cstring>
 #include <type_traits>
@@ -258,8 +261,26 @@ const char *validate_config(const config_type &c, const uint8_t master_mac[6]) {
     const auto &condition = c.conditions[i];
     if (condition.kind == mesh_interop_MatrixCondition_Kind_MODE) {
       if (!lookup(std::data(c.modes), c.modes_count, condition.mode_id)) return "Invalid condition mode";
+    } else if (condition.kind == mesh_interop_MatrixCondition_Kind_AND || condition.kind == mesh_interop_MatrixCondition_Kind_OR) {
+      if (!lookup(std::data(c.conditions), c.conditions_count, condition.left_id) ||
+          !lookup(std::data(c.conditions), c.conditions_count, condition.right_id)) return "Invalid condition reference";
     } else if (condition.kind != mesh_interop_MatrixCondition_Kind_ALWAYS) return "Unsupported condition";
   }
+  std::array<uint8_t, 32> visited{};
+  const auto acyclic = [&](auto &&self, size_t index) -> bool {
+    if (visited[index] == 1) return false;
+    if (visited[index] == 2) return true;
+    visited[index] = 1;
+    const auto &condition = c.conditions[index];
+    if (condition.kind == mesh_interop_MatrixCondition_Kind_AND || condition.kind == mesh_interop_MatrixCondition_Kind_OR) {
+      const auto *base = std::data(c.conditions);
+      if (!self(self, lookup(base, c.conditions_count, condition.left_id) - base) ||
+          !self(self, lookup(base, c.conditions_count, condition.right_id) - base)) return false;
+    }
+    visited[index] = 2; return true;
+  };
+  for (size_t i = 0; i < c.conditions_count; ++i)
+    if (!acyclic(acyclic, i)) return "Cyclic condition reference";
   for (size_t i = 0; i < c.layout_count; ++i) {
     const auto &m = c.layout[i];
     if (!valid_driver(m.driver) || m.source_index > 1) return "Unknown layout driver or source ID";
@@ -657,14 +678,54 @@ esp_err_t player::tick(uint64_t now, bool render, uint32_t excluded_driver, uint
   }
   return result;
 }
+class runtime_condition : public trigger_condition_base {
+public:
+  runtime_condition(const mesh_interop_MatrixCondition &condition, const mesh_interop_MatrixCondition *all, size_t count,
+      std::array<int8_t, 32> &memo) : _condition(condition), _all(all), _count(count), _memo(memo) {}
+  trigger_condition_type type() const override {
+    if (_condition.kind == mesh_interop_MatrixCondition_Kind_MODE) return trigger_condition_type::MODE;
+    if (_condition.kind == mesh_interop_MatrixCondition_Kind_AND) return trigger_condition_type::AND;
+    if (_condition.kind == mesh_interop_MatrixCondition_Kind_OR) return trigger_condition_type::OR;
+    return trigger_condition_type::ALWAYS;
+  }
+  bool evaluate(const trigger_context &context) const override {
+    const auto index = size_t(&_condition - _all);
+    if (_memo[index] >= 0) return _memo[index] != 0;
+    const bool result = evaluate_uncached(context);
+    _memo[index] = result ? 1 : 0;
+    return result;
+  }
+private:
+  bool evaluate_uncached(const trigger_context &context) const {
+    if (_condition.kind == mesh_interop_MatrixCondition_Kind_ALWAYS)
+      return trigger_condition<trigger_condition_type::ALWAYS>().evaluate(context);
+    if (_condition.kind == mesh_interop_MatrixCondition_Kind_MODE)
+      return trigger_condition<trigger_condition_type::MODE>(_condition.mode_id, _condition.inverted).evaluate(context);
+    const auto *left = lookup(_all, _count, _condition.left_id);
+    const auto *right = lookup(_all, _count, _condition.right_id);
+    if (!left || !right) return false;
+    runtime_condition a(*left, _all, _count, _memo), b(*right, _all, _count, _memo);
+    if (_condition.kind == mesh_interop_MatrixCondition_Kind_AND)
+      return trigger_condition<trigger_condition_type::AND>(a, b).evaluate(context);
+    if (_condition.kind == mesh_interop_MatrixCondition_Kind_OR)
+      return trigger_condition<trigger_condition_type::OR>(a, b).evaluate(context);
+    return false;
+  }
+  const mesh_interop_MatrixCondition &_condition;
+  const mesh_interop_MatrixCondition *_all;
+  size_t _count;
+  std::array<int8_t, 32> &_memo;
+};
 void evaluator::tick(uint64_t now, const trigger_gpio_edge_t *edges, size_t count,
                      uint64_t edge_time, command_sink sink, void *arg) {
+  std::array<int8_t, 32> memo; memo.fill(-1);
   for (size_t i = 0; i < _entries_count; ++i) {
     const auto &entry = _entries[i];
     const auto &source = *lookup(_sources, _sources_count, entry.source_id);
     const auto &effect = *lookup(_effects, _effects_count, entry.effect_id);
     const auto &condition = *lookup(_conditions, _conditions_count, entry.condition_id);
-    if (condition.kind == mesh_interop_MatrixCondition_Kind_MODE && condition.mode_id != _mode) continue;
+    trigger_context context{}; context.active_mode_id = _mode;
+    if (!runtime_condition(condition, _conditions, _conditions_count, memo).evaluate(context)) continue;
     if (_active[i] && effect.duration_ms && now >= _starts[i] &&
         (now - _starts[i]) / 1000 >= effect.duration_ms) _active[i] = false;
     bool fired = source.kind == mesh_interop_MatrixSource_Kind_DEFAULT_STATE && !_active[i];

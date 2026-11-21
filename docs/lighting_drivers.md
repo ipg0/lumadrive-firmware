@@ -1,45 +1,65 @@
 # Connected lighting drivers
 
-Board wiring is provisioned per node in a dedicated flash partition. Firmware and
-the app contain no default pin assignments. Copy `provisioning/example_driver_config.hpp`
-to a file for each node and edit its `DRIVER_CONFIGURATION`. Keep driver IDs 1–6
+Each node's role and wiring are provisioned in a dedicated hardware configuration
+partition. Firmware and the app contain no default pin assignments. Copy
+`provisioning/example_hardware_config.hpp` to a file for each node and edit its
+`HARDWARE_CONFIGURATION`. Set `config.role` to `NODE_MASTER` or `NODE_SLAVE`.
+Keep driver IDs 1–6
 stable because saved layouts reference each node's MAC, driver ID and source index.
 
 ## USB provisioning
 
-The new partition table moves the application and requires a **one-time USB flash**
-of the bootloader, partition table and firmware on every node. NVS and PHY retain
+The hardware partition has been renamed and requires a **one-time USB flash**
+of the bootloader, partition table and firmware on every node. Existing driver-only
+records do not specify a role and must be replaced with a hardware configuration.
+NVS and PHY retain
 their offsets; do not use `erase_flash` if pairing and saved configuration must be
 preserved. Back up important data before migration. For each node, with the correct
 header and serial port:
 
 ```sh
 pio run -e esp32dev -t upload --upload-port /dev/ttyUSB0
-LUMADRIVE_DRIVER_CONFIG=/path/to/my_node.hpp pio run -e esp32dev -t provision-drivers --upload-port /dev/ttyUSB0
+LUMADRIVE_HARDWARE_CONFIG=/path/to/my_node.hpp pio run -e esp32dev -t provision-hardware --upload-port /dev/ttyUSB0
 ```
 
 The second command validates the header, generates an image, and writes only the
-`drivercfg` partition at `0x12000`. Repeat it to change wiring; the firmware does
+`hardwarecfg` partition at `0x12000`. Repeat it to change role or wiring; the firmware does
 not write this partition. Never include a configuration image in a firmware/OTA
 package. Re-provisioning is not power-fail atomic: if interrupted, rerun the USB
-command. The header can instead be specified with `custom_driver_config` in
-`platformio.ini`; `LUMADRIVE_DRIVER_CONFIG` takes precedence for one run. A port
+command. The header can instead be specified with `custom_hardware_config` in
+`platformio.ini`; `LUMADRIVE_HARDWARE_CONFIG` takes precedence for one run. A port
 is required, either via `--upload-port` or the `upload_port` setting. The target
 is independent of `upload` and never runs during a normal firmware build. To
 generate an image without flashing:
 
 ```sh
-bash provisioning/build_driver_image.sh /path/to/my_node.hpp /tmp/my_node.bin
+bash provisioning/build_hardware_image.sh /path/to/my_node.hpp /tmp/my_node.bin
 ```
 
 The versioned record is checksummed and validated on the host and device. Invalid
-or missing records leave all lighting drivers disabled, log the error, and keep
-mesh networking and the master's BLE available for diagnosis. An intentionally empty configuration
-is allowed. Output pins must be valid ESP32 output GPIOs; flash, serial, role GPIO4
+or missing records leave lighting and networking disabled and log the error; re-provision
+over USB. A configuration with no drivers or inputs is allowed when its role is set.
+Output pins must be valid ESP32 output GPIOs; flash, serial,
 and discovery GPIO16 are reserved. Duplicate IDs, overlapping pins, invalid RGB
 bit mappings, and conflicting shared BCM timer periods are rejected. `uses_gpio()`
 derives reserved pins from the loaded registry; the master uses each node's actual
 inventory. The app cannot edit wiring.
+
+Configure trigger inputs alongside drivers with `config.gpio_count` and
+`config.gpios`, as shown in the example header. Set each pin's `pull` to
+`PULL_NONE`, `PULL_UP`, or `PULL_DOWN`. The ESP32's GPIO34–39 are input-only
+and have no internal pull resistors, so they require `PULL_NONE` and an
+external bias where needed. Driver pins, duplicate inputs, flash/serial pins,
+GPIO16 are rejected. GPIO4 is now available; check the board's boot-strapping requirements
+before choosing an input or pull. Inputs are configured at startup; interrupt
+handlers are installed when the matrix uses them. Re-provision each node over
+USB to change the list. Existing matrix entries referring to removed
+inputs need to be changed or re-provisioned before they can run.
+
+Set `.inverted = true` for an active-low input. Its physical falling edge is
+reported to the matrix as a logical rising edge, and its physical rising edge
+as a logical falling edge. Inversion does not change the selected pull resistor.
+It defaults to `false`.
 
 One 595 driver configured with `led_count = 2` exposes two independent layout
 sources, each length one, addressed by `(node_mac, driver, source_index)`.

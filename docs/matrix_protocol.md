@@ -43,15 +43,18 @@ Supported effects are static color, addressed RGBA keyframes, blink, breathe,
 flowing gradient, rainbow, and fill; see [Animation effects](animations.md) for parameters.
 The matrix may include up to 32 named modes with stable nonzero IDs. The active
 mode is saved with the matrix; zero means no mode. A `MODE` condition matches
-its selected mode, while `ALWAYS` matches every mode. An `ON_MODE_SWITCHED`
+its selected mode, or every other mode when `inverted` is set. `ALWAYS` matches
+every mode. `AND` and `OR` each reference two condition IDs and can be nested;
+missing references and cycles are rejected. The app editor currently supports
+one group with two mode or always conditions. An `ON_MODE_SWITCHED`
 source triggers once when the active mode changes, at the new revision's shared
 activation time. It does not trigger when a revision keeps the same mode or on
 reboot. Switching replaces the runtime, stopping layers from the previous mode.
 Duration is in milliseconds; zero runs indefinitely. Sources include default
 state, on boot, mode changes, and local or slave GPIO edges. Set alpha explicitly:
 protobuf's default zero is transparent.
-GPIO inputs use external biasing, with internal pulls disabled. Role/discovery,
-flash, and connected-driver pins cannot be used as trigger inputs. GPIO sources
+GPIO inputs and their pull settings are set in each node's hardware configuration.
+Discovery, flash, and connected-driver pins cannot be used as trigger inputs. GPIO sources
 identify the owning node's ESP-NOW MAC; remote source and layout nodes must be paired.
 Each node can have its own static wiring configuration. The master uses the
 owning node's reported input capabilities; the slave validates its pins again
@@ -137,8 +140,14 @@ revision is active, an active read returns an empty schema-0 matrix at revision
 zero. `MatrixClient.readCurrentMatrix()` and `MeshController.readCurrentMatrix()`
 expose this paged read without replacing an editor draft.
 The GPIO mask appended to inventory frames reports pins accepted by each node's
-firmware, excluding role/discovery, flash, and output wiring. Unknown nodes expose
+firmware, excluding discovery, flash, and output wiring. Unknown nodes expose
 no selectable pins; known offline capability data may be cached by the app.
+The matrix document also reports the controller's ESP-IDF application version
+and each node's most recently received version. An empty version means unknown;
+offline values are cached only for the current controller session. Versions come
+from `esp_app_get_description()->version`, which uses ESP-IDF's project version
+(normally the Git description, including a dirty suffix). Distinct uncommitted
+builds can therefore show the same version.
 
 `matrix_begin` transfers `MatrixUpdate`, with expected revision/session and the
 replacement effects, sources, conditions, and entries. Commit merges these fields
@@ -167,7 +176,7 @@ their formats. Types and bodies are:
 | 9 GPIO event | session u64, revision u64, GPIO stream u64, sequence u32, captured master time u64, pin u8, rising u8 (0 or 1) |
 | 10 GPIO event ACK | session u64, revision u64, GPIO stream u64, sequence u32, result u8 (0 accepted/discarded, 1 rejected) |
 | 11 inventory request | session u64 |
-| 12 inventory | session u64, physical driver count u8 (0–6), repeated slot ID u32, initial pixel count u32, ready u8, kind u8 (1 strip, 2 RGB module), maximum source pixel count u32, GPIO capability mask u64 |
+| 12 inventory | session u64, physical driver count u8 (0–6), repeated slot ID u32, initial pixel count u32, ready u8, kind u8 (1 strip, 2 RGB module), maximum source pixel count u32, GPIO capability mask u64; extended frame appends version length u8 and up to 31 ASCII bytes |
 | 13 identify | session u64, request ID u32, driver slot ID u32, source index u32, draft pixel count u32, reversed u8 (0 or 1) |
 | 14 identify ACK | session u64, request ID u32, result u8 (0 OK, 1 unavailable) |
 

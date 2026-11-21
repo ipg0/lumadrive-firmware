@@ -54,10 +54,18 @@ mesh_interop::mesh_interop_state_result_t mesh_interop::get_state() {
 }
 namespace connected_lighting_drivers {
 esp_err_t fake_status = ESP_OK;
+uint64_t fake_gpio_mask = (1ULL << 12) | (1ULL << 13) | (1ULL << 14) | (1ULL << 35);
+uint64_t fake_inverted_mask = 0;
 esp_err_t status() { return fake_status; }
 driver_resolver configured_resolver = resolve;
 rgb_lighting_driver *find(uint32_t id) { return configured_resolver(id); }
 bool uses_gpio(uint32_t pin) { return pin == 5 || pin == 18 || pin == 19 || pin == 23; }
+bool gpio_input(uint32_t pin, uint8_t &pull, bool *inverted) {
+  if (pin >= 40 || !(fake_gpio_mask & (1ULL << pin))) return false;
+  pull = pin == 12 ? hardware_config::PULL_UP : pin == 13 ? hardware_config::PULL_DOWN : hardware_config::PULL_NONE;
+  if (inverted) *inverted = bool(fake_inverted_mask & (1ULL << pin));
+  return true;
+}
 }
 using matrix_service::service;
 using matrix_service::packet;
@@ -400,6 +408,7 @@ void capture_slave_edge(service &slave, uint32_t pin, bool rising) {
   fake_gpio_handlers[pin](fake_gpio_args[pin]);
 }
 void test_remote_gpio_delivery() {
+  connected_lighting_drivers::fake_inverted_mask = 1ULL << 12;
   service master, slave; configure_node(master, true); configure_node(slave, false);
   auto c = fixture(); memcpy(c.sources[0].node_mac, slave_mac, 6);
   c.effects[0].duration_ms = 1000;
@@ -407,8 +416,10 @@ void test_remote_gpio_delivery() {
   memcpy(c.layout[1].node_mac, master_mac, 6);
   upload(master, c, 40); cycles(master, slave, 200);
   assert(slave.local && slave.configured_pins[12] && !master.configured_pins[12]);
+  assert(fake_gpio_configs[12].mode == GPIO_MODE_INPUT && fake_gpio_configs[12].intr_type == GPIO_INTR_ANYEDGE);
+  assert(fake_gpio_configs[12].pull_up_en == GPIO_PULLUP_ENABLE && fake_gpio_configs[12].pull_down_en == GPIO_PULLDOWN_DISABLE);
   const auto captured_at = fake_now;
-  capture_slave_edge(slave, 12, true);
+  capture_slave_edge(slave, 12, false); // Physical falling is logical rising.
   fake_now += 20000; slave_tick(slave); // Worker latency is not part of the timestamp.
   assert(slave.gpio_events.size() == 1 && slave.gpio_events.front().edge.at == captured_at);
   bool drop = true; deliver(master, slave, drop, w::GPIO_EVENT_ACK);
@@ -427,10 +438,10 @@ void test_remote_gpio_delivery() {
   state = slave.local->snapshot(d, 0, 0);
   assert(state.states[0].started_at_us == captured_at + LEAD_US); // Retry did not retrigger.
 
-  capture_slave_edge(slave, 12, false); slave_tick(slave); deliver(master, slave, drop);
+  capture_slave_edge(slave, 12, true); slave_tick(slave); deliver(master, slave, drop);
   assert(master.peers[0].gpio_sequence == 2 && master.peers[0].sequence == command_sequence);
   fake_now += 10000; const auto retriggered_at = fake_now;
-  capture_slave_edge(slave, 12, true); slave_tick(slave); deliver(master, slave, drop);
+  capture_slave_edge(slave, 12, false); slave_tick(slave); deliver(master, slave, drop);
   cycles(master, slave, 12);
   state = slave.local->snapshot(d, 0, 0);
   assert(state.states[0].started_at_us == retriggered_at + LEAD_US);
@@ -456,6 +467,33 @@ void test_remote_gpio_delivery() {
   bad = gpio_packet(slave, 9, fake_now); bad.mac[0] = 6;
   master.handle_radio(bad, fake_now); assert(master.peer_count == 1);
   network.clear();
+  connected_lighting_drivers::fake_inverted_mask = 0;
+}
+void test_provisioned_gpio_inventory() {
+  network.clear();
+  service master, slave; configure_node(master, true); configure_node(slave, false);
+  connected_lighting_drivers::fake_gpio_mask = (1ULL << 13) | (1ULL << 35);
+  slave.send_inventory(master_mac);
+  bool drop = false; deliver(master, slave, drop);
+  assert(master.peer_count == 1 && master.peers[0].catalog_known);
+  assert(master.peers[0].gpio_mask == ((1ULL << 13) | (1ULL << 35)));
+  assert(!strcmp(master.peers[0].firmware_version, "test-version"));
+  // A legacy inventory arriving after the extended one must not erase its version.
+  slave.send_inventory(master_mac);
+  const auto legacy = network.front().bytes;
+  auto malformed = network.back().bytes; network.clear();
+  packet received{}; memcpy(received.mac, slave_mac, 6);
+  received.size = legacy.size(); memcpy(received.data, legacy.data(), legacy.size());
+  master.handle_radio(received, fake_now);
+  assert(!strcmp(master.peers[0].firmware_version, "test-version"));
+  // Invalid version length cannot replace a previously accepted catalog.
+  malformed[w::HEADER_SIZE + 17 + malformed[w::HEADER_SIZE + 8] * 14] = 32;
+  received.size = malformed.size(); memcpy(received.data, malformed.data(), malformed.size());
+  master.handle_radio(received, fake_now + 1);
+  assert(!strcmp(master.peers[0].firmware_version, "test-version"));
+  assert(!service::valid_input(12) && service::valid_input(13) && service::valid_input(35));
+  connected_lighting_drivers::fake_gpio_mask = (1ULL << 12) | (1ULL << 13) | (1ULL << 14) | (1ULL << 35);
+  network.clear();
 }
 void test_remote_gpio_source_only_and_replacement() {
   service master, slave; configure_node(master, true); configure_node(slave, false);
@@ -471,6 +509,7 @@ void test_remote_gpio_source_only_and_replacement() {
   slave.gpio_sequence = 2;
   c.sources[0].gpio = 13; upload(master, c, 51); cycles(master, slave, 200);
   assert(slave.configured_pins[13] && !slave.configured_pins[12]);
+  assert(fake_gpio_configs[13].pull_up_en == GPIO_PULLUP_DISABLE && fake_gpio_configs[13].pull_down_en == GPIO_PULLDOWN_ENABLE);
   const auto before = master.peers[0].sequence;
   master.handle_radio(old, fake_now); assert(master.peers[0].sequence == before);
   network.clear();
@@ -797,6 +836,10 @@ void test_matrix_editor_service() {
   snprintf(c.entries[0].name, sizeof(c.entries[0].name), "%0120d", 2);
   snprintf(c.layout[0].name, sizeof(c.layout[0].name), "%0120d", 3);
   upload(master, c, 101); cycles(master, slave, 200);
+  strcpy(fake_app_description.version, "node-build-2");
+  slave.send_inventory(master_mac);
+  bool drop = false; deliver(master, slave, drop);
+  strcpy(fake_app_description.version, "controller-build-1");
   layout_request(master, 100, 0, 0, false, 0, true); const auto first = layout_response();
   assert(!first.error[0] && !first.complete);
   std::vector<uint8_t> bytes(first.data.bytes, first.data.bytes + first.data.size);
@@ -809,6 +852,10 @@ void test_matrix_editor_service() {
   auto document = std::make_unique<mesh_interop_MatrixDocument>();
   assert(decode(mesh_interop_MatrixDocument_fields, document.get(), bytes.data(), bytes.size()));
   assert(document->revision == 1 && document->nodes_count == 2 && document->nodes[1].known);
+  assert(!strcmp(document->master_firmware_version, "controller-build-1"));
+  assert(!strcmp(document->nodes[0].firmware_version, "controller-build-1"));
+  assert(!strcmp(document->nodes[1].firmware_version, "node-build-2"));
+  strcpy(fake_app_description.version, "test-version");
   for (size_t i = 0; i < document->nodes_count; ++i) {
     const auto &node = document->nodes[i];
     assert(std::find(node.gpios, node.gpios + node.gpios_count, 12) != node.gpios + node.gpios_count);
@@ -999,7 +1046,8 @@ void test_six_driver_inventory_and_independent_remote_leds() {
   assert(slave.identify_driver == 6 && slave.identify_source == 1 && layout_response().complete);
   assert(six_outputs[5].shown[1].g == 255 && six_outputs[5].shown[1].r == 0);
   network.clear(); slave.send_inventory(master_mac);
-  assert(network.size() == 1 && network.front().bytes.size() == w::HEADER_SIZE + 101);
+  assert(network.size() == 2 && network.front().bytes.size() == w::HEADER_SIZE + 101);
+  assert(network.back().bytes.size() == w::HEADER_SIZE + 102 + strlen(fake_app_description.version));
   auto frame = network.front().bytes; network.clear();
   packet packet{}; memcpy(packet.mac, slave_mac, 6); packet.size = frame.size();
   // Duplicate physical slot IDs cannot partially replace the existing catalog.
@@ -1116,7 +1164,7 @@ void test_missing_provisioning_reports_error() {
   service master, slave; configure_node(master, true); configure_node(slave, false);
   master.initialize_configuration(); slave.initialize_configuration();
   assert(!master.candidate && !master.local && !slave.local);
-  assert(strstr(master.state.error, "provisioning") && strstr(slave.state.error, "provisioning"));
+  assert(strstr(master.state.error, "configuration") && strstr(slave.state.error, "configuration"));
   connected_lighting_drivers::fake_status = ESP_OK;
 }
 int main() {
@@ -1129,6 +1177,7 @@ int main() {
   test_boot_palette_deployment_and_restore();
   test_mode_switch_deployment();
   test_remote_gpio_delivery();
+  test_provisioned_gpio_inventory();
   test_remote_gpio_source_only_and_replacement();
   test_remote_gpio_time_queues_and_sessions();
   test_car_layout_distribution_and_recovery();

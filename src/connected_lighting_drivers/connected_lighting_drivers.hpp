@@ -11,5 +11,8 @@ esp_err_t status();
 constexpr uint32_t MAX_DRIVERS = 6;
 rgb_lighting_driver *find(uint32_t id);
 bool uses_gpio(uint32_t pin);
+// Returns the provisioned pull setting for a GPIO input, if present.
+bool gpio_input(uint32_t pin, uint8_t &pull, bool *inverted = nullptr);
+uint8_t node_role();
 
 } // namespace connected_lighting_drivers

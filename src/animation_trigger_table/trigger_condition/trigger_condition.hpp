@@ -4,6 +4,9 @@
 
 enum class trigger_condition_type {
   ALWAYS = 0,
+  MODE = 1,
+  AND = 2,
+  OR = 3,
 };
 
 class trigger_condition_base {

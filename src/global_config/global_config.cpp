@@ -1,24 +1,13 @@
 #include "global_config.hpp"
-#include <driver/gpio.h>
+#include "../hardware_config/hardware_config.hpp"
+#include "../connected_lighting_drivers/connected_lighting_drivers.hpp"
 #include <esp_event.h>
 #include <esp_log.h>
 #include <esp_netif.h>
 #include <nvs_flash.h>
 
 global_config::global_config() {
-  gpio_config_t role_gpio_conf = {
-      .pin_bit_mask = (1ULL << CONFIG_ROLE_GPIO),
-      .mode = GPIO_MODE_INPUT,
-      .pull_up_en = GPIO_PULLUP_ENABLE,
-      .pull_down_en = GPIO_PULLDOWN_DISABLE,
-      .intr_type = GPIO_INTR_DISABLE,
-  };
-
-  ESP_ERROR_CHECK(gpio_config(&role_gpio_conf));
-
-  int level = gpio_get_level(CONFIG_ROLE_GPIO);
-
-  this->_master_node = (level == 0);
+  this->_master_node = connected_lighting_drivers::node_role() == hardware_config::NODE_MASTER;
 
   if (this->_master_node) {
     ESP_LOGI("global_config", "Booting as MASTER");

@@ -3,6 +3,6 @@
 nvs,      data, nvs,     0x9000,   0x6000,
 phy_init, data, phy,     0xf000,   0x1000,
 otadata,  data, ota,     0x10000,  0x2000,
-drivercfg,data, 0x40,    0x12000,  0x4000,    readonly
+hardwarecfg,data, 0x40,  0x12000,  0x4000,    readonly
 ota_0,    app,  ota_0,   0x20000,  0xf0000,
 ota_1,    app,  ota_1,   0x110000, 0xf0000,

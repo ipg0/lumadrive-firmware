@@ -30,6 +30,14 @@ private:
   static constexpr ble_uuid128_t LAYOUT_RESPONSE_UUID =
       BLE_UUID128_INIT(0x39, 0x15, 0x9d, 0x2c, 0x61, 0x5c, 0x41, 0xdc, 0x85,
                       0xbf, 0xd2, 0x57, 0x30, 0x8b, 0x4b, 0x29);
+  static constexpr ble_uuid128_t OTA_UPLOAD_UUID =
+      BLE_UUID128_INIT(0x39, 0x15, 0x9d, 0x2c, 0x61, 0x5c, 0x41, 0xdc, 0x85,
+                      0xbf, 0xd2, 0x57, 0x31, 0x8b, 0x4b, 0x29);
+  static constexpr ble_uuid128_t OTA_STATUS_UUID =
+      BLE_UUID128_INIT(0x39, 0x15, 0x9d, 0x2c, 0x61, 0x5c, 0x41, 0xdc, 0x85,
+                      0xbf, 0xd2, 0x57, 0x32, 0x8b, 0x4b, 0x29);
+  static int handle_ota_upload(uint16_t, uint16_t, struct ble_gatt_access_ctxt *, void *);
+  static int handle_ota_status(uint16_t, uint16_t, struct ble_gatt_access_ctxt *, void *);
   static uint16_t _matrix_status_handle;
   static int handle_matrix_upload(uint16_t, uint16_t, struct ble_gatt_access_ctxt *, void *);
   static int handle_matrix_status(uint16_t, uint16_t, struct ble_gatt_access_ctxt *, void *);
@@ -97,6 +105,16 @@ private:
                   {
                       .uuid = &LAYOUT_RESPONSE_UUID.u,
                       .access_cb = ble_interop::handle_layout_response,
+                      .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC,
+                  },
+                  {
+                      .uuid = &OTA_UPLOAD_UUID.u,
+                      .access_cb = ble_interop::handle_ota_upload,
+                      .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC,
+                  },
+                  {
+                      .uuid = &OTA_STATUS_UUID.u,
+                      .access_cb = ble_interop::handle_ota_status,
                       .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC,
                   },
                   {0}, // end of characteristics

@@ -11,6 +11,7 @@
 #include "services/gatt/ble_svc_gatt.h"
 #include <nvs.h>
 #include "matrix_runtime/matrix_service.hpp"
+#include "ota_update/ota_update.hpp"
 
 extern "C" {
 void ble_store_config_init(void);
@@ -70,6 +71,7 @@ int ble_interop::handle_ble_gap_event(struct ble_gap_event *event, void *arg) {
 
   case BLE_GAP_EVENT_DISCONNECT:
     matrix_service::disconnect(event->disconnect.conn.conn_handle);
+    ota_update::disconnect();
     ESP_LOGI("ble_interop", "Received BLE GAP event of type DISCONNECT");
     ESP_LOGI("ble_interop", "BLE disconnected, reason=%d",
              event->disconnect.reason);
@@ -131,6 +133,7 @@ ble_interop::ble_interop() {
   }
 
   init_ble_device_name();
+  ESP_ERROR_CHECK(ota_update::init());
 
   ESP_ERROR_CHECK(nimble_port_init());
   ble_store_config_init();

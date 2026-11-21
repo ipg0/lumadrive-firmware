@@ -1,5 +1,5 @@
 #include "connected_lighting_drivers.hpp"
-#include "driver_provisioning.hpp"
+#include "../hardware_config/hardware_config.hpp"
 #include "../lighting_driver/impl/bcm_74hc595_lighting_driver.hpp"
 #include "../lighting_driver/impl/ws2812_lighting_driver.hpp"
 #include <esp_log.h>
@@ -13,14 +13,14 @@
 
 namespace {
 constexpr const char *TAG = "connected_lighting_drivers";
-using namespace driver_provisioning;
+using namespace hardware_config;
 std::array<std::unique_ptr<rgb_lighting_driver>, MAX_DRIVERS> drivers;
 configuration wiring;
 esp_err_t initialization_status = ESP_ERR_INVALID_STATE;
 
 esp_err_t read_wiring(configuration &config) {
   const auto *partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
-      static_cast<esp_partition_subtype_t>(0x40), "drivercfg");
+      static_cast<esp_partition_subtype_t>(0x40), "hardwarecfg");
   if (!partition || partition->size < HEADER_SIZE) return ESP_ERR_NOT_FOUND;
   std::array<uint8_t, MAX_IMAGE_SIZE> bytes{};
   auto err = esp_partition_read(partition, 0, bytes.data(), HEADER_SIZE);
@@ -36,6 +36,7 @@ esp_err_t init_registered_drivers() {
   configuration config{};
   auto err = read_wiring(config);
   if (err != ESP_OK) return err;
+  wiring = config;
   size_t strips = 0;
   for (size_t i = 0; i < config.count; ++i) strips += config.drivers[i].type == WS2812;
   const size_t symbols = strips ? (8 / strips) * 64 : 64;
@@ -66,16 +67,36 @@ esp_err_t init_registered_drivers() {
     if (err == ESP_OK) err = entry->show();
     if (err != ESP_OK) break;
   }
+  // Apply the provisioned idle bias even before a matrix uses an input.
+  for (size_t i = 0; err == ESP_OK && i < config.gpio_count; ++i) {
+    const auto &input = config.gpios[i];
+    gpio_config_t cfg{};
+    cfg.pin_bit_mask = uint64_t(1) << input.pin;
+    cfg.mode = GPIO_MODE_INPUT; cfg.intr_type = GPIO_INTR_DISABLE;
+    cfg.pull_up_en = input.pull == PULL_UP ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE;
+    cfg.pull_down_en = input.pull == PULL_DOWN ? GPIO_PULLDOWN_ENABLE : GPIO_PULLDOWN_DISABLE;
+    err = gpio_config(&cfg);
+  }
   if (err != ESP_OK) {
     while (initialized) { auto &d = drivers[order[--initialized] - 1]; d->deinit(); d.reset(); }
     return err;
   }
-  wiring = config;
   return ESP_OK;
 }
 } // namespace
 
 namespace connected_lighting_drivers {
+bool gpio_input(uint32_t pin, uint8_t &pull, bool *inverted) {
+  for (size_t i = 0; i < wiring.gpio_count; ++i) {
+    if (wiring.gpios[i].pin == pin) {
+      pull = wiring.gpios[i].pull;
+      if (inverted) *inverted = wiring.gpios[i].inverted;
+      return true;
+    }
+  }
+  return false;
+}
+uint8_t node_role() { return wiring.role; }
 bool uses_gpio(uint32_t pin) {
   for (size_t i = 0; i < wiring.count; ++i) {
     const auto &d = wiring.drivers[i];

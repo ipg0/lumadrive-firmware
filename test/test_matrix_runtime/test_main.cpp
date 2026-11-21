@@ -23,7 +23,7 @@ matrix_config fixture() {
   c.sources_count = 1; auto &s = c.sources[0];
   s.id = 2; s.kind = mesh_interop_MatrixSource_Kind_GPIO_EDGE; s.gpio = 12; s.rising = true;
   memcpy(s.node_mac, master_mac, 6);
-  c.conditions_count = 1; c.conditions[0] = {3, mesh_interop_MatrixCondition_Kind_ALWAYS, 0};
+  c.conditions_count = 1; c.conditions[0] = {3, mesh_interop_MatrixCondition_Kind_ALWAYS, 0, false, 0, 0};
   c.entries_count = 1; auto &e = c.entries[0];
   e.id = 4; e.effect_id = 1; e.source_id = 2; e.condition_id = 3; e.priority = 10;
   c.layout_count = 1; memcpy(c.layout[0].node_mac, slave_mac, 6);
@@ -218,6 +218,29 @@ void test_modes() {
   rules.tick(1000000, nullptr, 0, 1000000, sink, &commands); assert(commands.size() == 1);
   config.active_mode_id = 3; assert(validate(config, master_mac));
   config.active_mode_id = 2; config.conditions[0].mode_id = 3; assert(validate(config, master_mac));
+  config.conditions_count = 3;
+  config.conditions[0] = {3, mesh_interop_MatrixCondition_Kind_MODE, 1, false, 0, 0};
+  config.conditions[1] = {4, mesh_interop_MatrixCondition_Kind_MODE, 2, true, 0, 0};
+  config.conditions[2] = {5, mesh_interop_MatrixCondition_Kind_AND, 0, false, 3, 4};
+  config.entries[0].condition_id = 5;
+  config.active_mode_id = 1; assert(!validate(config, master_mac));
+  commands.clear(); rules.configure(&config, 10, 4, false, true);
+  rules.tick(400, nullptr, 0, 400, sink, &commands); assert(commands.size() == 1);
+  config.active_mode_id = 2; commands.clear(); rules.configure(&config, 10, 5, false, true);
+  rules.tick(500, nullptr, 0, 500, sink, &commands); assert(commands.empty());
+  config.conditions[2].kind = mesh_interop_MatrixCondition_Kind_OR;
+  config.conditions[1].inverted = false; commands.clear(); rules.configure(&config, 10, 6, false, true);
+  rules.tick(600, nullptr, 0, 600, sink, &commands); assert(commands.size() == 1);
+  config.conditions_count = 4;
+  config.conditions[3] = {6, mesh_interop_MatrixCondition_Kind_AND, 0, false, 5, 4};
+  config.entries[0].condition_id = 6;
+  assert(!validate(config, master_mac));
+  commands.clear(); rules.configure(&config, 10, 7, false, true);
+  rules.tick(700, nullptr, 0, 700, sink, &commands); assert(commands.size() == 1);
+  config.conditions[2].left_id = 6; assert(validate(config, master_mac));
+  config.conditions[2].left_id = 3;
+  config.conditions[2].left_id = 99; assert(validate(config, master_mac));
+  config.conditions[2].left_id = 5; assert(validate(config, master_mac));
 }
 void test_layering() {
   auto config = fixture(); auto d = definitions_for(config, slave_mac, 10, 20);
