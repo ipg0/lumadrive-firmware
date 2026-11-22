@@ -7,7 +7,7 @@
 
 class ble_interop {
   static constexpr const char *BLE_INTEROP_DEVICE_NAME_TEMPLATE =
-      "LUMAPROTO %02x-%02x-%02x";
+      "Lumadrive %02x-%02x-%02x";
   static constexpr size_t BLE_INTEROP_DEVICE_NAME_MAX_LENGTH = 32;
 
   static constexpr uint64_t ADVERTISING_TIMEOUT_US = 30 * 1000000; // 30 seconds
