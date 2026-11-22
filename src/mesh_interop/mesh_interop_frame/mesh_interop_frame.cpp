@@ -84,7 +84,7 @@ esp_err_t mesh_interop_frame_base::send() const {
     ESP_LOGE("mesh_interop", "Cannot send a frame that was received");
     return ESP_ERR_INVALID_ARG;
   }
-  ESP_LOGI("mesh_interop", "Sending frame with frame_id: %u",
+  ESP_LOGD("mesh_interop", "Sending frame with frame_id: %u",
            this->frame_id);
   mesh_interop_frame_base::frame_buffer_t *buffer = this->serialize();
   if (!buffer) return ESP_ERR_INVALID_SIZE;

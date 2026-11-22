@@ -14,6 +14,11 @@ uint64_t master_clock_manager::session() {
   return _session;
 }
 
+int64_t master_clock_manager::last_sync_at() {
+  std::lock_guard<std::mutex> lock(_clock_mutex);
+  return _last_sync_absolute_time_us;
+}
+
 void master_clock_manager::synchronize(int64_t timestamp_us, int64_t received_at_us,
                                        uint64_t session) {
   std::lock_guard<std::mutex> lock(this->_clock_mutex);

@@ -37,7 +37,7 @@ namespace w = matrix::wire;
 constexpr uint32_t RECORD_VERSION = 0;
 // Give paired outputs time to receive the first heartbeat after a master boot.
 // Offline nodes must not prevent the rest of the installation from starting.
-constexpr uint64_t BOOT_PEER_GRACE_US = 2000000;
+constexpr uint64_t STANDBY_TIMEOUT_US = 5000000;
 // Decode an editor patch directly into the replacement matrix. Keeping a
 // maximum-sized LayoutUpdate/MatrixUpdate alongside it exhausts fragmented RAM
 // even for tiny edits. Nanopb still decodes and bounds every nested message.
@@ -310,7 +310,12 @@ public:
   heap_object<animation_snapshot> pending_snapshot;
   evaluator rules;
   bool boot_pending = true;
-  uint64_t boot_wait_started = 0;
+  uint64_t slave_started_at = 0;
+  uint64_t standby_last_sync = 0;
+  uint64_t discovery_last_sync = 0;
+  bool standby = false;
+  bool discovering = false;
+  bool waiting_for_discovery_sync = false;
   evaluator retiring_rules;
   receiver ble_rx, radio_rx;
   std::array<peer, 16> peers{};
@@ -1315,20 +1320,7 @@ public:
       if (!started) {
         const bool has_boot = boot_pending && std::any_of(candidate->sources.begin(), candidate->sources.end(),
             [](const auto &source) { return source.kind == mesh_interop_MatrixSource_Kind_ON_BOOT; });
-        bool waiting = false;
-        if (has_boot) {
-          if (!boot_wait_started) boot_wait_started = now;
-          if (now - boot_wait_started < BOOT_PEER_GRACE_US) {
-            for (size_t i = 0; i < peer_count; ++i) {
-              const auto &p = peers[i];
-              if (!p.attempted && !available(p, now) &&
-                  std::any_of(candidate->layout.begin(), candidate->layout.end(),
-                      [&](const auto &row) { return !memcmp(row.node_mac, p.mac, 6); })) {
-                waiting = true; break;
-              }
-            }
-          }
-        }
+        const bool waiting = has_boot && mesh_interop::instance().startup_waiting_for_nodes(now);
         if (!waiting) activate(clock);
       }
     }
@@ -1383,8 +1375,67 @@ public:
           (tx.peer_index == int(i) || deployment) ? NODE_PREPARING : NODE_DEGRADED;
     }
   }
+  void reset_slave_playback() {
+    for (uint32_t id = 1; id <= connected_lighting_drivers::MAX_DRIVERS; ++id) {
+      auto *driver = connected_lighting_drivers::find(id);
+      if (driver && driver->_is_ready()) { driver->clear(); driver->show(); }
+    }
+    local.reset(); pending_player.reset(); pending_snapshot.reset();
+    radio_rx.reset(); completed_transfer = 0; local_sequence = 0; revision = 0;
+    identify_driver = 0; gpio_events.clear(); last_hello = 0;
+  }
   void slave_step(uint64_t now) {
     auto &clock = master_clock_manager::instance();
+    if (!slave_started_at) slave_started_at = now;
+    const auto last_sync = uint64_t(clock.last_sync_at());
+    const auto mesh = mesh_interop::instance().get_state();
+    if (mesh.is_discovery_mode) {
+      if (!discovering) {
+        reset_slave_playback();
+        discovery_last_sync = last_sync;
+        discovering = true;
+        waiting_for_discovery_sync = true;
+        session = 0;
+      }
+      if (standby) {
+        const auto err = mesh_interop::instance().set_standby_radio(false);
+        if (err != ESP_OK) { ESP_LOGW("matrix", "Unable to wake radio for discovery: %s", esp_err_to_name(err)); return; }
+        standby = false;
+      }
+      gpio_event ignored;
+      while (xQueueReceive(gpio_queue, &ignored, 0) == pdTRUE) {}
+      return;
+    }
+    if (discovering) {
+      discovering = false;
+      slave_started_at = now;
+      session = 0;
+    }
+    if (waiting_for_discovery_sync && last_sync > discovery_last_sync) waiting_for_discovery_sync = false;
+    if (!last_sync && !mesh.nodes_count) {
+      slave_started_at = now;
+      return; // Keep an unpaired node available for discovery.
+    }
+    const auto last_contact = waiting_for_discovery_sync ? slave_started_at : (last_sync ? last_sync : slave_started_at);
+    if (!standby && now >= last_contact && now - last_contact >= STANDBY_TIMEOUT_US) {
+      reset_slave_playback();
+      standby_last_sync = last_sync;
+      standby = true;
+      auto err = mesh_interop::instance().set_standby_radio(true);
+      if (err != ESP_OK) ESP_LOGW("matrix", "Unable to enable standby radio: %s", esp_err_to_name(err));
+      ESP_LOGI("matrix", "Controller timed out; outputs off and node in standby");
+    }
+    if (standby) {
+      gpio_event ignored;
+      while (xQueueReceive(gpio_queue, &ignored, 0) == pdTRUE) {}
+      if (!last_sync || last_sync <= standby_last_sync || now < last_sync || now - last_sync >= STANDBY_TIMEOUT_US) return;
+      auto err = mesh_interop::instance().set_standby_radio(false);
+      if (err != ESP_OK) { ESP_LOGW("matrix", "Unable to wake radio: %s", esp_err_to_name(err)); return; }
+      standby = false;
+      session = 0; // Force a fresh HELLO and snapshot, even for the same controller session.
+      ESP_LOGI("matrix", "Controller heartbeat received; recovering playback");
+    }
+    if (waiting_for_discovery_sync) return;
     if (!clock.is_synchronized()) {
       gpio_event e;
       for (unsigned i = 0; i < 64 && xQueueReceive(gpio_queue, &e, 0) == pdTRUE; ++i) {}
@@ -1410,7 +1461,6 @@ public:
       if (!gpio_stream) gpio_stream = 1;
     }
     collect_gpio(uint64_t(clock.get_master_time()));
-    auto mesh = mesh_interop::instance().get_state();
     if (mesh.nodes_count) gpio_send_step(mesh.nodes[0].mac, now);
     if (now - last_hello >= 1000000) {
       if (mesh.nodes_count) {
@@ -1435,8 +1485,10 @@ public:
       uint64_t now = esp_timer_get_time();
       if (!master) slave_step(now);
       packet p;
-      for (unsigned i = 0; i < 16 && xQueueReceive(priority_queue, &p, 0) == pdTRUE; ++i) handle_radio(p, now);
-      for (unsigned i = 0; i < 8 && xQueueReceive(radio_queue, &p, 0) == pdTRUE; ++i) handle_radio(p, now);
+      for (unsigned i = 0; i < 16 && xQueueReceive(priority_queue, &p, 0) == pdTRUE; ++i)
+        if (!standby && !discovering && !waiting_for_discovery_sync) handle_radio(p, now);
+      for (unsigned i = 0; i < 8 && xQueueReceive(radio_queue, &p, 0) == pdTRUE; ++i)
+        if (!standby && !discovering && !waiting_for_discovery_sync) handle_radio(p, now);
       if (ble_rx.id() && upload_generation != ble_generation.load()) {
         ble_rx.reset(); error("Upload connection closed", true);
       }
@@ -1467,6 +1519,7 @@ public:
     }
   }
   void playback_step(uint64_t clock) {
+    if (standby || discovering || waiting_for_discovery_sync) return;
     if (pending_snapshot && pending_player && clock >= pending_snapshot->activate_at_us) {
       if (local) local->blank();
       local = std::move(pending_player); revision = local->definitions().revision;

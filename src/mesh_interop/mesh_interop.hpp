@@ -14,6 +14,8 @@ public:
   static constexpr uint8_t ESP_NOW_CHANNEL = 6;
   static constexpr uint8_t MESH_INTEROP_SLAVE_NODES_MAX = 16;
   static constexpr uint32_t MESH_INTEROP_HEARTBEAT_INTERVAL_US = 1000000;
+  static constexpr uint32_t STARTUP_HEARTBEAT_INTERVAL_US = 20000;
+  static constexpr uint32_t STARTUP_WAKE_US = 1000000;
   static constexpr uint32_t MESH_INTEROP_MASTER_DISCOVERY_TIMEOUT_US = 60000000;
 
   typedef struct {
@@ -45,6 +47,8 @@ public:
   bool slave_node_exists(const uint8_t[ESP_NOW_ETH_ALEN]);
   bool master_node_matches(const uint8_t[ESP_NOW_ETH_ALEN]);
   esp_err_t sync_slave_node(const uint8_t[ESP_NOW_ETH_ALEN]);
+  bool startup_waiting_for_nodes(uint64_t now);
+  esp_err_t set_standby_radio(bool standby);
   mesh_interop_state_result_t get_state();
   void register_mesh_state_cb(void (*cb)());
 
@@ -66,6 +70,9 @@ private:
   bool _discovery_mode;
   mesh_interop_state_t _state;
   int64_t _node_last_synced_at[MESH_INTEROP_SLAVE_NODES_MAX];
+  int64_t _startup_at = 0;
+  int64_t _last_periodic_heartbeat = 0;
+  int64_t _last_discovery_broadcast = 0;
   void (*_mesh_state_cb)();
 
   void broadcast_discover();

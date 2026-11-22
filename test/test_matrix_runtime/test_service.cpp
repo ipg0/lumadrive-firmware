@@ -14,6 +14,10 @@ uint64_t fake_now = 1000000;
 int64_t fake_clock_offset = 0;
 uint64_t fake_session = 10;
 bool fake_synchronized = true, fake_mesh_master = true;
+uint64_t fake_last_sync = 0;
+uint64_t fake_startup_at = 0;
+bool fake_radio_standby = false;
+bool fake_discovery = false;
 bool fake_peer_online = true;
 bool fail_commit = false;
 std::vector<uint8_t> stored, staged;
@@ -44,11 +48,16 @@ uint64_t master_clock_manager::session() { return fake_session; }
 int64_t master_clock_manager::get_master_time() { return get_master_time_at(fake_now); }
 int64_t master_clock_manager::get_master_time_at(int64_t timestamp) { return timestamp + fake_clock_offset; }
 bool master_clock_manager::is_synchronized() { return fake_synchronized; }
-mesh_interop::mesh_interop() : _discovery_mode(false), _state{}, _node_last_synced_at{}, _mesh_state_cb(nullptr) {}
+int64_t master_clock_manager::last_sync_at() { return fake_last_sync ? fake_last_sync : fake_now; }
+mesh_interop::mesh_interop() : _discovery_mode(false), _state{}, _node_last_synced_at{}, _startup_at(fake_now), _mesh_state_cb(nullptr) {}
+bool mesh_interop::startup_waiting_for_nodes(uint64_t now) { return !fake_peer_online && now < fake_startup_at + STARTUP_WAKE_US; }
+esp_err_t mesh_interop::set_standby_radio(bool standby) { fake_radio_standby = standby; return ESP_OK; }
 bool mesh_interop::slave_node_exists(const uint8_t *mac) { return !memcmp(mac, slave_mac, 6); }
 bool mesh_interop::master_node_matches(const uint8_t *mac) { return !memcmp(mac, master_mac, 6); }
 mesh_interop::mesh_interop_state_result_t mesh_interop::get_state() {
-  mesh_interop_state_result_t s{}; s.nodes_count = 1;
+  mesh_interop_state_result_t s{}; s.is_discovery_mode = fake_discovery;
+  if (fake_discovery) return s;
+  s.nodes_count = 1;
   memcpy(s.nodes[0].mac, fake_mesh_master ? slave_mac : master_mac, 6);
   s.nodes[0].last_synced_at = fake_peer_online ? fake_now : 0; return s;
 }
@@ -986,6 +995,7 @@ void test_boot_and_default_start_together() {
 }
 void test_boot_waits_for_first_slave_heartbeat() {
   stored.clear(); staged.clear(); network.clear(); fake_peer_online = false;
+  fake_startup_at = fake_now;
   service master, slave; configure_node(master, true); configure_node(slave, false);
   auto c = fixture();
   c.sources[0].kind = mesh_interop_MatrixSource_Kind_ON_BOOT;
@@ -994,7 +1004,7 @@ void test_boot_waits_for_first_slave_heartbeat() {
   c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 0, 1);
   c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_WS2812, 1, 2);
   upload(master, c, 203);
-  cycles(master, slave, 100);
+  cycles(master, slave, 99);
   assert(master.deployment && !master.local && !slave.local);
   fake_peer_online = true;
   for (unsigned i = 0; i < 180 && (!master.local || !slave.local); ++i) cycles(master, slave, 1);
@@ -1003,12 +1013,61 @@ void test_boot_waits_for_first_slave_heartbeat() {
   assert(snapshot.states[0].active && snapshot.states[0].started_at_us == master.activate_at);
 
   // A missing slave delays startup only for the bounded grace period.
-  fake_peer_online = false; network.clear();
+  fake_peer_online = false; network.clear(); fake_startup_at = fake_now;
   service offline_master, offline_slave; configure_node(offline_master, true); configure_node(offline_slave, false);
   upload(offline_master, c, 204);
   cycles(offline_master, offline_slave, 205);
   assert(!offline_master.deployment && offline_master.activate_at > 0);
   fake_peer_online = true; stored.clear(); staged.clear(); network.clear();
+}
+
+void test_standby_blanks_and_recovers() {
+  stored.clear(); staged.clear(); network.clear();
+  service master, slave; configure_node(master, true); configure_node(slave, false);
+  auto c = fixture(); c.sources[0].kind = mesh_interop_MatrixSource_Kind_DEFAULT_STATE;
+  c.effects[0].duration_ms = 0;
+  upload(master, c, 205); cycles(master, slave, 250);
+  assert(slave.local);
+  fake_last_sync = fake_now;
+  fake_now += 4990000; fake_mesh_master = false; slave.slave_step(fake_now);
+  assert(!slave.standby && !fake_radio_standby);
+  fake_now += 10000; slave.slave_step(fake_now);
+  assert(slave.standby && fake_radio_standby && !slave.local);
+  assert(output.shown.r == 0 && output.shown.g == 0 && output.shown.b == 0);
+  slave.playback_step(fake_now);
+  assert(output.shown.r == 0 && output.shown.g == 0 && output.shown.b == 0);
+  fake_last_sync = ++fake_now; slave.slave_step(fake_now);
+  assert(!slave.standby && !fake_radio_standby && !slave.local);
+  assert(output.shown.r == 0 && output.shown.g == 0 && output.shown.b == 0);
+  fake_mesh_master = true; fake_last_sync = 0;
+  bool drop = false; deliver(master, slave, drop); cycles(master, slave, 250);
+  assert(slave.local && master.peers[0].ready);
+  stored.clear(); staged.clear(); network.clear();
+}
+
+void test_discovery_wakes_node_and_requires_fresh_sync() {
+  stored.clear(); staged.clear(); network.clear();
+  service master, slave; configure_node(master, true); configure_node(slave, false);
+  auto c = fixture(); c.sources[0].kind = mesh_interop_MatrixSource_Kind_DEFAULT_STATE;
+  c.effects[0].duration_ms = 0;
+  upload(master, c, 206); cycles(master, slave, 250);
+  fake_last_sync = fake_now;
+  fake_now += 5000000; fake_mesh_master = false; slave.slave_step(fake_now);
+  assert(slave.standby && fake_radio_standby);
+  fake_discovery = true; slave.slave_step(fake_now);
+  assert(slave.discovering && !slave.standby && !fake_radio_standby && !slave.local);
+  fake_now += 10000000; slave.slave_step(fake_now);
+  assert(slave.discovering && !slave.standby && !fake_radio_standby);
+  fake_discovery = false; slave.slave_step(fake_now);
+  assert(slave.waiting_for_discovery_sync && !slave.standby && !slave.local);
+  fake_now += 4990000; slave.slave_step(fake_now);
+  assert(slave.waiting_for_discovery_sync && !slave.standby);
+  fake_last_sync = ++fake_now; slave.slave_step(fake_now);
+  assert(!slave.waiting_for_discovery_sync && !slave.standby && !slave.local);
+  fake_mesh_master = true; fake_last_sync = 0;
+  bool drop = false; deliver(master, slave, drop); cycles(master, slave, 250);
+  assert(slave.local && master.peers[0].ready);
+  stored.clear(); staged.clear(); network.clear();
 }
 void test_six_driver_inventory_and_independent_remote_leds() {
   stored.clear(); staged.clear(); network.clear();
@@ -1187,6 +1246,8 @@ int main() {
   test_preconfigured_rainbow_and_current_read();
   test_boot_and_default_start_together();
   test_boot_waits_for_first_slave_heartbeat();
+  test_standby_blanks_and_recovers();
+  test_discovery_wakes_node_and_requires_fresh_sync();
   test_six_driver_inventory_and_independent_remote_leds();
   test_configurable_strip_and_identify_preview();
   test_local_layout_validation_errors();

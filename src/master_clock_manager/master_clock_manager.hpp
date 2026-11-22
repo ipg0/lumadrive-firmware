@@ -15,6 +15,7 @@ public:
 
   bool is_synchronized();
   uint64_t session();
+  int64_t last_sync_at();
   int64_t get_master_time();
   // Convert a captured local timestamp using the current synchronized offset.
   // Call from task context, never from an ISR.

@@ -52,10 +52,15 @@ void mesh_interop::heartbeat_timer_cb(void *arg) {
 
   mesh_interop &interop = mesh_interop::instance();
 
-  if (interop.is_discovery_mode()) {
-    interop.broadcast_discover();
-  } else {
+  const int64_t now = esp_timer_get_time();
+  if (now - interop._startup_at < STARTUP_WAKE_US) interop.send_heartbeats();
+  else if (now - interop._last_periodic_heartbeat >= MESH_INTEROP_HEARTBEAT_INTERVAL_US) {
     interop.send_heartbeats();
+    interop._last_periodic_heartbeat = now;
+  }
+  if (interop.is_discovery_mode() && now - interop._last_discovery_broadcast >= MESH_INTEROP_HEARTBEAT_INTERVAL_US) {
+    interop.broadcast_discover();
+    interop._last_discovery_broadcast = now;
   }
 }
 
@@ -144,9 +149,26 @@ mesh_interop::mesh_interop() {
     };
     esp_timer_handle_t heartbeat_timer;
     ESP_ERROR_CHECK(esp_timer_create(&heartbeat_timer_args, &heartbeat_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(
-        heartbeat_timer, MESH_INTEROP_HEARTBEAT_INTERVAL_US));
+    _startup_at = esp_timer_get_time();
+    ESP_ERROR_CHECK(esp_timer_start_periodic(heartbeat_timer, STARTUP_HEARTBEAT_INTERVAL_US));
   }
+}
+
+bool mesh_interop::startup_waiting_for_nodes(uint64_t now) {
+  std::lock_guard<std::mutex> lock(_state_mutex);
+  if (now >= uint64_t(_startup_at) + STARTUP_WAKE_US) return false;
+  for (size_t i = 0; i < _state.nodes_count; ++i)
+    if (!_node_last_synced_at[i]) return true;
+  return false;
+}
+
+esp_err_t mesh_interop::set_standby_radio(bool standby) {
+  auto err = esp_now_set_wake_window(standby ? 40 : UINT16_MAX);
+  if (err != ESP_OK) return err;
+  err = esp_wifi_connectionless_module_set_wake_interval(
+      standby ? 200 : ESP_WIFI_CONNECTIONLESS_INTERVAL_DEFAULT_MODE);
+  if (err != ESP_OK && standby) esp_now_set_wake_window(UINT16_MAX);
+  return err;
 }
 
 void mesh_interop::finish_discovery_timer_cb(void *arg) {
@@ -260,12 +282,17 @@ void mesh_interop::broadcast_discover() {
 }
 
 void mesh_interop::send_heartbeats() {
-  // broadcast heartbeat frame to all peers
+  // Take a snapshot so discovery and subscription cannot change the list while sending.
   if (!global_config::instance().is_master_node())
     return; // only master node should send heartbeat
 
-  for (size_t i = 0; i < this->_state.nodes_count; i++) {
-    const auto &slave_node = this->_state.nodes[i];
+  mesh_interop_state_t state{};
+  {
+    std::lock_guard<std::mutex> lock(_state_mutex);
+    state = _state;
+  }
+  for (size_t i = 0; i < state.nodes_count; i++) {
+    const auto &slave_node = state.nodes[i];
 
     mesh_interop_frame<mesh_interop_frame_type::HEARTBEAT> heartbeat_frame(
         slave_node.mac);

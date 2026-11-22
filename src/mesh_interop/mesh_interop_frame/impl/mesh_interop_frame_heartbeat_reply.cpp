@@ -37,8 +37,7 @@ mesh_interop_frame<mesh_interop_frame_type::HEARTBEAT_REPLY>::mesh_interop_frame
 
 esp_err_t
 mesh_interop_frame<mesh_interop_frame_type::HEARTBEAT_REPLY>::handle() const {
-  if (!global_config::instance().is_master_node() ||
-      mesh_interop::instance().is_discovery_mode()) {
+  if (!global_config::instance().is_master_node()) {
     ESP_LOGI(TAG, "Received HEARTBEAT_REPLY frame on slave node or in "
                   "discovery mode, ignoring");
     return ESP_OK;
