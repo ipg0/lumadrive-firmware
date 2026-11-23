@@ -5,6 +5,7 @@
 #include "../lighting_driver/impl/linear_lighting_driver_view.hpp"
 #include "../animation_trigger_table/trigger_condition/impl/always_trigger_condition.hpp"
 #include "../animation_trigger_table/trigger_condition/impl/never_trigger_condition.hpp"
+#include "../animation_trigger_table/trigger_condition/impl/gpio_state_trigger_condition.hpp"
 #include "../animation_trigger_table/trigger_condition/impl/mode_trigger_condition.hpp"
 #include "../animation_trigger_table/trigger_condition/impl/composite_trigger_condition.hpp"
 #include <algorithm>
@@ -343,6 +344,10 @@ const char* validate_config(const config_type& c, const uint8_t master_mac[6]) {
     if (condition.kind == mesh_interop_MatrixCondition_Kind_MODE) {
       if (!lookup(std::data(c.modes), c.modes_count, condition.mode_id))
         return "Invalid condition mode";
+    } else if (condition.kind == mesh_interop_MatrixCondition_Kind_GPIO_STATE) {
+      if (condition.gpio > 39 || (condition.node_mac[0] & 1) ||
+          std::all_of(condition.node_mac, condition.node_mac + 6, [](uint8_t v) { return v == 0; }))
+        return "Invalid GPIO condition node or pin";
     } else if (condition.kind == mesh_interop_MatrixCondition_Kind_AND ||
                condition.kind == mesh_interop_MatrixCondition_Kind_OR) {
       if (!lookup(std::data(c.conditions), c.conditions_count, condition.left_id) ||
@@ -351,6 +356,22 @@ const char* validate_config(const config_type& c, const uint8_t master_mac[6]) {
     } else if (condition.kind != mesh_interop_MatrixCondition_Kind_ALWAYS &&
                condition.kind != mesh_interop_MatrixCondition_Kind_NEVER)
       return "Unsupported condition";
+  }
+  for (size_t i = 0; i < c.conditions_count; ++i) {
+    const auto& owner = c.conditions[i];
+    if (owner.kind != mesh_interop_MatrixCondition_Kind_GPIO_STATE)
+      continue;
+    uint64_t pins = 0;
+    for (size_t j = 0; j < c.conditions_count; ++j)
+      if (c.conditions[j].kind == mesh_interop_MatrixCondition_Kind_GPIO_STATE &&
+          !memcmp(owner.node_mac, c.conditions[j].node_mac, 6))
+        pins |= 1ULL << c.conditions[j].gpio;
+    for (size_t j = 0; j < c.sources_count; ++j)
+      if (c.sources[j].kind == mesh_interop_MatrixSource_Kind_GPIO_EDGE &&
+          !memcmp(owner.node_mac, c.sources[j].node_mac, 6))
+        pins |= 1ULL << c.sources[j].gpio;
+    if (__builtin_popcountll(pins) > 32)
+      return "Too many GPIO inputs on node";
   }
   std::array<uint8_t, 32> visited{};
   const auto acyclic = [&](auto&& self, size_t index) -> bool {
@@ -484,6 +505,16 @@ void fill_definitions(const config_type& c, const uint8_t* mac, uint64_t session
         d.gpio_inputs + d.gpio_inputs_count)
       d.gpio_inputs[d.gpio_inputs_count++] = s.gpio;
   }
+  for (size_t i = 0; mac && i < c.conditions_count; ++i) {
+    const auto& condition = c.conditions[i];
+    if (condition.kind != mesh_interop_MatrixCondition_Kind_GPIO_STATE ||
+        memcmp(condition.node_mac, mac, 6))
+      continue;
+    if (std::find(d.gpio_inputs, d.gpio_inputs + d.gpio_inputs_count, condition.gpio) ==
+            d.gpio_inputs + d.gpio_inputs_count &&
+        d.gpio_inputs_count < 32)
+      d.gpio_inputs[d.gpio_inputs_count++] = condition.gpio;
+  }
   for (size_t i = 0; i < c.entries_count; ++i) {
     const auto& e = c.entries[i];
     if (mac && !d.output_mappings_count)
@@ -564,6 +595,16 @@ void populate_playback(playback_definitions& d, const config_type& c, const uint
     if (std::find(gpio_inputs.begin(), gpio_inputs.begin() + gpio_inputs_count, s.gpio) ==
         gpio_inputs.begin() + gpio_inputs_count)
       gpio_inputs[gpio_inputs_count++] = s.gpio;
+  }
+  for (size_t i = 0; mac && i < c.conditions_count; ++i) {
+    const auto& condition = c.conditions[i];
+    if (condition.kind != mesh_interop_MatrixCondition_Kind_GPIO_STATE ||
+        memcmp(condition.node_mac, mac, 6))
+      continue;
+    if (std::find(gpio_inputs.begin(), gpio_inputs.begin() + gpio_inputs_count, condition.gpio) ==
+            gpio_inputs.begin() + gpio_inputs_count &&
+        gpio_inputs_count < gpio_inputs.size())
+      gpio_inputs[gpio_inputs_count++] = condition.gpio;
   }
   if (!mac || output_mappings_count)
     for (size_t i = 0; i < c.entries_count; ++i)
@@ -924,6 +965,8 @@ public:
   trigger_condition_type type() const override {
     if (_condition.kind == mesh_interop_MatrixCondition_Kind_NEVER)
       return trigger_condition_type::NEVER;
+    if (_condition.kind == mesh_interop_MatrixCondition_Kind_GPIO_STATE)
+      return trigger_condition_type::GPIO_STATE;
     if (_condition.kind == mesh_interop_MatrixCondition_Kind_MODE)
       return trigger_condition_type::MODE;
     if (_condition.kind == mesh_interop_MatrixCondition_Kind_AND)
@@ -947,6 +990,10 @@ private:
       return trigger_condition<trigger_condition_type::ALWAYS>().evaluate(context);
     if (_condition.kind == mesh_interop_MatrixCondition_Kind_NEVER)
       return trigger_condition<trigger_condition_type::NEVER>().evaluate(context);
+    if (_condition.kind == mesh_interop_MatrixCondition_Kind_GPIO_STATE)
+      return trigger_condition<trigger_condition_type::GPIO_STATE>(_condition.node_mac,
+                                                                   _condition.gpio, _condition.high)
+          .evaluate(context);
     if (_condition.kind == mesh_interop_MatrixCondition_Kind_MODE)
       return trigger_condition<trigger_condition_type::MODE>(_condition.mode_id,
                                                              _condition.inverted)
@@ -978,8 +1025,23 @@ void evaluator::tick(uint64_t now, const trigger_gpio_edge_t* edges, size_t coun
     const auto& condition = *lookup(_conditions, _conditions_count, entry.condition_id);
     trigger_context context{};
     context.active_mode_id = _mode;
-    if (!runtime_condition(condition, _conditions, _conditions_count, memo).evaluate(context))
+    context.gpio_level = _gpio_lookup;
+    context.gpio_level_arg = _gpio_arg;
+    if (!runtime_condition(condition, _conditions, _conditions_count, memo).evaluate(context)) {
+      if (_boot && source.kind == mesh_interop_MatrixSource_Kind_ON_BOOT)
+        _boot_fired[i] = true;
+      if (source.kind == mesh_interop_MatrixSource_Kind_DEFAULT_STATE && _active[i]) {
+        animation_command stop{};
+        stop.master_session = _session;
+        stop.revision = _revision;
+        stop.entry_id = entry.id;
+        stop.stop = true;
+        stop.effective_at_us = now + LEAD_US;
+        if (sink(arg, stop))
+          _active[i] = false;
+      }
       continue;
+    }
     if (_active[i] && effect.duration_ms && now >= _starts[i] &&
         (now - _starts[i]) / 1000 >= effect.duration_ms)
       _active[i] = false;

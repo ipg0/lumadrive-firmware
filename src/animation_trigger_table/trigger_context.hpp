@@ -17,7 +17,7 @@ public:
   uint32_t active_mode_id = 0;
   size_t gpio_edges_count = 0;
   // Borrowed for one tick. A null pointer represents an empty event batch.
-  const trigger_gpio_edge_t *gpio_edges = nullptr;
-
-  // TODO: form context & propagate to slave nodes
+  const trigger_gpio_edge_t* gpio_edges = nullptr;
+  bool (*gpio_level)(void*, const uint8_t*, uint32_t, bool&) = nullptr;
+  void* gpio_level_arg = nullptr;
 };

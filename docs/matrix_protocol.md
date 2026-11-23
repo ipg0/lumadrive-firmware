@@ -199,6 +199,23 @@ request inventory or identification on a slave.
 
 ## Slave GPIO reporting
 
+GPIO state conditions reference a provisioned input on the controller or a node
+and match its logical high or low level after hardware inversion. An input with
+no current state matches neither level; AND and OR receive ordinary booleans.
+Nodes sample initialized inputs after synchronizing their controller session and
+send acknowledged state snapshots, independently of animation definitions.
+Snapshots are retried and refreshed periodically; session changes, delivery
+gaps, queue loss, or stale communication invalidate affected state until a new
+sample arrives. Sampling does not generate GPIO edge triggers.
+
+At controller boot, GPIO samples are collected alongside node wakeup. Boot
+evaluation waits for initial samples up to a bounded deadline, leaving missing
+inputs unmatched. Each boot condition is evaluated once; reconnecting later
+does not replay a missed boot trigger. Reconnecting nodes sample again and their
+new levels can enable default-state entries.
+If a default-state entry's condition stops matching, its layer stops; it can
+start again when the condition matches. Other triggers are not replayed.
+
 Definitions contain up to 32 distinct node-local `gpio_inputs`, with both edges
 captured by ISR into a bounded 64-edge queue. The worker converts captured local
 timestamps through the synchronized clock offset, filters pins against the active

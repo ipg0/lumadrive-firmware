@@ -38,7 +38,7 @@ matrix_config fixture() {
   s.rising = true;
   memcpy(s.node_mac, master_mac, 6);
   c.conditions_count = 1;
-  c.conditions[0] = {3, mesh_interop_MatrixCondition_Kind_ALWAYS, 0, false, 0, 0};
+  c.conditions[0] = {3, mesh_interop_MatrixCondition_Kind_ALWAYS, 0, false, 0, 0, {}, 0, false};
   c.entries_count = 1;
   auto& e = c.entries[0];
   e.id = 4;
@@ -345,9 +345,9 @@ void test_modes() {
   config.conditions[0].mode_id = 3;
   assert(validate(config, master_mac));
   config.conditions_count = 3;
-  config.conditions[0] = {3, mesh_interop_MatrixCondition_Kind_MODE, 1, false, 0, 0};
-  config.conditions[1] = {4, mesh_interop_MatrixCondition_Kind_MODE, 2, true, 0, 0};
-  config.conditions[2] = {5, mesh_interop_MatrixCondition_Kind_AND, 0, false, 3, 4};
+  config.conditions[0] = {3, mesh_interop_MatrixCondition_Kind_MODE, 1, false, 0, 0, {}, 0, false};
+  config.conditions[1] = {4, mesh_interop_MatrixCondition_Kind_MODE, 2, true, 0, 0, {}, 0, false};
+  config.conditions[2] = {5, mesh_interop_MatrixCondition_Kind_AND, 0, false, 3, 4, {}, 0, false};
   config.entries[0].condition_id = 5;
   config.active_mode_id = 1;
   assert(!validate(config, master_mac));
@@ -367,7 +367,7 @@ void test_modes() {
   rules.tick(600, nullptr, 0, 600, sink, &commands);
   assert(commands.size() == 1);
   config.conditions_count = 4;
-  config.conditions[3] = {6, mesh_interop_MatrixCondition_Kind_AND, 0, false, 5, 4};
+  config.conditions[3] = {6, mesh_interop_MatrixCondition_Kind_AND, 0, false, 5, 4, {}, 0, false};
   config.entries[0].condition_id = 6;
   assert(!validate(config, master_mac));
   commands.clear();
@@ -400,6 +400,80 @@ void test_never_condition() {
   rules.configure(&config, 10, 2, true, false);
   rules.tick(200, nullptr, 0, 200, sink, &commands);
   assert(commands.size() == 1);
+}
+void test_gpio_state_condition() {
+  auto config = fixture();
+  config.sources[0].kind = mesh_interop_MatrixSource_Kind_ON_BOOT;
+  auto& condition = config.conditions[0];
+  condition.kind = mesh_interop_MatrixCondition_Kind_GPIO_STATE;
+  memcpy(condition.node_mac, slave_mac, 6);
+  condition.gpio = 12;
+  assert(!validate(config, master_mac));
+  auto definitions = definitions_for(config, slave_mac, 10, 20);
+  assert(definitions.gpio_inputs_count == 1 && definitions.gpio_inputs[0] == 12);
+  struct input {
+    bool known;
+    bool high;
+  } state{false, false};
+  auto lookup = [](void* arg, const uint8_t*, uint32_t pin, bool& high) {
+    auto& value = *static_cast<input*>(arg);
+    high = value.high;
+    return value.known && pin == 12;
+  };
+  auto sink = [](void* arg, const animation_command& command) {
+    static_cast<std::vector<animation_command>*>(arg)->push_back(command);
+    return true;
+  };
+  evaluator rules;
+  rules.set_gpio_lookup(lookup, &state);
+  std::vector<animation_command> commands;
+  for (bool target : {false, true}) {
+    condition.high = target;
+    rules.configure(&config, 10, 20, true);
+    rules.tick(100, nullptr, 0, 100, sink, &commands);
+    state.known = true;
+    state.high = target;
+    rules.tick(200, nullptr, 0, 200, sink, &commands);
+    assert(commands.empty());
+    rules.configure(&config, 10, 20, true);
+    rules.tick(300, nullptr, 0, 300, sink, &commands);
+    assert(commands.size() == 1);
+    commands.clear();
+    state.known = false;
+  }
+  config.sources[0].kind = mesh_interop_MatrixSource_Kind_DEFAULT_STATE;
+  condition.high = true;
+  rules.configure(&config, 10, 20);
+  rules.tick(400, nullptr, 0, 400, sink, &commands);
+  assert(commands.empty());
+  state.known = true;
+  state.high = true;
+  rules.tick(500, nullptr, 0, 500, sink, &commands);
+  assert(commands.size() == 1);
+  state.high = false;
+  rules.tick(600, nullptr, 0, 600, sink, &commands);
+  assert(commands.size() == 2 && commands.back().stop);
+  state.high = true;
+  rules.tick(700, nullptr, 0, 700, sink, &commands);
+  assert(commands.size() == 3 && !commands.back().stop);
+  config.conditions_count = 3;
+  config.conditions[1].id = 7;
+  config.conditions[1].kind = mesh_interop_MatrixCondition_Kind_ALWAYS;
+  config.conditions[2].id = 8;
+  config.conditions[2].kind = mesh_interop_MatrixCondition_Kind_OR;
+  config.conditions[2].left_id = condition.id;
+  config.conditions[2].right_id = 7;
+  config.entries[0].condition_id = 8;
+  state.known = false;
+  commands.clear();
+  rules.configure(&config, 10, 20);
+  rules.tick(800, nullptr, 0, 800, sink, &commands);
+  assert(commands.size() == 1); // OR sees the unknown GPIO condition as false.
+  config.conditions[2].kind = mesh_interop_MatrixCondition_Kind_AND;
+  commands.clear();
+  rules.configure(&config, 10, 20);
+  rules.tick(900, nullptr, 0, 900, sink, &commands);
+  assert(commands.empty());
 }
 void test_layering() {
   auto config = fixture();
@@ -1202,6 +1276,7 @@ int main() {
   test_entry_background_opacity();
   test_modes();
   test_never_condition();
+  test_gpio_state_condition();
   test_boot_once_and_palette_roundtrip();
   test_one_entry_two_drivers();
   test_node_input_definitions();
