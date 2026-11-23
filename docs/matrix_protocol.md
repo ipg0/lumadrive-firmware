@@ -31,7 +31,7 @@ per category, six physical drivers per node, 84 placed light sources across up
 to 17 mesh nodes, and 16 KiB encoded bytes. The selected full-capacity target is
 seven nodes with six two-LED modules each.
 `MatrixConfig.layout` describes the one physical arrangement of the car, and
-every animation renders on its complete canvas. Entries have no output targets.
+animations share the canvas; simple animations may restrict their region. Entries have no output targets.
 See [Car layout](layout.md) for boundary indices, reversal, overlap, and examples.
 Driver slot IDs are 1–6; historical enum names `WS2812`/`HC595` for slots 1/2 do
 not constrain their types. Inventory reports the hardware kind independently.

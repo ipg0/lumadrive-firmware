@@ -752,6 +752,23 @@ void test_effect_validation_and_roundtrip() {
   c.effects[0].duration_ms = 0;
   assert(!validate(c, master_mac));
   c = fixture();
+  c.effects[0].kind = mesh_interop_MatrixEffect_Kind_BREATHE;
+  c.effects[0].gradient_colors_count = 1;
+  assert(validate(c, master_mac));
+  c.effects[0].gradient_colors_count = 3;
+  c.effects[0].gradient_colors[0] = {255, 0, 0, 255};
+  c.effects[0].gradient_colors[1] = {0, 255, 0, 200};
+  c.effects[0].gradient_colors[2] = {0, 0, 255, 255};
+  assert(!validate(c, master_mac));
+  auto breathe_definitions = definitions_for(c, slave_mac, 10, 20);
+  auto breathe_bytes = encode(mesh_interop_AnimationDefinitions_fields, &breathe_definitions);
+  animation_definitions breathe_received{};
+  assert(decode(mesh_interop_AnimationDefinitions_fields, &breathe_received, breathe_bytes.data(),
+                breathe_bytes.size()));
+  assert(breathe_received.layers[0].effect.gradient_colors_count == 3);
+  player breathe_player(resolve);
+  assert(breathe_player.prepare(breathe_received));
+  c = fixture();
   c.effects[0].kind = static_cast<mesh_interop_MatrixEffect_Kind>(99);
   assert(validate(c, master_mac));
   c = keyframe_fixture();
@@ -1141,6 +1158,74 @@ void assert_canvas_projection(const canvas_test_driver& reference) {
   assert(same(canvas_block.shown[0], reference.pixels[2]));
   assert(same(canvas_block.shown[1], reference.pixels[1]));
 }
+void test_animation_region() {
+  auto c = fixture();
+  c.layout_count = 3;
+  c.layout[0] = layout_row(slave_mac, mesh_interop_MatrixDriver_WS2812, 0, 4);
+  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_HC595, 3, 1);
+  c.layout[2] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 8, 4);
+  c.effects[0].duration_ms = 0;
+  c.effects_count = 2;
+  c.effects[1] = {};
+  auto& effect = c.effects[1];
+  effect.id = 8;
+  effect.kind = mesh_interop_MatrixEffect_Kind_BLINK;
+  effect.blue = 255;
+  effect.alpha = 128;
+  effect.period_ms = 1000;
+  effect.has_region_start = true;
+  effect.region_start = 2;
+  effect.has_region_end = true;
+  effect.region_end = 6;
+  c.entries_count = 2;
+  c.entries[1] = c.entries[0];
+  c.entries[1].id = 5;
+  c.entries[1].effect_id = 8;
+  c.entries[1].priority = 20;
+  c.entries[1].opaque_background = true;
+  assert(!validate(c, master_mac));
+  auto definitions = make_definitions(c, slave_mac, 10, 20);
+  auto bytes = encode(mesh_interop_AnimationDefinitions_fields, definitions.get());
+  animation_definitions received{};
+  assert(decode(mesh_interop_AnimationDefinitions_fields, &received, bytes.data(), bytes.size()));
+  assert(received.layers[1].effect.has_region_start && received.layers[1].effect.region_start == 2);
+  player a(resolve_canvas_a), b(resolve_canvas_b), recovered(resolve_canvas_a);
+  assert(a.prepare(received) && b.prepare(c, master_mac, 10, 20));
+  auto first = start(), second = start();
+  second.entry_id = 5;
+  assert(a.enqueue(first) && a.enqueue(second) && b.enqueue(first) && b.enqueue(second));
+  for (uint64_t time : {100000ULL, 600000ULL}) {
+    a.tick(time);
+    b.tick(time);
+    const uint8_t blue = time == 100000 ? 128 : 0;
+    for (size_t i = 0; i < 4; ++i) {
+      const auto x = canvas_strip_a.shown[i], y = canvas_strip_b.shown[i];
+      assert(x.r == (i < 2 ? 255 : 0) && x.b == (i < 2 ? 0 : blue));
+      assert(y.r == (i < 2 ? 255 : 0) && y.b == (i < 2 ? 0 : blue));
+    }
+    assert(canvas_block.shown[0].b == blue && canvas_block.shown[0].r == 0);
+    assert(canvas_block.shown[1].r == 255 && canvas_block.shown[1].b == 0);
+  }
+  assert(recovered.prepare(a));
+  effect.kind = mesh_interop_MatrixEffect_Kind_FILL;
+  effect.alpha = 255;
+  effect.duration_ms = 1000;
+  c.entries[1].opaque_background = false;
+  assert(a.prepare(c, slave_mac, 10, 20) && b.prepare(c, master_mac, 10, 20));
+  assert(a.enqueue(first) && a.enqueue(second) && b.enqueue(first) && b.enqueue(second));
+  a.tick(600000);
+  b.tick(600000);
+  assert(canvas_strip_a.shown[1].r == 255 && canvas_strip_a.shown[2].b == 255 &&
+         canvas_strip_a.shown[3].b == 255);
+  for (const auto& pixel : canvas_strip_b.shown)
+    assert(pixel.r == 255 && pixel.b == 0);
+  assert(canvas_block.shown[0].b == 255 && canvas_block.shown[1].r == 255);
+  effect.region_start = 6;
+  assert(validate(c, master_mac));
+  effect.region_start = 2;
+  effect.kind = mesh_interop_MatrixEffect_Kind_KEYFRAMES;
+  assert(validate(c, master_mac));
+}
 void test_shared_canvas_motion_and_gradient() {
   auto c = keyframe_fixture();
   c.layout_count = 3;
@@ -1310,6 +1395,7 @@ int main() {
   test_expanded_definition_limit();
   test_layout_validation();
   test_shared_canvas_motion_and_gradient();
+  test_animation_region();
   test_seven_node_six_driver_point_layout();
   std::puts("Matrix runtime: transfer, schema, scheduling, recovery, and layering passed.");
   return 0;

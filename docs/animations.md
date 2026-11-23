@@ -81,11 +81,20 @@ defaults to 1000 ms; explicit periods must be at least 2 ms. Rendering runs at
 | `DIMMING` | Blend black over lower-priority lighting. Alpha sets the dimming amount: 0% leaves it unchanged and 100% turns it black. Use a transparent entry background to retain lower layers. |
 | `BLINK` | Primary color on first, then transparent. `duty_percent` is the on fraction, 1–100; zero defaults to 50. |
 | `BREATHE` | Smoothly vary primary alpha from zero to its configured value and back, peaking halfway through `period_ms`. |
-| `FLOWING_GRADIENT` | Move 2–8 RGBA stops from `gradient_colors` along canvas indices, equally spaced and wrapping last → first. `wavelength_pixels: 0` fits one cycle to the full canvas; a positive value sets its spatial length. `reverse: true` flows toward decreasing indices. |
+| `FLOWING_GRADIENT` | Move 2–8 RGBA stops from `gradient_colors` along canvas indices, equally spaced and wrapping last → first. `wavelength_pixels: 0` fits one cycle to the animation region; a positive value sets its spatial length. `reverse: true` flows toward decreasing indices. |
 | `RAINBOW` | Move a repeating saturated RGB spectrum along canvas indices. Uses primary alpha for opacity, with the same wavelength and reverse controls as flowing gradient. Primary RGB and secondary color are ignored. |
 | `FILL` | Fill the shared canvas with primary RGBA, leaving unfilled pixels transparent. With `loop: false`, `duration_ms` (at least 2) sets the time for one pass; with `loop: true`, `period_ms` sets the pass time and duration limits total playback. `reverse` starts at the end; `fill_from_center` expands in both directions from the layout center. The center defaults between the dash locations and can be set manually. The farther edge determines the fill time. A finite effect ends at its duration; default-state triggers restart it. |
 
-These parametric types cover the whole canvas. Blink/breathe off phases reveal
+Simple effects can specify an optional canvas region: `region_start` is an
+inclusive boundary and `region_end` is exclusive. Missing boundaries default to
+the beginning and end of the layout. The app accepts indices or fills them from
+named light sources, using each source's lower and upper boundaries even when it
+is reversed. Gradient and fill geometry is relative to the region; center fill
+uses the configured layout center clamped to that region. Keyframes continue to
+use the entire canvas and do not accept region boundaries. An opaque entry's
+black background is limited to the same region.
+
+These parametric types use the selected region. Blink/breathe off phases reveal
 lower layers. Gradient interpolation includes alpha and uses logical RGB pixels
 on both WS2812 and HC595 drivers. The app supports adding, removing and reordering
 gradient stops. When `gradient_colors` is empty, primary → `secondary_color` →

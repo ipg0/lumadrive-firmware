@@ -220,9 +220,16 @@ const char* validate_effect(const matrix_effect& e) {
     return "Too many keyframes";
   if (e.gradient_colors_count > MAX_GRADIENT_COLORS)
     return "Too many gradient colors";
-  if (e.gradient_colors_count && e.kind != mesh_interop_MatrixEffect_Kind_FLOWING_GRADIENT)
-    return "Gradient colors require a flowing gradient";
+  if (e.gradient_colors_count && e.kind != mesh_interop_MatrixEffect_Kind_FLOWING_GRADIENT &&
+      e.kind != mesh_interop_MatrixEffect_Kind_BREATHE)
+    return "Palette colors require a gradient or breathe effect";
   const auto kind = enum_value(e.kind);
+  if ((e.has_region_start && e.region_start >= 65536) ||
+      (e.has_region_end && (!e.region_end || e.region_end > 65536)) ||
+      (e.has_region_start && e.has_region_end && e.region_start >= e.region_end))
+    return "Invalid animation region";
+  if (kind == mesh_interop_MatrixEffect_Kind_KEYFRAMES && (e.has_region_start || e.has_region_end))
+    return "Keyframes cannot specify an animation region";
   if (kind != mesh_interop_MatrixEffect_Kind_KEYFRAMES && e.keyframes_count)
     return "Keyframes require the keyframe effect type";
   switch (kind) {
@@ -241,6 +248,8 @@ const char* validate_effect(const matrix_effect& e) {
       return "Blink duty must be 1..100 percent (zero defaults to 50)";
     break;
   case mesh_interop_MatrixEffect_Kind_BREATHE:
+    if (e.gradient_colors_count == 1)
+      return "Breathe palette requires 2..8 colors";
     break;
   case mesh_interop_MatrixEffect_Kind_RAINBOW:
     break;
@@ -416,6 +425,13 @@ const char* validate_config(const config_type& c, const uint8_t master_mac[6]) {
     extent = std::max(extent, std::max(c.layout[i].from, c.layout[i].to));
   if (c.has_center_index && c.center_index > extent)
     return "Center is outside the layout";
+  if (extent)
+    for (size_t i = 0; i < c.effects_count; ++i) {
+      const auto& effect = c.effects[i];
+      if ((effect.has_region_start && effect.region_start >= extent) ||
+          (effect.has_region_end && (!effect.region_end || effect.region_end > extent)))
+        return "Animation region is outside the layout";
+    }
   size_t node_count = 0;
   for (size_t i = 0; i < c.layout_count; ++i) {
     bool first = true;
@@ -766,6 +782,10 @@ bool player::prepare(const playback_definitions& d,
     const auto& l = d.layers[i];
     if (!l.entry_id || !effects[i] || validate_effect(*effects[i]) || l.priority > 255)
       return false;
+    const auto start = effects[i]->has_region_start ? effects[i]->region_start : 0;
+    const auto end = effects[i]->has_region_end ? effects[i]->region_end : d.canvas_size;
+    if (start >= end || end > d.canvas_size)
+      return false;
     for (size_t j = 0; j < i; ++j)
       if (d.layers[j].entry_id == l.entry_id)
         return false;
@@ -778,6 +798,12 @@ bool player::prepare(const playback_definitions& d,
   if (!write_playback_definitions(stream, d, effects))
     return false;
   _definitions = d;
+  for (size_t i = 0; i < d.layers_count; ++i) {
+    _definitions.layers[i].region_start =
+        effects[i]->has_region_start ? effects[i]->region_start : 0;
+    _definitions.layers[i].region_end =
+        effects[i]->has_region_end ? effects[i]->region_end : d.canvas_size;
+  }
   _definition_bytes = std::move(bytes);
   _pending_count = 0;
   for (auto& l : _layers)
@@ -941,9 +967,12 @@ esp_err_t player::tick(uint64_t now, bool render, uint32_t excluded_driver,
         if (mapping.driver == excluded_driver && mapping.source_index == excluded_source)
           continue;
         auto* driver = _resolver(mapping.driver);
-        linear_lighting_driver_view view(*driver, mapping.from, mapping.to,
-                                         _definitions.canvas_size, mapping.source_index,
-                                         _definitions.center_index);
+        linear_lighting_driver_view view(
+            *driver, mapping.from, mapping.to, _definitions.canvas_size, mapping.source_index,
+            _definitions.center_index, _definitions.layers[i].region_start,
+            _definitions.layers[i].region_end);
+        if (!view.get_render_pixel_count())
+          continue;
         if (_definitions.layers[i].opaque_background) {
           auto err = view.fill(alpha_color(color(0, 0, 0), 255));
           if (err != ESP_OK)

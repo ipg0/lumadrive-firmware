@@ -58,6 +58,7 @@ private:
 struct playback_layer {
   uint32_t entry_id = 0, priority = 0, order = 0;
   bool opaque_background = false;
+  uint32_t region_start = 0, region_end = UINT32_MAX;
 };
 struct playback_definitions {
   playback_definitions() = default;
