@@ -118,7 +118,7 @@ capacity), reversal (bit 20), and whole-node identification (bit 21) into a fixe
 Whole-node requests require zero length and no reversal; bits 22–31 must be zero. Omitting
 `output_index` with this option keeps even the largest request within a 20-byte
 envelope for ATT MTU 23. A strip fills over two seconds and holds fully lit for
-one second, with cyan and magenta end markers; an individual RGB module LED pulses cyan.
+one second, with purple end markers and a cyan fill; an individual RGB module LED pulses cyan.
 Whole-node identification flashes all local outputs together.
 
 `MatrixUpload.layout_begin` uses the existing begin/chunk/commit framing, but its

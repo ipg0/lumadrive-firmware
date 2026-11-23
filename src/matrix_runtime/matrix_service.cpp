@@ -1585,10 +1585,10 @@ public:
               elapsed >= 2000000 ? length : 1 + elapsed * (length - 1) / 2000000;
           for (uint32_t position = 0; position < filled; ++position) {
             const uint32_t physical = !all && identify_reversed ? length - 1 - position : position;
-            source.set_pixel(physical, alpha_color(color(53, 101, 252)));
+            source.set_pixel(physical, alpha_color(color(0, 220, 233)));
           }
           if (!all || filled) {
-            source.set_pixel(!all && identify_reversed ? length - 1 : 0, alpha_color(color(0, 220, 233)));
+            source.set_pixel(!all && identify_reversed ? length - 1 : 0, alpha_color(color(222, 80, 233)));
             if (length > 1) source.set_pixel(!all && identify_reversed ? 0 : length - 1, alpha_color(color(222, 80, 233)));
           }
         }

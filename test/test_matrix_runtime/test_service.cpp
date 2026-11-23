@@ -803,14 +803,14 @@ void test_layout_editor_service() {
   layout_request(master, 20); auto response = layout_response(); const auto token = response.snapshot_id;
   layout_request(master, 21, token, 0, true, 0); response = layout_response();
   assert(response.request_id == 21 && response.complete && master.identify_driver == 1);
-  master.playback_step(fake_now); assert(output.shown.g == 220 && output.shown.r == 0);
+  master.playback_step(fake_now); assert(output.shown.r == 222 && output.shown.g == 80);
   const auto before_identify = stored;
   fake_now += 3000001; master.playback_step(fake_now);
   assert(!master.identify_driver && output.shown.r == 255 && stored == before_identify);
   // Unmapped output identification also clears itself at the deadline.
   layout_request(master, 22); response = layout_response();
   layout_request(master, 23, response.snapshot_id, 0, true, 1); master.playback_step(fake_now);
-  assert(output_secondary.shown.g == 220); fake_now += 3000001; master.playback_step(fake_now);
+  assert(output_secondary.shown.r == 222); fake_now += 3000001; master.playback_step(fake_now);
   assert(output_secondary.shown.r == 0 && output_secondary.shown.g == 0 && output_secondary.shown.b == 0);
   // Slave identify ACK loss retries without restarting the three-second window.
   master.master_step(fake_now, fake_now); bool drop = false; deliver(master, slave, drop);
@@ -820,7 +820,7 @@ void test_layout_editor_service() {
   assert(!drop && slave.identify_driver == 2); const auto deadline = slave.identify_until;
   fake_now += 100000; master.master_step(fake_now, fake_now); deliver(master, slave, drop);
   response = layout_response(); assert(response.request_id == 25 && response.complete && !master.identifying.active);
-  assert(slave.identify_until == deadline); slave.playback_step(fake_now); assert(output_secondary.shown.g == 220);
+  assert(slave.identify_until == deadline); slave.playback_step(fake_now); assert(output_secondary.shown.r == 222);
   fake_now = deadline + 1; slave.playback_step(fake_now); assert(output_secondary.shown.r == 255);
   // Whole-node identify uses one acknowledged request and flashes every driver.
   layout_request(master, 30); response = layout_response();
@@ -828,7 +828,7 @@ void test_layout_editor_service() {
   master.master_step(fake_now, fake_now); deliver(master, slave, drop);
   assert(layout_response().complete && slave.identify_driver == matrix_service::IDENTIFY_ALL_DRIVERS);
   slave.playback_step(fake_now);
-  assert(output.shown.g == 220 && output_secondary.shown.g == 220);
+  assert(output.shown.r == 222 && output_secondary.shown.r == 222);
   fake_now += 250000; slave.playback_step(fake_now);
   assert(output.shown.g == 0 && output_secondary.shown.g == 0);
   fake_now += 3000000; slave.playback_step(fake_now);
@@ -1162,16 +1162,16 @@ void test_configurable_strip_and_identify_preview() {
   assert(slave.identify_length == 8 && slave.identify_reversed);
   const auto start = slave.identify_until - 3000000;
   fake_now = start; slave.playback_step(fake_now);
-  assert(growing_output.shown[7].g == 220 && growing_output.shown[0].r == 222 && growing_output.shown[11].r == 0);
+  assert(growing_output.shown[7].r == 222 && growing_output.shown[0].r == 222 && growing_output.shown[11].r == 0);
   fake_now = start + 1000000; slave.playback_step(fake_now);
-  for (size_t i = 4; i < 7; ++i) assert(growing_output.shown[i].g == 101);
+  for (size_t i = 4; i < 7; ++i) assert(growing_output.shown[i].g == 220);
   assert(growing_output.shown[3].g == 0 && growing_output.shown[0].r == 222);
   fake_now = start + 1999999; slave.playback_step(fake_now);
-  assert(growing_output.shown[1].g == 101 && growing_output.shown[0].r == 222);
+  assert(growing_output.shown[1].g == 220 && growing_output.shown[0].r == 222);
   for (uint64_t elapsed : {2000000, 2500000, 2999999}) {
     fake_now = start + elapsed; slave.playback_step(fake_now);
-    assert(growing_output.shown[0].r == 222 && growing_output.shown[7].g == 220);
-    for (size_t i = 1; i < 7; ++i) assert(growing_output.shown[i].g == 101);
+    assert(growing_output.shown[0].r == 222 && growing_output.shown[7].r == 222);
+    for (size_t i = 1; i < 7; ++i) assert(growing_output.shown[i].g == 220);
     for (size_t i = 8; i < 12; ++i) assert(growing_output.shown[i].r == 0 && growing_output.shown[i].g == 0 && growing_output.shown[i].b == 0);
   }
   fake_now = start + 3000001; slave.playback_step(fake_now);
@@ -1179,11 +1179,11 @@ void test_configurable_strip_and_identify_preview() {
   assert(slave.begin_identify(1, fake_now, 0, 6, false));
   const auto forward_start = fake_now;
   fake_now += 1000000; slave.playback_step(fake_now);
-  assert(growing_output.shown[0].g == 220);
-  for (size_t i = 1; i < 3; ++i) assert(growing_output.shown[i].g == 101);
+  assert(growing_output.shown[0].r == 222);
+  for (size_t i = 1; i < 3; ++i) assert(growing_output.shown[i].g == 220);
   assert(growing_output.shown[3].g == 0 && growing_output.shown[5].r == 222);
   fake_now = forward_start + 2500000; slave.playback_step(fake_now);
-  assert(growing_output.shown[0].g == 220 && growing_output.shown[5].r == 222 && growing_output.shown[6].r == 0);
+  assert(growing_output.shown[0].r == 222 && growing_output.shown[5].r == 222 && growing_output.shown[6].r == 0);
   fake_now = forward_start + 3000001; slave.playback_step(fake_now);
   assert(!slave.identify_driver && growing_output.shown[11].r == 255);
   const auto before = stored;
