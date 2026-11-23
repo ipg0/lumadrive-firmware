@@ -7,7 +7,7 @@
 
 namespace matrix {
 inline bool add_default_output(matrix_config &config, const uint8_t mac[6], uint32_t driver, uint32_t pixels,
-    uint32_t source_index = 0, lighting_driver_kind kind = lighting_driver_kind::UNKNOWN) {
+    uint32_t source_index = 0) {
   if (!pixels || pixels > 65536 || !driver || driver > MAX_DRIVERS_PER_NODE || source_index > 1) return false;
   for (size_t i = 0; i < config.layout_count; ++i) {
     auto &row = config.layout[i];
@@ -20,9 +20,6 @@ inline bool add_default_output(matrix_config &config, const uint8_t mac[6], uint
   memcpy(row.node_mac, mac, 6); row.driver = static_cast<mesh_interop_MatrixDriver>(driver);
   row.from = 0; row.to = pixels;
   row.source_index = source_index;
-  if (kind == lighting_driver_kind::RGB_LED_MODULE)
-    snprintf(row.name, sizeof(row.name), "RGB LED %u · driver %u", unsigned(source_index + 1), unsigned(driver));
-  else snprintf(row.name, sizeof(row.name), "LED strip · driver %u", unsigned(driver));
   return true;
 }
 
@@ -33,7 +30,7 @@ inline heap_object<matrix_config> make_default_config(const uint8_t mac[6], driv
   for (uint32_t id = 1; id <= MAX_DRIVERS_PER_NODE; ++id) {
     const auto *driver = resolve(id);
     if (driver) for (uint32_t source = 0; source < driver->get_layout_source_count(); ++source)
-      add_default_output(*config, mac, id, driver->get_layout_default_pixel_count(source), source, driver->get_kind());
+      add_default_output(*config, mac, id, driver->get_layout_default_pixel_count(source), source);
   }
   if (!config->layout_count) return nullptr;
   config->effects_count = 1;

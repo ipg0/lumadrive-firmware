@@ -38,6 +38,7 @@ constexpr uint32_t RECORD_VERSION = 0;
 // Give paired outputs time to receive the first heartbeat after a master boot.
 // Offline nodes must not prevent the rest of the installation from starting.
 constexpr uint64_t STANDBY_TIMEOUT_US = 5000000;
+constexpr uint32_t IDENTIFY_ALL_DRIVERS = UINT32_MAX;
 // Decode an editor patch directly into the replacement matrix. Keeping a
 // maximum-sized LayoutUpdate/MatrixUpdate alongside it exhausts fragmented RAM
 // even for tiny edits. Nanopb still decodes and bounds every nested message.
@@ -547,7 +548,7 @@ public:
       if (!peer.catalog_known || !mesh_interop::instance().slave_node_exists(peer.mac)) continue;
       for (size_t j = 0; j < peer.outputs_count; ++j)
         changed |= add_default_output(*next, peer.mac, peer.outputs[j].driver, peer.outputs[j].pixel_count,
-            peer.outputs[j].source_index, static_cast<lighting_driver_kind>(peer.outputs[j].driver_kind));
+            peer.outputs[j].source_index);
     }
     if (!changed || revision == UINT64_MAX || platform_validate(*next, true)) return;
     const auto bytes = encode(mesh_interop_MatrixConfig_fields, next.get());
@@ -688,6 +689,13 @@ public:
     return !layout_snapshot_bytes.empty();
   }
   void clear_identified_source() {
+    if (identify_driver == IDENTIFY_ALL_DRIVERS) {
+      for (uint32_t id = 1; id <= connected_lighting_drivers::MAX_DRIVERS; ++id) {
+        auto *driver = connected_lighting_drivers::find(id);
+        if (driver && driver->_is_ready()) { driver->clear(); driver->show(); }
+      }
+      return;
+    }
     auto *driver = connected_lighting_drivers::find(identify_driver);
     if (!driver) return;
     const auto length = driver->get_layout_pixel_count(identify_source);
@@ -695,6 +703,18 @@ public:
     view.clear(); view.show();
   }
   bool begin_identify(uint32_t driver_id, uint64_t now, uint32_t source = 0, uint32_t length = 0, bool reversed = false) {
+    if (driver_id == IDENTIFY_ALL_DRIVERS) {
+      if (source || length || reversed) return false;
+      bool found = false;
+      for (uint32_t id = 1; id <= connected_lighting_drivers::MAX_DRIVERS; ++id) {
+        auto *driver = connected_lighting_drivers::find(id);
+        found |= driver && driver->_is_ready() && driver->get_layout_source_count();
+      }
+      if (!found) return false;
+      if (identify_driver) clear_identified_source();
+      identify_driver = driver_id; identify_source = 0; identify_length = 0;
+      identify_reversed = false; identify_until = now + 3000000; return true;
+    }
     auto *driver = connected_lighting_drivers::find(driver_id);
     if (!driver || !driver->_is_ready() || source >= driver->get_layout_source_count() || !driver->get_layout_pixel_count(source)) return false;
     const auto maximum = driver->get_layout_max_pixel_count(source);
@@ -733,7 +753,8 @@ public:
       const uint32_t output_index = request.has_identify_options ? request.identify_options & 0xffu : request.output_index;
       const uint32_t length = request.has_identify_options ? (request.identify_options >> 8) & 0xfffu : 0;
       const bool reversed = request.has_identify_options && (request.identify_options & (1u << 20));
-      if (request.has_identify_options && request.identify_options >> 21) { layout_error(request.request_id, "Invalid identify options"); return; }
+      const bool all = request.has_identify_options && (request.identify_options & (1u << 21));
+      if (request.has_identify_options && (request.identify_options >> 22 || (all && (length || reversed)))) { layout_error(request.request_id, "Invalid identify options"); return; }
       if (snapshot_is_matrix || request.snapshot_id != layout_snapshot_id || output_index >= snapshot_outputs.size()) {
         layout_error(request.request_id, "Unknown output"); return;
       }
@@ -742,7 +763,7 @@ public:
         layout_error(request.request_id, "Identify length exceeds output capacity"); return;
       }
       if (!memcmp(output.node_mac, mac, 6)) {
-        if (!begin_identify(output.driver, now, output.source_index, length, reversed)) { layout_error(request.request_id, "Output is unavailable"); return; }
+        if (!begin_identify(all ? IDENTIFY_ALL_DRIVERS : uint32_t(output.driver), now, all ? 0 : output.source_index, length, reversed)) { layout_error(request.request_id, "Output is unavailable"); return; }
         mesh_interop_LayoutResponse response{}; response.request_id = request.request_id; response.complete = true;
         publish_layout(response); return;
       }
@@ -751,8 +772,8 @@ public:
         layout_error(request.request_id, "Output is offline or unavailable"); return;
       }
       identifying = {}; identifying.active = true; identifying.peer_index = index;
-      identifying.request_id = request.request_id; identifying.driver = output.driver;
-      identifying.source = output.source_index;
+      identifying.request_id = request.request_id; identifying.driver = all ? IDENTIFY_ALL_DRIVERS : uint32_t(output.driver);
+      identifying.source = all ? 0 : output.source_index;
       identifying.length = length;
       identifying.reversed = reversed;
       identifying.wire_id = esp_random(); if (!identifying.wire_id) identifying.wire_id = 1;
@@ -1546,29 +1567,40 @@ public:
       identify_driver = 0;
     }
     if (local && synchronized) {
-      auto err = local->tick(clock, true, identify_driver, identify_source);
+      auto err = local->tick(clock, identify_driver != IDENTIFY_ALL_DRIVERS, identify_driver, identify_source);
       if (err != ESP_OK && !state.error[0]) error("Animation driver failed");
     }
     if (identify_driver) {
-      auto *driver = connected_lighting_drivers::find(identify_driver);
-      if (driver) {
-        const auto capacity = driver->get_layout_pixel_count(identify_source);
-        linear_lighting_driver_view source(*driver, 0, capacity, capacity, identify_source);
+      const auto draw = [&](rgb_lighting_driver *driver, uint32_t source_index, bool all) {
+        const auto capacity = driver->get_layout_pixel_count(source_index);
+        if (!capacity) return;
+        linear_lighting_driver_view source(*driver, 0, capacity, capacity, source_index);
         source.clear();
         const uint64_t elapsed = 3000000 - (identify_until - now);
-        const uint32_t length = identify_length;
+        const uint32_t length = all ? capacity : identify_length;
         if (driver->get_kind() == lighting_driver_kind::RGB_LED_MODULE) {
-          if (elapsed / 250000 % 2 == 0) source.set_pixel(0, alpha_color(color(0, 255, 0)));
+          if (elapsed / 250000 % 2 == 0) source.set_pixel(0, alpha_color(color(0, 220, 233)));
         } else {
-          // Fill for two seconds, then hold the complete configured strip for
-          // one second. Leave any unused buffer tail off throughout the check.
-          const uint32_t filled = elapsed >= 2000000 ? length : 1 + elapsed * (length - 1) / 2000000;
+          const uint32_t filled = all ? (elapsed / 250000 % 2 == 0 ? length : 0) :
+              elapsed >= 2000000 ? length : 1 + elapsed * (length - 1) / 2000000;
           for (uint32_t position = 0; position < filled; ++position) {
-            const uint32_t physical = identify_reversed ? length - 1 - position : position;
-            source.set_pixel(physical, alpha_color(position + 1 == length && length > 1 ? color(0, 64, 255) : color(0, 255, 0)));
+            const uint32_t physical = !all && identify_reversed ? length - 1 - position : position;
+            source.set_pixel(physical, alpha_color(color(53, 101, 252)));
+          }
+          if (!all || filled) {
+            source.set_pixel(!all && identify_reversed ? length - 1 : 0, alpha_color(color(0, 220, 233)));
+            if (length > 1) source.set_pixel(!all && identify_reversed ? 0 : length - 1, alpha_color(color(222, 80, 233)));
           }
         }
         source.show();
+      };
+      if (identify_driver == IDENTIFY_ALL_DRIVERS) {
+        for (uint32_t id = 1; id <= connected_lighting_drivers::MAX_DRIVERS; ++id) {
+          auto *driver = connected_lighting_drivers::find(id);
+          if (driver && driver->_is_ready()) for (uint32_t source = 0; source < driver->get_layout_source_count(); ++source) draw(driver, source, true);
+        }
+      } else if (auto *driver = connected_lighting_drivers::find(identify_driver)) {
+        draw(driver, identify_source, false);
       }
     }
   }

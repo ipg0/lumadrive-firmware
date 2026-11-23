@@ -735,12 +735,12 @@ void test_editor_patch_decoding() {
 }
 void layout_request(service &s, uint32_t request_id, uint32_t snapshot_id = 0, uint32_t offset = 0,
                     bool identify = false, uint32_t output_index = 0, bool matrix = false, bool active = false,
-                    uint32_t count = 0, bool reversed = false) {
+                    uint32_t count = 0, bool reversed = false, bool whole_node = false) {
   mesh_interop_MatrixUpload u{}; u.which_operation = mesh_interop_MatrixUpload_layout_request_tag;
   auto &q = u.operation.layout_request; q.request_id = request_id; q.snapshot_id = snapshot_id;
   q.offset = offset; q.operation = active ? mesh_interop_LayoutRequest_Operation_READ_ACTIVE_MATRIX : matrix ? mesh_interop_LayoutRequest_Operation_READ_MATRIX : identify ? mesh_interop_LayoutRequest_Operation_IDENTIFY : mesh_interop_LayoutRequest_Operation_READ;
   q.output_index = output_index;
-  if (count || reversed) { q.has_identify_options = true; q.identify_options = output_index | (count << 8) | (uint32_t(reversed) << 20); }
+  if (count || reversed || whole_node) { q.has_identify_options = true; q.identify_options = output_index | (count << 8) | (uint32_t(reversed) << 20) | (uint32_t(whole_node) << 21); }
   const auto encoded = encode(mesh_interop_MatrixUpload_fields, &u);
   packet p{}; p.connection = 1; p.generation = matrix_service::ble_generation.load(); p.size = encoded.size();
   memcpy(p.data, encoded.data(), encoded.size()); s.handle_upload(p, fake_now);
@@ -803,14 +803,14 @@ void test_layout_editor_service() {
   layout_request(master, 20); auto response = layout_response(); const auto token = response.snapshot_id;
   layout_request(master, 21, token, 0, true, 0); response = layout_response();
   assert(response.request_id == 21 && response.complete && master.identify_driver == 1);
-  master.playback_step(fake_now); assert(output.shown.g == 255 && output.shown.r == 0);
+  master.playback_step(fake_now); assert(output.shown.g == 220 && output.shown.r == 0);
   const auto before_identify = stored;
   fake_now += 3000001; master.playback_step(fake_now);
   assert(!master.identify_driver && output.shown.r == 255 && stored == before_identify);
   // Unmapped output identification also clears itself at the deadline.
   layout_request(master, 22); response = layout_response();
   layout_request(master, 23, response.snapshot_id, 0, true, 1); master.playback_step(fake_now);
-  assert(output_secondary.shown.g == 255); fake_now += 3000001; master.playback_step(fake_now);
+  assert(output_secondary.shown.g == 220); fake_now += 3000001; master.playback_step(fake_now);
   assert(output_secondary.shown.r == 0 && output_secondary.shown.g == 0 && output_secondary.shown.b == 0);
   // Slave identify ACK loss retries without restarting the three-second window.
   master.master_step(fake_now, fake_now); bool drop = false; deliver(master, slave, drop);
@@ -820,8 +820,19 @@ void test_layout_editor_service() {
   assert(!drop && slave.identify_driver == 2); const auto deadline = slave.identify_until;
   fake_now += 100000; master.master_step(fake_now, fake_now); deliver(master, slave, drop);
   response = layout_response(); assert(response.request_id == 25 && response.complete && !master.identifying.active);
-  assert(slave.identify_until == deadline); slave.playback_step(fake_now); assert(output_secondary.shown.g == 255);
+  assert(slave.identify_until == deadline); slave.playback_step(fake_now); assert(output_secondary.shown.g == 220);
   fake_now = deadline + 1; slave.playback_step(fake_now); assert(output_secondary.shown.r == 255);
+  // Whole-node identify uses one acknowledged request and flashes every driver.
+  layout_request(master, 30); response = layout_response();
+  layout_request(master, 31, response.snapshot_id, 0, true, 3, false, false, 0, false, true);
+  master.master_step(fake_now, fake_now); deliver(master, slave, drop);
+  assert(layout_response().complete && slave.identify_driver == matrix_service::IDENTIFY_ALL_DRIVERS);
+  slave.playback_step(fake_now);
+  assert(output.shown.g == 220 && output_secondary.shown.g == 220);
+  fake_now += 250000; slave.playback_step(fake_now);
+  assert(output.shown.g == 0 && output_secondary.shown.g == 0);
+  fake_now += 3000000; slave.playback_step(fake_now);
+  assert(!slave.identify_driver);
   // Tokens cannot cross a BLE disconnection, and expired snapshots are explicit errors.
   layout_request(master, 26); response = layout_response(); matrix_service::disconnect(1);
   layout_request(master, 27, response.snapshot_id, 320); response = layout_response(); assert(response.error[0]);
@@ -926,6 +937,7 @@ void test_preconfigured_rainbow_and_current_read() {
   auto current = std::make_unique<matrix_config>();
   assert(decode(mesh_interop_MatrixConfig_fields, current.get(), running->config.bytes, running->config.size));
   assert(current->factory_default && current->effects[0].kind == mesh_interop_MatrixEffect_Kind_RAINBOW);
+  for (size_t i = 0; i < current->layout_count; ++i) assert(current->layout[i].name[0] == '\0');
   auto snapshot = slave.local->snapshot(slave.local->definitions(), 0, 0);
   assert(snapshot.states_count == 1 && snapshot.states[0].started_at_us == 0);
   const auto old_revision = master.revision;
@@ -1103,7 +1115,7 @@ void test_six_driver_inventory_and_independent_remote_leds() {
   assert(index < master.snapshot_outputs.size());
   layout_request(master, 904, token, 0, true, index); cycles(master, slave, 10);
   assert(slave.identify_driver == 6 && slave.identify_source == 1 && layout_response().complete);
-  assert(six_outputs[5].shown[1].g == 255 && six_outputs[5].shown[1].r == 0);
+  assert(six_outputs[5].shown[1].g == 220 && six_outputs[5].shown[1].r == 0);
   network.clear(); slave.send_inventory(master_mac);
   assert(network.size() == 2 && network.front().bytes.size() == w::HEADER_SIZE + 101);
   assert(network.back().bytes.size() == w::HEADER_SIZE + 102 + strlen(fake_app_description.version));
@@ -1150,16 +1162,16 @@ void test_configurable_strip_and_identify_preview() {
   assert(slave.identify_length == 8 && slave.identify_reversed);
   const auto start = slave.identify_until - 3000000;
   fake_now = start; slave.playback_step(fake_now);
-  assert(growing_output.shown[7].g == 255 && growing_output.shown[0].g == 0 && growing_output.shown[11].r == 0);
+  assert(growing_output.shown[7].g == 220 && growing_output.shown[0].r == 222 && growing_output.shown[11].r == 0);
   fake_now = start + 1000000; slave.playback_step(fake_now);
-  for (size_t i = 4; i < 8; ++i) assert(growing_output.shown[i].g == 255);
-  assert(growing_output.shown[3].g == 0 && growing_output.shown[0].b == 0);
+  for (size_t i = 4; i < 7; ++i) assert(growing_output.shown[i].g == 101);
+  assert(growing_output.shown[3].g == 0 && growing_output.shown[0].r == 222);
   fake_now = start + 1999999; slave.playback_step(fake_now);
-  assert(growing_output.shown[1].g == 255 && growing_output.shown[0].b == 0);
+  assert(growing_output.shown[1].g == 101 && growing_output.shown[0].r == 222);
   for (uint64_t elapsed : {2000000, 2500000, 2999999}) {
     fake_now = start + elapsed; slave.playback_step(fake_now);
-    assert(growing_output.shown[0].b == 255);
-    for (size_t i = 1; i < 8; ++i) assert(growing_output.shown[i].g == 255);
+    assert(growing_output.shown[0].r == 222 && growing_output.shown[7].g == 220);
+    for (size_t i = 1; i < 7; ++i) assert(growing_output.shown[i].g == 101);
     for (size_t i = 8; i < 12; ++i) assert(growing_output.shown[i].r == 0 && growing_output.shown[i].g == 0 && growing_output.shown[i].b == 0);
   }
   fake_now = start + 3000001; slave.playback_step(fake_now);
@@ -1167,10 +1179,11 @@ void test_configurable_strip_and_identify_preview() {
   assert(slave.begin_identify(1, fake_now, 0, 6, false));
   const auto forward_start = fake_now;
   fake_now += 1000000; slave.playback_step(fake_now);
-  for (size_t i = 0; i < 3; ++i) assert(growing_output.shown[i].g == 255);
-  assert(growing_output.shown[3].g == 0 && growing_output.shown[5].b == 0);
+  assert(growing_output.shown[0].g == 220);
+  for (size_t i = 1; i < 3; ++i) assert(growing_output.shown[i].g == 101);
+  assert(growing_output.shown[3].g == 0 && growing_output.shown[5].r == 222);
   fake_now = forward_start + 2500000; slave.playback_step(fake_now);
-  assert(growing_output.shown[0].g == 255 && growing_output.shown[5].b == 255 && growing_output.shown[6].r == 0);
+  assert(growing_output.shown[0].g == 220 && growing_output.shown[5].r == 222 && growing_output.shown[6].r == 0);
   fake_now = forward_start + 3000001; slave.playback_step(fake_now);
   assert(!slave.identify_driver && growing_output.shown[11].r == 255);
   const auto before = stored;

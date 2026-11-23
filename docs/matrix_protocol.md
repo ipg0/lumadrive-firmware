@@ -114,10 +114,12 @@ belong to one BLE connection generation and expire after five idle seconds.
 IDENTIFY uses the snapshot token and output index and replies after the node
 acknowledges starting a three-second temporary overlay. Optional `identify_options`
 packs output index (bits 0–7), draft LED count (bits 8–19, zero means current
-capacity), and reversal (bit 20) into a fixed32. Bits 21–31 must be zero. Omitting
+capacity), reversal (bit 20), and whole-node identification (bit 21) into a fixed32.
+Whole-node requests require zero length and no reversal; bits 22–31 must be zero. Omitting
 `output_index` with this option keeps even the largest request within a 20-byte
 envelope for ATT MTU 23. A strip fills over two seconds and holds fully lit for
-one second, with a blue end pixel; an individual RGB module LED pulses green.
+one second, with cyan and magenta end markers; an individual RGB module LED pulses cyan.
+Whole-node identification flashes all local outputs together.
 
 `MatrixUpload.layout_begin` uses the existing begin/chunk/commit framing, but its
 payload is `LayoutUpdate`: expected revision, master session, and replacement
@@ -177,7 +179,7 @@ their formats. Types and bodies are:
 | 10 GPIO event ACK | session u64, revision u64, GPIO stream u64, sequence u32, result u8 (0 accepted/discarded, 1 rejected) |
 | 11 inventory request | session u64 |
 | 12 inventory | session u64, physical driver count u8 (0–6), repeated slot ID u32, initial pixel count u32, ready u8, kind u8 (1 strip, 2 RGB module), maximum source pixel count u32, GPIO capability mask u64; extended frame appends version length u8 and up to 31 ASCII bytes |
-| 13 identify | session u64, request ID u32, driver slot ID u32, source index u32, draft pixel count u32, reversed u8 (0 or 1) |
+| 13 identify | session u64, request ID u32, driver slot ID u32 (`0xffffffff` for all), source index u32, draft pixel count u32, reversed u8 (0 or 1) |
 | 14 identify ACK | session u64, request ID u32, result u8 (0 OK, 1 unavailable) |
 
 All fixed-width integers are little-endian. Transfers use stop-and-wait ACKs,

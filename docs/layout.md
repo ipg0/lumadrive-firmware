@@ -104,11 +104,11 @@ they have no reversal control. Identifying one LED leaves its sibling playing.
 Overlapping bars intentionally share canvas colors. Zoom controls help place
 short modules beside longer strips.
 
-**Identify** fills green from the configured start over two seconds, then holds
-the complete strip lit for one second, with the final pixel blue.
+**Identify** fills blue from the configured start over two seconds, then holds
+the complete strip lit for one second. Cyan and magenta mark the start and end.
 It previews the draft LED count and direction without
 saving; unconfigured trailing pixels stay off during the test. An individual
-RGB LED pulses green instead. Playback continues advancing underneath and
+RGB LED pulses cyan instead. Playback continues advancing underneath and
 resumes at its current phase. Identification also works before placing an output
 by first adding it to the local draft; Apply is not required.
 
