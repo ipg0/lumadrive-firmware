@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd -- "$(git rev-parse --show-toplevel)"
+files=()
+while IFS= read -r -d '' file; do
+  case "$file" in
+    src/*|include/*|lib/*|test/*|provisioning/*)
+      case "$file" in
+        *.pb.c|*.pb.h|*.pb.cc|*.pb.cpp) ;;
+        *.c|*.cc|*.cpp|*.h|*.hpp) files+=("$file") ;;
+      esac ;;
+  esac
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+if ((${#files[@]} == 0)); then exit 0; fi
+if ! command -v clang-format >/dev/null 2>&1; then
+  printf 'pre-commit: clang-format is required for staged firmware sources.\n' >&2
+  exit 1
+fi
+
+for file in "${files[@]}"; do
+  entry=$(git ls-files --stage -- "$file")
+  mode=${entry:0:6}
+  [[ $mode == 100644 || $mode == 100755 ]] || continue
+  original=$(git rev-parse --verify ":$file")
+  clean=true
+  git diff --quiet --no-ext-diff -- "$file" || clean=false
+  formatted=$(git show ":$file" | clang-format --style=file --assume-filename="$file" | git hash-object -w --stdin)
+  if [[ $formatted != "$original" ]]; then
+    git update-index --cacheinfo "$mode,$formatted,$file"
+    if $clean; then
+      git checkout-index --force -- "$file"
+    else
+      printf 'pre-commit: formatted staged %s; unstaged edits were left untouched.\n' "$file" >&2
+    fi
+    printf 'pre-commit: formatted %s\n' "$file"
+  fi
+done

@@ -78,6 +78,7 @@ defaults to 1000 ms; explicit periods must be at least 2 ms. Rendering runs at
 | Type | Parameters and behavior |
 | --- | --- |
 | `STATIC_COLOR` | Hold the primary RGBA color. |
+| `DIMMING` | Blend black over lower-priority lighting. Alpha sets the dimming amount: 0% leaves it unchanged and 100% turns it black. Use a transparent entry background to retain lower layers. |
 | `BLINK` | Primary color on first, then transparent. `duty_percent` is the on fraction, 1–100; zero defaults to 50. |
 | `BREATHE` | Smoothly vary primary alpha from zero to its configured value and back, peaking halfway through `period_ms`. |
 | `FLOWING_GRADIENT` | Move 2–8 RGBA stops from `gradient_colors` along canvas indices, equally spaced and wrapping last → first. `wavelength_pixels: 0` fits one cycle to the full canvas; a positive value sets its spatial length. `reverse: true` flows toward decreasing indices. |

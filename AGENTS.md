@@ -24,7 +24,9 @@ The build uses size optimization (`-Os`) and a custom 2 MiB `partitions.csv`: tw
 
 ## Coding Style & Naming Conventions
 
-Use two-space indentation, opening braces on the declaration line, `.hpp` headers with `#pragma once`, and `.cpp` implementations. Project-owned C++ classes, type aliases, functions, variables, and template parameters use lowercase `snake_case`. Constants, enum values, and macros use `UPPER_SNAKE_CASE`. Private members may start with `_`. Preserve identifiers defined by generated code, ESP-IDF, FreeRTOS, and other external APIs. No repository formatter or linter configuration is present; avoid unrelated reformatting.
+Use two-space indentation, opening braces on the declaration line, `.hpp` headers with `#pragma once`, and `.cpp` implementations. Project-owned C++ classes, type aliases, functions, variables, and template parameters use lowercase `snake_case`. Constants, enum values, and macros use `UPPER_SNAKE_CASE`. Private members may start with `_`. Preserve identifiers defined by generated code, ESP-IDF, FreeRTOS, and other external APIs. Use `clang-format` with `.clang-format`; avoid unrelated reformatting.
+
+Install the staged-source formatter with `git config --local core.hooksPath .githooks`. The hook formats staged C/C++ files, excludes generated code, and requires `clang-format`. Partially staged files are formatted in the index only; unstaged edits are left untouched.
 
 ## Testing Guidelines
 
