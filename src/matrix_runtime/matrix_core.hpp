@@ -122,6 +122,8 @@ public:
   bool prepare(const runtime_config& config, const uint8_t* node_mac, uint64_t session,
                uint64_t revision);
   bool prepare(const player& source);
+  // Prepare a single temporary layer against an existing node's layout.
+  bool prepare_preview(const playback_definitions& layout, const matrix_effect& effect);
   bool enqueue(const animation_command& command);
   bool restore(const animation_snapshot& snapshot);
   animation_snapshot snapshot(const playback_definitions& subset, uint32_t sequence,

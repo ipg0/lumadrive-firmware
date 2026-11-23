@@ -182,6 +182,32 @@ void cycles(service& master, service& slave, unsigned count, bool drop_one = fal
     slave.playback_step(fake_now);
   }
 }
+void test_animation_preview_distribution() {
+  service master, slave;
+  configure_node(master, true);
+  configure_node(slave, false);
+  auto config = fixture();
+  config.effects[0].duration_ms = 0;
+  config.sources[0].kind = mesh_interop_MatrixSource_Kind_DEFAULT_STATE;
+  config.effects_count = 2;
+  config.effects[1] = config.effects[0];
+  config.effects[1].id = 7;
+  config.effects[1].red = 0;
+  config.effects[1].blue = 255;
+  upload(master, config, 701);
+  cycles(master, slave, 250);
+  assert(master.peers[0].ready && slave.local);
+  const auto saved = stored;
+  const auto revision = master.revision;
+  assert(master.begin_animation_preview(7, fake_now));
+  cycles(master, slave, 150);
+  assert(slave.preview_player && output.shown.b == 255 && output.shown.r == 0);
+  assert(master.peers[0].ready && master.revision == revision && stored == saved);
+  cycles(master, slave, 1000);
+  assert(!slave.preview_player && output.shown.r == 255 && output.shown.b == 0);
+  assert(master.peers[0].ready && master.revision == revision && stored == saved);
+  network.clear();
+}
 void test_deploy_recover_persist() {
   service master, slave;
   configure_node(master, true);
@@ -1953,6 +1979,7 @@ void test_missing_provisioning_reports_error() {
 int main() {
   matrix_core_tests_main();
   matrix_service::gpio_queue = xQueueCreate(64, sizeof(matrix_service::gpio_event));
+  test_animation_preview_distribution();
   test_deploy_recover_persist();
   test_old_matrix_evaluates_until_shared_boundary();
   test_command_retry_gap_and_snapshot_overflow();

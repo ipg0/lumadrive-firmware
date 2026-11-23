@@ -323,6 +323,7 @@ struct peer {
   bool definitions = false, ready = false, snapshotting = false;
   bool replacement_prepared = false;
   bool attempted = false;
+  bool preview_attempted = false;
   uint32_t sequence = 0;
   unsigned retries = 0;
   std::deque<animation_command> commands;
@@ -403,6 +404,10 @@ public:
   heap_object<runtime_config> config, candidate;
   heap_object<runtime_config> retiring_config;
   heap_object<player> ledger, local, pending_player;
+  heap_object<player> preview_player;
+  uint64_t preview_start = 0, preview_end = 0;
+  std::vector<uint8_t> preview_bytes;
+  bool preview_distributing = false;
   heap_object<player> prepared_ledger, prepared_local;
   heap_object<player> retiring_ledger;
   heap_object<animation_snapshot> pending_snapshot;
@@ -791,6 +796,9 @@ public:
     start_deployment(std::move(next));
   }
   void start_deployment(heap_object<runtime_config> compact) {
+    preview_player.reset();
+    preview_distributing = false;
+    preview_bytes.clear();
     candidate = std::move(compact);
     deployment = true;
     state.stage = STAGE_DISTRIBUTING;
@@ -1042,12 +1050,87 @@ public:
     identify_until = now + 3000000;
     return true;
   }
+  bool prepare_preview(const mesh_interop_AnimationPreview& message) {
+    if (!local || !message.has_effect || message.master_session != session ||
+        message.revision != local->definitions().revision ||
+        message.end_at_us <= message.start_at_us ||
+        message.end_at_us - message.start_at_us > 10000000 ||
+        !local->definitions().output_mappings_count)
+      return false;
+    auto player = make_heap_object<matrix::player>(connected_lighting_drivers::find);
+    if (!player || !player->prepare_preview(local->definitions(), message.effect))
+      return false;
+    animation_command command{};
+    command.master_session = session;
+    command.revision = message.revision;
+    command.entry_id = 1;
+    command.effective_at_us = message.start_at_us;
+    if (!player->enqueue(command))
+      return false;
+    preview_start = message.start_at_us;
+    preview_end = message.end_at_us;
+    preview_player = std::move(player);
+    return true;
+  }
+  bool begin_animation_preview(uint32_t effect_id, uint64_t clock) {
+    if (!config || !local || deployment || pending_snapshot || tx.peer_index >= 0 || !effect_id)
+      return false;
+    const auto it = std::find_if(config->effects.begin(), config->effects.end(),
+                                 [&](const auto& effect) { return effect.id == effect_id; });
+    if (it == config->effects.end())
+      return false;
+    bool has_output = local->definitions().output_mappings_count != 0;
+    for (size_t i = 0; i < peer_count; ++i)
+      if (peers[i].ready && available(peers[i], esp_timer_get_time())) {
+        has_output |=
+            std::any_of(config->layout.begin(), config->layout.end(),
+                        [&](const auto& row) { return !memcmp(row.node_mac, peers[i].mac, 6); });
+      }
+    if (!has_output)
+      return false;
+    auto message = make_heap_object<mesh_interop_AnimationPreview>();
+    if (!message)
+      return false;
+    message->master_session = session;
+    message->revision = revision;
+    message->start_at_us = clock + 500000 + peer_count * 500000;
+    const uint64_t duration =
+        it->duration_ms ? std::min<uint64_t>(it->duration_ms * 1000ULL, 10000000) : 10000000;
+    message->end_at_us = message->start_at_us + duration;
+    message->has_effect = true;
+    message->effect = *it;
+    auto bytes = encode(mesh_interop_AnimationPreview_fields, message.get());
+    if (bytes.empty())
+      return false;
+    if (local->definitions().output_mappings_count && !prepare_preview(*message))
+      return false;
+    preview_start = message->start_at_us;
+    preview_end = message->end_at_us;
+    preview_bytes = std::move(bytes);
+    preview_distributing = true;
+    for (auto& peer : peers)
+      peer.preview_attempted = false;
+    return true;
+  }
   void handle_layout_request(const packet& packet, const mesh_interop_LayoutRequest& request,
                              uint64_t now) {
     if (!request.request_id)
       return;
     std::underlying_type_t<mesh_interop_LayoutRequest_Operation> operation;
     memcpy(&operation, &request.operation, sizeof(operation));
+    if (operation == mesh_interop_LayoutRequest_Operation_PREVIEW) {
+      if (!request.has_identify_options ||
+          !begin_animation_preview(request.identify_options,
+                                   uint64_t(master_clock_manager::instance().get_master_time()))) {
+        layout_error(request.request_id, "Unable to start animation preview");
+        return;
+      }
+      mesh_interop_LayoutResponse response{};
+      response.request_id = request.request_id;
+      response.complete = true;
+      publish_layout(response);
+      return;
+    }
     const bool active_read = operation == mesh_interop_LayoutRequest_Operation_READ_ACTIVE_MATRIX;
     const bool matrix_read =
         operation == mesh_interop_LayoutRequest_Operation_READ_MATRIX || active_read;
@@ -1167,7 +1250,8 @@ public:
     if (u.which_operation == mesh_interop_MatrixUpload_begin_tag ||
         u.which_operation == mesh_interop_MatrixUpload_layout_begin_tag ||
         u.which_operation == mesh_interop_MatrixUpload_matrix_begin_tag) {
-      if (deployment || pending_snapshot) {
+      if (deployment || pending_snapshot || preview_distributing ||
+          (tx.peer_index >= 0 && tx.kind == 3)) {
         error("Another deployment is in progress", true);
         return;
       }
@@ -1309,6 +1393,12 @@ public:
       return;
     auto& p = peers[tx.peer_index];
     if (tx.retries++ >= 4 || tx.bytes.empty()) {
+      if (tx.kind == 3) {
+        p.preview_attempted = true;
+        tx = outbound{};
+        error("Node preview transfer timed out");
+        return;
+      }
       p.ready = false;
       p.snapshotting = false;
       p.attempted = true;
@@ -1340,6 +1430,12 @@ public:
       return;
     auto& p = peers[index];
     if (b[9] != 0) {
+      if (tx.kind == 3) {
+        p.preview_attempted = true;
+        tx = outbound{};
+        error("Node rejected animation preview");
+        return;
+      }
       p.ready = false;
       p.snapshotting = false;
       p.attempted = true;
@@ -1363,6 +1459,11 @@ public:
       tx.offset = offset;
       tx.phase = offset == tx.bytes.size() ? 2 : 1;
     } else {
+      if (tx.kind == 3) {
+        p.preview_attempted = true;
+        tx = outbound{};
+        return;
+      }
       if (deployment && tx.kind == 1)
         p.replacement_prepared = true;
       else
@@ -1388,6 +1489,16 @@ public:
     send(dest, w::ACK, b);
   }
   bool install_received() {
+    if (inbound_kind == 3) {
+      auto message = make_heap_object<mesh_interop_AnimationPreview>();
+      if (!message ||
+          !decode(mesh_interop_AnimationPreview_fields, message.get(), radio_rx.bytes().data(),
+                  radio_rx.bytes().size()) ||
+          message->revision != inbound_revision ||
+          message->end_at_us <= uint64_t(master_clock_manager::instance().get_master_time()))
+        return false;
+      return prepare_preview(*message);
+    }
     if (inbound_kind == 1) {
       auto d = make_heap_object<animation_definitions>();
       if (!d ||
@@ -1772,7 +1883,7 @@ public:
       gpio_retries = 0;
     } else if (type == w::BEGIN && n == 29) {
       const auto id = uint32_t(w::get(b, 4));
-      bool ok = (b[4] == 1 || b[4] == 2) && w::get(b + 21, 8) == session;
+      bool ok = (b[4] == 1 || b[4] == 2 || b[4] == 3) && w::get(b + 21, 8) == session;
       if (radio_rx.id() == id && (inbound_kind != b[4] || inbound_revision != w::get(b + 13, 8)))
         ok = false;
       if (local && w::get(b + 13, 8) < local->definitions().revision)
@@ -2058,6 +2169,27 @@ public:
       }
     }
     extend_default_layout();
+    if (preview_distributing && tx.peer_index < 0) {
+      bool started = false;
+      for (size_t i = 0; i < peer_count; ++i) {
+        auto& peer = peers[i];
+        if (peer.preview_attempted || !peer.ready || !available(peer, now))
+          continue;
+        const bool mapped =
+            std::any_of(config->layout.begin(), config->layout.end(),
+                        [&](const auto& row) { return !memcmp(row.node_mac, peer.mac, 6); });
+        peer.preview_attempted = true;
+        if (!mapped)
+          continue;
+        begin_transfer(i, 3, preview_bytes);
+        started = true;
+        break;
+      }
+      if (!started) {
+        preview_distributing = false;
+        preview_bytes.clear();
+      }
+    }
     if (deployment && tx.peer_index < 0) {
       bool started = false;
       for (size_t i = 0; i < peer_count; ++i) {
@@ -2183,6 +2315,7 @@ public:
     }
   }
   void reset_slave_playback() {
+    preview_player.reset();
     for (uint32_t id = 1; id <= connected_lighting_drivers::MAX_DRIVERS; ++id) {
       auto* driver = connected_lighting_drivers::find(id);
       if (driver && driver->_is_ready()) {
@@ -2276,6 +2409,7 @@ public:
     }
     const auto observed = clock.session();
     if (session != observed) {
+      preview_player.reset();
       if (local)
         local->blank();
       session = observed;
@@ -2457,12 +2591,19 @@ public:
       }
       identify_driver = 0;
     }
+    if (preview_player && (clock >= preview_end || !local ||
+                           local->definitions().revision != preview_player->definitions().revision))
+      preview_player.reset();
+    const bool previewing = preview_player && clock >= preview_start && clock < preview_end;
     if (local && synchronized) {
-      auto err = local->tick(clock, identify_driver != IDENTIFY_ALL_DRIVERS, identify_driver,
-                             identify_source);
+      auto err = local->tick(clock, !previewing && identify_driver != IDENTIFY_ALL_DRIVERS,
+                             identify_driver, identify_source);
       if (err != ESP_OK && !state.error[0])
         error("Animation driver failed");
     }
+    if (previewing && synchronized)
+      preview_player->tick(clock, identify_driver != IDENTIFY_ALL_DRIVERS, identify_driver,
+                           identify_source);
     if (identify_driver) {
       const auto draw = [&](rgb_lighting_driver* driver, uint32_t source_index, bool all) {
         const auto capacity = driver->get_layout_pixel_count(source_index);

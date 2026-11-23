@@ -698,6 +698,15 @@ bool player::prepare(const animation_definitions& d) {
   }
   return prepare(playback_definitions(d), effects);
 }
+bool player::prepare_preview(const playback_definitions& layout, const matrix_effect& effect) {
+  auto preview = layout;
+  preview.layers_count = 1;
+  preview.layers[0] = {1, 0, 0, false};
+  preview.gpio_inputs_count = 0;
+  std::array<const matrix_effect*, 32> effects{};
+  effects[0] = &effect;
+  return prepare(preview, effects);
+}
 bool player::prepare(const matrix_config& c, const uint8_t* mac, uint64_t session, uint64_t rev) {
   if (c.schema_version != SCHEMA_VERSION || c.entries_count > 32 || c.sources_count > 32 ||
       c.effects_count > 32 || c.layout_count > MAX_LAYOUT_SOURCES)

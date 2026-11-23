@@ -197,6 +197,15 @@ the app also persists its last actual device-reported lengths. Identify uses
 without extending the overlay. Only the configured, synchronized master may
 request inventory or identification on a slave.
 
+## Animation preview
+
+The app saves the edited animation, then sends a `LayoutRequest.PREVIEW` with
+its effect ID in `identify_options`. The controller prepares a separate player
+on the current layout and sends the effect to ready nodes using chunked transfer
+kind 3. Playback uses a shared future clock timestamp and does not change matrix
+entries or persist a preview state. After at most ten seconds, normal playback
+resumes. Nodes that are offline or cannot prepare the preview are skipped.
+
 ## Slave GPIO reporting
 
 GPIO state conditions reference a provisioned input on the controller or a node

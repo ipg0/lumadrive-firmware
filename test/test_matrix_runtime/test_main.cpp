@@ -475,6 +475,26 @@ void test_gpio_state_condition() {
   rules.tick(900, nullptr, 0, 900, sink, &commands);
   assert(commands.empty());
 }
+void test_preview_player() {
+  auto config = fixture();
+  config.effects[0].duration_ms = 0;
+  player normal(resolve), preview(resolve);
+  assert(normal.prepare(config, slave_mac, 10, 20));
+  assert(normal.enqueue(start()));
+  normal.tick(100000);
+  assert(output.shown.r == 255);
+  auto effect = config.effects[0];
+  effect.red = 0;
+  effect.blue = 255;
+  assert(preview.prepare_preview(normal.definitions(), effect));
+  auto command = start(200000);
+  command.entry_id = 1;
+  assert(preview.enqueue(command));
+  preview.tick(200000);
+  assert(output.shown.b == 255 && output.shown.r == 0);
+  normal.tick(210000);
+  assert(output.shown.r == 255 && output.shown.b == 0);
+}
 void test_layering() {
   auto config = fixture();
   auto d = definitions_for(config, slave_mac, 10, 20);
@@ -1272,6 +1292,7 @@ int main() {
   test_scheduled_player();
   test_master_evaluation_and_recovery();
   test_layering();
+  test_preview_player();
   test_dimming();
   test_entry_background_opacity();
   test_modes();
