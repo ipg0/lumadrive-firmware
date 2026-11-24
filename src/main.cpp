@@ -6,6 +6,8 @@
 #include "mesh_interop/packet_router.hpp"
 #include "matrix_runtime/matrix_service.hpp"
 #include "hardware_config/hardware_config.hpp"
+#include "ota_update/ota_update.hpp"
+#include "ota_update/mesh_ota.hpp"
 #include <esp_err.h>
 #include <esp_log.h>
 
@@ -22,6 +24,9 @@ void app_main() {
   }
   global_config::instance();
   master_clock_manager::instance();
+  ESP_ERROR_CHECK(ota_update::init());
+  ESP_ERROR_CHECK(mesh_ota::init());
+  ESP_ERROR_CHECK(mesh_packet_router().add(mesh_ota::receive) ? ESP_OK : ESP_ERR_NO_MEM);
   ESP_ERROR_CHECK(mesh_packet_router().add(matrix_service::receive) ? ESP_OK : ESP_ERR_NO_MEM);
   mesh_interop::instance();
   ESP_ERROR_CHECK(matrix_service::init());
