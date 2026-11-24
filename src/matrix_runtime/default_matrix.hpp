@@ -6,7 +6,7 @@
 #include <new>
 
 namespace matrix {
-inline bool add_default_output(matrix_config& config, const uint8_t mac[6], uint32_t driver,
+inline bool add_default_output(runtime_config& config, const uint8_t mac[6], uint32_t driver,
                                uint32_t pixels, uint32_t source_index = 0) {
   if (!pixels || pixels > 65536 || !driver || driver > MAX_DRIVERS_PER_NODE || source_index > 1)
     return false;
@@ -22,8 +22,9 @@ inline bool add_default_output(matrix_config& config, const uint8_t mac[6], uint
   }
   if (config.layout_count >= MAX_LAYOUT_SOURCES)
     return false;
-  auto& row = config.layout[config.layout_count++];
-  row = {};
+  config.layout.emplace_back();
+  config.layout_count = config.layout.size();
+  auto& row = config.layout.back();
   memcpy(row.node_mac, mac, 6);
   row.driver = static_cast<mesh_interop_MatrixDriver>(driver);
   row.from = 0;
@@ -32,9 +33,9 @@ inline bool add_default_output(matrix_config& config, const uint8_t mac[6], uint
   return true;
 }
 
-inline heap_object<matrix_config> make_default_config(const uint8_t mac[6],
-                                                      driver_resolver resolve) {
-  auto config = make_heap_object<matrix_config>();
+inline heap_object<runtime_config> make_default_config(const uint8_t mac[6],
+                                                       driver_resolver resolve) {
+  auto config = make_heap_object<runtime_config>();
   if (!config)
     return nullptr;
   config->schema_version = SCHEMA_VERSION;
@@ -48,6 +49,7 @@ inline heap_object<matrix_config> make_default_config(const uint8_t mac[6],
   }
   if (!config->layout_count)
     return nullptr;
+  config->effects.emplace_back();
   config->effects_count = 1;
   auto& effect = config->effects[0];
   effect.id = 1;
@@ -55,16 +57,21 @@ inline heap_object<matrix_config> make_default_config(const uint8_t mac[6],
   effect.red = effect.green = effect.blue = effect.alpha = 255;
   effect.period_ms = 8000;
   snprintf(effect.name, sizeof(effect.name), "Rainbow");
+  config->sources.emplace_back();
   config->sources_count = 1;
   config->sources[0].id = 1;
   config->sources[0].kind = mesh_interop_MatrixSource_Kind_DEFAULT_STATE;
+  config->conditions.emplace_back();
   config->conditions_count = 1;
   config->conditions[0] = {1,    mesh_interop_MatrixCondition_Kind_ALWAYS, 0, false, 0, 0, {}, 0,
                            false};
+  config->entries.emplace_back();
   config->entries_count = 1;
   auto& entry = config->entries[0];
   entry.id = entry.effect_id = entry.source_id = entry.condition_id = 1;
   snprintf(entry.name, sizeof(entry.name), "Default rainbow");
+  if (!config->reencode())
+    return nullptr;
   return config;
 }
 } // namespace matrix

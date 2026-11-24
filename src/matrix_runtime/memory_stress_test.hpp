@@ -19,7 +19,8 @@ inline void memory_test_report(const char* stage) {
 }
 
 inline bool run_memory_stress_test(const runtime_config* active, const uint8_t* node_mac,
-                                   driver_resolver resolver) {
+                                   driver_resolver resolver,
+                                   bool (*decode_config)(const uint8_t*, size_t, runtime_config&)) {
   memory_test_report("baseline");
   if (!active || active->encoded().empty()) {
     ESP_LOGE("memory_test", "FAIL: no active encoded configuration to test");
@@ -46,7 +47,7 @@ inline bool run_memory_stress_test(const runtime_config* active, const uint8_t* 
     return false;
   }
   memory_test_report("saved record staged");
-  auto decoded = make_heap_object<matrix_config>();
+  auto decoded = make_heap_object<runtime_config>();
   bool restore_ok = false;
   if (!decoded) {
     ESP_LOGE("memory_test", "FAIL: decoded matrix allocation");
@@ -54,8 +55,7 @@ inline bool run_memory_stress_test(const runtime_config* active, const uint8_t* 
   } else {
     const auto& bytes = active->encoded();
     memcpy(record.get(), bytes.data(), bytes.size());
-    restore_ok =
-        decode(mesh_interop_MatrixConfig_fields, decoded.get(), record.get(), bytes.size());
+    restore_ok = decode_config(record.get(), bytes.size(), *decoded) && decoded->reencode();
     if (!restore_ok)
       ESP_LOGE("memory_test", "FAIL: matrix protobuf decode");
     else

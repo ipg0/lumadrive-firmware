@@ -29,6 +29,7 @@
 #include <freertos/task.h>
 #include <nvs.h>
 #include <pb_decode.h>
+#include <pb_encode.h>
 #ifdef ESP_PLATFORM
 #include <esp_heap_caps.h>
 #endif
@@ -222,10 +223,10 @@ bool decode_compact_editor_update(const std::vector<uint8_t>& bytes, bool layout
   config.signals_count = config.signals.size();
   return true;
 }
-bool decode_compact_config(const std::vector<uint8_t>& bytes, runtime_config& config) {
-  if (bytes.size() > MAX_BYTES)
+bool decode_compact_config(const uint8_t* bytes, size_t size, runtime_config& config) {
+  if (size > MAX_BYTES)
     return false;
-  auto stream = pb_istream_from_buffer(bytes.data(), bytes.size());
+  auto stream = pb_istream_from_buffer(bytes, size);
   while (stream.bytes_left) {
     pb_wire_type_t wire;
     uint32_t tag;
@@ -293,6 +294,9 @@ bool decode_compact_config(const std::vector<uint8_t>& bytes, runtime_config& co
   config.modes_count = config.modes.size();
   config.signals_count = config.signals.size();
   return true;
+}
+bool decode_compact_config(const std::vector<uint8_t>& bytes, runtime_config& config) {
+  return decode_compact_config(bytes.data(), bytes.size(), config);
 }
 constexpr auto STAGE_RECEIVING = mesh_interop_MatrixStatus_Stage_RECEIVING;
 constexpr auto STAGE_FAILED = mesh_interop_MatrixStatus_Stage_FAILED;
@@ -910,13 +914,19 @@ public:
       ESP_LOGW("matrix", "Discarding obsolete development matrix record");
       return false;
     }
-    auto c = make_heap_object<matrix_config>();
-    if (!c || !decode(mesh_interop_MatrixConfig_fields, c.get(), record.data() + 24, size - 24) ||
-        platform_validate(*c, false) || !prepare_gpio(*c)) {
+    auto c = make_heap_object<runtime_config>();
+    if (!c || !decode_compact_config(record.data() + 24, size - 24, *c) ||
+        platform_validate(*c, false) ||
+        !prepare_gpio(playback_definitions(*c, mac, session, revision))) {
       error("Saved matrix cannot be restored", true);
       return true;
     }
     revision = w::get(record.data() + 8, 8);
+    std::vector<uint8_t>().swap(record);
+    if (!c->reencode()) {
+      error("Unable to encode saved matrix", true);
+      return true;
+    }
     if (!prepare_runtime(*c, revision)) {
       error("Unable to prepare saved matrix", true);
       return true;
@@ -941,8 +951,7 @@ public:
       error("Unable to prepare default matrix", true);
       return;
     }
-    const auto bytes = encode(mesh_interop_MatrixConfig_fields, c.get());
-    configuration_persisted = !bytes.empty() && save(bytes, 1);
+    configuration_persisted = !c->encoded().empty() && save(c->encoded(), 1);
     if (!configuration_persisted)
       error("Default matrix is active in RAM; NVS save failed");
     revision = 1;
@@ -953,7 +962,7 @@ public:
         pending_snapshot || ble_rx.id())
       return;
     default_layout_dirty = false;
-    auto next = config->to_wire();
+    auto next = make_heap_object<runtime_config>(*config);
     if (!next)
       return;
     bool changed = false;
@@ -967,10 +976,9 @@ public:
     }
     if (!changed || revision == UINT64_MAX || platform_validate(*next, true))
       return;
-    const auto bytes = encode(mesh_interop_MatrixConfig_fields, next.get());
-    if (bytes.empty() || !prepare_runtime(*next, revision + 1))
+    if (!next->reencode() || !prepare_runtime(*next, revision + 1))
       return;
-    if (!save(bytes, revision + 1)) {
+    if (!save(next->encoded(), revision + 1)) {
       prepared_ledger.reset();
       prepared_local.reset();
       error("Unable to save default layout");
@@ -993,14 +1001,6 @@ public:
       p.attempted = false;
       p.replacement_prepared = false;
     }
-  }
-  void start_deployment(heap_object<matrix_config> c) {
-    auto compact = make_heap_object<runtime_config>(*c);
-    if (!compact) {
-      error("Unable to retain prepared matrix", true);
-      return;
-    }
-    start_deployment(std::move(compact));
   }
   size_t own_outputs(mesh_interop_LayoutOutput* outputs) {
     size_t count = 0;
@@ -1125,46 +1125,71 @@ public:
     return !layout_snapshot_bytes.empty();
   }
   bool capture_matrix(const packet& packet, uint64_t now, bool active = false) {
-    auto document = make_heap_object<mesh_interop_MatrixDocument>();
-    if (!document)
-      return false;
     const auto* saved =
         active      ? (local ? (retiring_config ? retiring_config.get() : config.get()) : nullptr)
         : candidate ? candidate.get()
                     : config.get();
-    const auto bytes = saved ? saved->encoded() : std::vector<uint8_t>{8, SCHEMA_VERSION};
+    const std::vector<uint8_t> empty_config{8, SCHEMA_VERSION};
+    const auto& bytes = saved ? saved->encoded() : empty_config;
     if (bytes.empty())
       return false;
-    document->config.size = bytes.size();
-    memcpy(document->config.bytes, bytes.data(), bytes.size());
-    document->active_revision = local ? local->definitions().revision : 0;
-    document->activation_pending = deployment || pending_snapshot != nullptr;
-    document->persisted = active ? active_persisted : configuration_persisted;
-    document->revision = active ? document->active_revision : revision;
-    document->master_session = session;
-    memcpy(document->master_mac, mac, 6);
-    snprintf(document->master_firmware_version, sizeof(document->master_firmware_version), "%.*s",
-             31, esp_app_get_description()->version);
     auto mesh = mesh_interop::instance().get_state();
     for (size_t i = 0; i < mesh.nodes_count; ++i)
       find_peer(mesh.nodes[i].mac);
-    auto add = [&](const uint8_t* address, uint64_t mask, bool known, bool online,
-                   const char* version) {
-      auto& node = document->nodes[document->nodes_count++];
-      memcpy(node.node_mac, address, 6);
-      node.known = known;
-      node.online = online;
-      snprintf(node.firmware_version, sizeof(node.firmware_version), "%.*s", 31, version);
-      for (uint32_t pin = 0; pin < 40; ++pin)
-        if (mask & (1ULL << pin))
-          node.gpios[node.gpios_count++] = pin;
+    const uint64_t active_revision = local ? local->definitions().revision : 0;
+    const auto* version = esp_app_get_description()->version;
+    const auto write = [&](pb_ostream_t& stream) {
+      const auto scalar = [&](uint32_t tag, uint64_t value) {
+        return !value ||
+               (pb_encode_tag(&stream, PB_WT_VARINT, tag) && pb_encode_varint(&stream, value));
+      };
+      const auto data = [&](uint32_t tag, const uint8_t* value, size_t length) {
+        return pb_encode_tag(&stream, PB_WT_STRING, tag) &&
+               pb_encode_string(&stream, value, length);
+      };
+      const auto add = [&](const uint8_t* address, uint64_t mask, bool known, bool online,
+                           const char* node_version) {
+        mesh_interop_MatrixInputNode node{};
+        memcpy(node.node_mac, address, 6);
+        node.known = known;
+        node.online = online;
+        snprintf(node.firmware_version, sizeof(node.firmware_version), "%.*s", 31, node_version);
+        for (uint32_t pin = 0; pin < 40; ++pin)
+          if (mask & (1ULL << pin))
+            node.gpios[node.gpios_count++] = pin;
+        return pb_encode_tag(&stream, PB_WT_STRING, mesh_interop_MatrixDocument_nodes_tag) &&
+               pb_encode_submessage(&stream, mesh_interop_MatrixInputNode_fields, &node);
+      };
+      if (!data(mesh_interop_MatrixDocument_config_tag, bytes.data(), bytes.size()) ||
+          !scalar(mesh_interop_MatrixDocument_revision_tag, active ? active_revision : revision) ||
+          !scalar(mesh_interop_MatrixDocument_master_session_tag, session) ||
+          !data(mesh_interop_MatrixDocument_master_mac_tag, mac, 6) ||
+          !add(mac, input_mask(), true, true, version))
+        return false;
+      size_t count = 1;
+      for (size_t i = 0; i < peer_count && count < 17; ++i)
+        if (mesh_interop::instance().slave_node_exists(peers[i].mac)) {
+          if (!add(peers[i].mac, peers[i].gpio_mask, peers[i].catalog_known,
+                   available(peers[i], now), peers[i].firmware_version))
+            return false;
+          ++count;
+        }
+      return scalar(mesh_interop_MatrixDocument_active_revision_tag, active_revision) &&
+             scalar(mesh_interop_MatrixDocument_activation_pending_tag,
+                    deployment || pending_snapshot != nullptr) &&
+             scalar(mesh_interop_MatrixDocument_persisted_tag,
+                    active ? active_persisted : configuration_persisted) &&
+             data(mesh_interop_MatrixDocument_master_firmware_version_tag,
+                  reinterpret_cast<const uint8_t*>(version), strnlen(version, 31));
     };
-    add(mac, input_mask(), true, true, document->master_firmware_version);
-    for (size_t i = 0; i < peer_count && document->nodes_count < 17; ++i)
-      if (mesh_interop::instance().slave_node_exists(peers[i].mac))
-        add(peers[i].mac, peers[i].gpio_mask, peers[i].catalog_known, available(peers[i], now),
-            peers[i].firmware_version);
-    layout_snapshot_bytes = encode(mesh_interop_MatrixDocument_fields, document.get(), 32768);
+    pb_ostream_t size = PB_OSTREAM_SIZING;
+    if (!write(size) || size.bytes_written > 32768)
+      return false;
+    std::vector<uint8_t> result(size.bytes_written);
+    auto stream = pb_ostream_from_buffer(result.data(), result.size());
+    if (!write(stream))
+      return false;
+    layout_snapshot_bytes = std::move(result);
     snapshot_outputs.clear();
     snapshot_is_matrix = true;
     snapshot_is_active = active;
@@ -2712,7 +2737,8 @@ public:
       if (master && !memory_test_done && now - startup_at >= 10000000 &&
           (config || now - startup_at >= 20000000)) {
         memory_test_done = true;
-        run_memory_stress_test(config.get(), mac, connected_lighting_drivers::find);
+        run_memory_stress_test(config.get(), mac, connected_lighting_drivers::find,
+                               decode_compact_config);
       }
 #endif
       if (!master)
