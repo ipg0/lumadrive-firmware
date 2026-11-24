@@ -1,4 +1,5 @@
 #pragma once
+#include "../mesh_interop/wire_encoding.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -28,16 +29,8 @@ enum type : uint8_t {
   SIGNAL_BATCH,
   SENSOR_BATCH
 };
-inline uint64_t get(const uint8_t* p, size_t n) {
-  uint64_t v = 0;
-  for (size_t i = 0; i < n; ++i)
-    v |= uint64_t(p[i]) << (8 * i);
-  return v;
-}
-inline void put(std::vector<uint8_t>& b, uint64_t v, size_t n) {
-  for (size_t i = 0; i < n; ++i)
-    b.push_back(static_cast<uint8_t>(v >> (8 * i)));
-}
+using wire_encoding::get;
+using wire_encoding::put;
 inline std::vector<uint8_t> packet(type t, const std::vector<uint8_t>& body) {
   if (body.size() + HEADER_SIZE > PACKET_LIMIT)
     return {};

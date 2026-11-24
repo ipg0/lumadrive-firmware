@@ -18,6 +18,12 @@ fi
 
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -pedantic "${runtime_flags[@]}" \
   -I test/test_animation_trigger_table/stubs -I src \
+  test/test_animation_trigger_table/test_shared_samples.cpp \
+  src/color/color.cpp -o "$test_binary"
+"$test_binary"
+
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -pedantic "${runtime_flags[@]}" \
+  -I test/test_animation_trigger_table/stubs -I src \
   test/test_animation_trigger_table/test_common_animations.cpp \
   src/animation_trigger_table/animation_trigger_table.cpp \
   src/color/color.cpp -o "$test_binary"

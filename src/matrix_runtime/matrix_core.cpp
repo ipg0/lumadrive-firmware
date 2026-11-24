@@ -1,5 +1,5 @@
 #include "matrix_core.hpp"
-#include "signal_generator.hpp"
+#include "modulation.hpp"
 #include "../animation_trigger_table/animation_effect/impl/static_color_animation_effect.hpp"
 #include "../animation_trigger_table/animation_effect/impl/keyframe_animation_effect.hpp"
 #include "../animation_trigger_table/animation_effect/impl/periodic_animation_effect.hpp"
@@ -424,7 +424,7 @@ const char* validate_config(const config_type& c, const uint8_t master_mac[6]) {
       return "Cyclic condition reference";
   for (size_t i = 0; i < c.layout_count; ++i) {
     const auto& m = c.layout[i];
-    if (!valid_driver(m.driver) || m.source_index > 1)
+    if (!valid_driver(m.driver) || m.source_index >= MAX_SOURCES_PER_NODE)
       return "Unknown layout driver or source ID";
     if ((m.node_mac[0] & 1) ||
         std::all_of(m.node_mac, m.node_mac + 6, [](uint8_t v) { return v == 0; }))
@@ -772,7 +772,7 @@ bool player::prepare(const playback_definitions& d,
     return false;
   for (size_t i = 0; i < d.output_mappings_count; ++i) {
     const auto& m = d.output_mappings[i];
-    if (!valid_driver(m.driver) || m.source_index > 1 || m.from == m.to ||
+    if (!valid_driver(m.driver) || m.source_index >= MAX_SOURCES_PER_NODE || m.from == m.to ||
         std::max(m.from, m.to) > d.canvas_size)
       return false;
     for (size_t j = 0; j < i; ++j)

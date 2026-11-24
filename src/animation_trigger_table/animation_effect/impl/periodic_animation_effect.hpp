@@ -43,7 +43,7 @@ public:
     _elapsed_ms = uint64_t(_options.period_ms) * std::min(position, animation_math::SCALE) /
                   animation_math::SCALE;
   }
-  esp_err_t render(rgb_lighting_driver& driver) const override {
+  esp_err_t render(render_target& driver) const override {
     using namespace animation_math;
     if (_options.period_ms < 2 || !_options.duty_percent || _options.duty_percent > 100)
       return ESP_ERR_INVALID_ARG;

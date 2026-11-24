@@ -74,7 +74,7 @@ public:
     _elapsed_ms =
         uint64_t(_cycle_ms) * std::min(position, animation_math::SCALE) / animation_math::SCALE;
   }
-  esp_err_t render(rgb_lighting_driver& driver) const override {
+  esp_err_t render(render_target& driver) const override {
     if (!_count)
       return ESP_ERR_INVALID_ARG;
     const auto time = _loop && !_sampling ? _elapsed_ms % _cycle_ms : _elapsed_ms;

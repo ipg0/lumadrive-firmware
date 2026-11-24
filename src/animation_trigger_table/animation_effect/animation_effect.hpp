@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../lighting_driver/lighting_driver.hpp"
+#include "../../lighting_driver/render_target.hpp"
 #include <cstdint>
 
 class animation_effect_instance_base;
@@ -38,8 +38,8 @@ public:
     seek(0);
   }
   virtual bool is_finished() const = 0;
-  // Draw into the driver's frame buffer. The table clears and presents it.
-  virtual esp_err_t render(rgb_lighting_driver& driver) const = 0;
+  // Paint a canvas; clearing and presenting are the caller's responsibility.
+  virtual esp_err_t render(render_target& driver) const = 0;
 };
 
 template <animation_effect_type effect_type> class animation_effect_descriptor;

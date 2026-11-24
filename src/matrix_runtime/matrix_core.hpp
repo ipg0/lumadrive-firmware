@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../lighting_driver/lighting_driver.hpp"
+
 #include "../animation_trigger_table/animation_effect/animation_effect.hpp"
 #include "../animation_trigger_table/trigger_context.hpp"
 #include "heap_object.hpp"

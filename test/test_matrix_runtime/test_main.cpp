@@ -1,6 +1,9 @@
 #include "matrix_runtime/matrix_core.hpp"
 #include "matrix_runtime/matrix_wire.hpp"
-#include "matrix_runtime/signal_generator.hpp"
+#include "mesh_interop/packet_router.hpp"
+#include "matrix_runtime/modulation.hpp"
+#include "signal_source/impl/virtual_signal_source.hpp"
+#include "signal_source/source_factory.hpp"
 #include "matrix_runtime/signal_buffer.hpp"
 #include "animation_trigger_table/animation_effect/impl/keyframe_animation_effect.hpp"
 #include "animation_trigger_table/animation_effect/impl/periodic_animation_effect.hpp"
@@ -13,6 +16,27 @@ static_assert(sizeof(player) < 8192,
               "Players must not retain maximum-sized protobuf effect arrays");
 const uint8_t master_mac[6] = {2, 1, 2, 3, 4, 5};
 const uint8_t slave_mac[6] = {4, 1, 2, 3, 4, 5};
+static unsigned router_calls = 0;
+static bool reject_packet(const uint8_t*, const uint8_t*, size_t) {
+  ++router_calls;
+  return false;
+}
+static bool accept_packet(const uint8_t*, const uint8_t* data, size_t size) {
+  ++router_calls;
+  return size && data[0] == 42;
+}
+static void test_packet_router() {
+  packet_router router;
+  const uint8_t packet[] = {42};
+  assert(!router.add(nullptr));
+  assert(!router.dispatch(master_mac, packet, sizeof(packet)));
+  assert(router.add(reject_packet) && router.add(accept_packet));
+  assert(router.add(accept_packet)); // Duplicate registration does not invoke twice.
+  router_calls = 0;
+  assert(router.dispatch(master_mac, packet, sizeof(packet)) && router_calls == 2);
+  router_calls = 0;
+  assert(!router.dispatch(master_mac, packet, 0) && router_calls == 2);
+}
 mesh_interop_MatrixLayout layout_row(const uint8_t* mac, mesh_interop_MatrixDriver driver,
                                      uint32_t from, uint32_t to) {
   mesh_interop_MatrixLayout row{};
@@ -50,7 +74,7 @@ matrix_config fixture() {
   e.priority = 10;
   c.layout_count = 1;
   memcpy(c.layout[0].node_mac, slave_mac, 6);
-  c.layout[0].driver = mesh_interop_MatrixDriver_WS2812;
+  c.layout[0].driver = mesh_interop_MatrixDriver_DRIVER_1;
   c.layout[0].to = 1;
   return c;
 }
@@ -505,7 +529,10 @@ void test_modulation_and_signal_buffer() {
   signal.period_ms = 1000;
   signal.amplitude = 1;
   assert(valid_signal(signal));
-  assert(virtual_signal_value(signal, 0) == 0 && virtual_signal_value(signal, 500000) == 1);
+  signal_source::virtual_source generator({signal_source::waveform::TRIANGLE, 1000, 1, 0, 0});
+  float generated = -1;
+  assert(generator.sample(0, generated) && generated == 0);
+  assert(generator.sample(500000, generated) && generated == 1);
   mesh_interop_AnimationModulation mapping{};
   mapping.signal_id = 1;
   mapping.maximum = 1;
@@ -616,6 +643,48 @@ void test_signal_history_capacity_and_reuse() {
   assert(!buffer.update(4, 1, 100000, 1));
   buffer.clear();
   assert(buffer.update(4, 1, 100000, 1));
+}
+void test_polymorphic_signal_sources() {
+  struct custom_source final : signal_source::source {
+    int& initialized;
+    int& stopped;
+    int& destroyed;
+    custom_source(int& a, int& b, int& c) : initialized(a), stopped(b), destroyed(c) {}
+    ~custom_source() override { ++destroyed; }
+    bool init() override {
+      ++initialized;
+      return true;
+    }
+    void deinit() override { ++stopped; }
+    bool sample(uint64_t time, float& value) override {
+      value = float(time);
+      return true;
+    }
+  };
+  int initialized = 0, stopped = 0, destroyed = 0;
+  {
+    signal_source::source_registry registry;
+    assert(registry.install(
+        1, 2, signal_source::make_source<custom_source>(initialized, stopped, destroyed)));
+    float value = 0;
+    assert(registry.find(1, 2)->sample(7, value) && value == 7);
+    assert(registry.install(
+        2, 2, signal_source::make_source<custom_source>(initialized, stopped, destroyed)));
+    registry.retain(2);
+    assert(!registry.find(1, 2) && registry.find(2, 2));
+    assert(initialized == 2 && stopped == 1 && destroyed == 1);
+  }
+  assert(stopped == 2 && destroyed == 2);
+
+  signal_source::set_sample_sink(nullptr);
+  assert(!signal_source::submit_sample({1, 1.0f, 10}));
+  signal_source::set_sample_sink([](const signal_source::sample& value) {
+    return value.sensor_id == 3 && value.value == 2.0f && value.captured_local_us == 10;
+  });
+  assert(signal_source::submit_sample({3, 2.0f, 10}));
+  custom_source hardware(initialized, stopped, destroyed);
+  assert(signal_source::publish_sample(hardware, 3, 2, 10));
+  signal_source::set_sample_sink(nullptr);
 }
 void test_layering() {
   auto config = fixture();
@@ -732,7 +801,7 @@ void test_one_entry_two_drivers() {
   config.layout_count = 2;
   config.layout[1] = config.layout[0];
   assert(validate(config, master_mac)); // Exact duplicate is invalid.
-  config.layout[1].driver = mesh_interop_MatrixDriver_HC595;
+  config.layout[1].driver = mesh_interop_MatrixDriver_DRIVER_2;
   assert(!validate(config, master_mac));
   auto d = definitions_for(config, slave_mac, 10, 20);
   assert(d.layers_count == 1 && d.output_mappings_count == 2);
@@ -962,9 +1031,9 @@ void test_animated_player_phase_and_snapshots() {
 void test_layout_center_distribution() {
   auto c = fixture();
   c.layout_count = 2;
-  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 0, 10);
+  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_DRIVER_1, 0, 10);
   c.layout[0].car_position = mesh_interop_CarPosition_DASH_LEFT;
-  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_WS2812, 12, 30);
+  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_DRIVER_1, 12, 30);
   c.layout[1].car_position = mesh_interop_CarPosition_DASH_RIGHT;
   auto d = definitions_for(c, slave_mac, 10, 2);
   assert(d.has_center_index && d.center_index == 11);
@@ -1150,7 +1219,7 @@ void test_layout_validation() {
   c.layout_count = 2;
   c.layout[1] = c.layout[0];
   assert(validate(c, master_mac));
-  c.layout[1].driver = mesh_interop_MatrixDriver_HC595;
+  c.layout[1].driver = mesh_interop_MatrixDriver_DRIVER_2;
   assert(!validate(c, master_mac)); // Overlap is valid.
   d = definitions_for(c, slave_mac, 10, 20);
   d.output_mappings[1].driver = d.output_mappings[0].driver;
@@ -1285,9 +1354,9 @@ void assert_canvas_projection(const canvas_test_driver& reference) {
 void test_animation_region() {
   auto c = fixture();
   c.layout_count = 3;
-  c.layout[0] = layout_row(slave_mac, mesh_interop_MatrixDriver_WS2812, 0, 4);
-  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_HC595, 3, 1);
-  c.layout[2] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 8, 4);
+  c.layout[0] = layout_row(slave_mac, mesh_interop_MatrixDriver_DRIVER_1, 0, 4);
+  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_DRIVER_2, 3, 1);
+  c.layout[2] = layout_row(master_mac, mesh_interop_MatrixDriver_DRIVER_1, 8, 4);
   c.effects[0].duration_ms = 0;
   c.effects_count = 2;
   c.effects[1] = {};
@@ -1353,9 +1422,9 @@ void test_animation_region() {
 void test_shared_canvas_motion_and_gradient() {
   auto c = keyframe_fixture();
   c.layout_count = 3;
-  c.layout[0] = layout_row(slave_mac, mesh_interop_MatrixDriver_WS2812, 0, 4);
-  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_HC595, 3, 1);
-  c.layout[2] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 8, 4);
+  c.layout[0] = layout_row(slave_mac, mesh_interop_MatrixDriver_DRIVER_1, 0, 4);
+  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_DRIVER_2, 3, 1);
+  c.layout[2] = layout_row(master_mac, mesh_interop_MatrixDriver_DRIVER_1, 8, 4);
   auto& effect = c.effects[0];
   effect.keyframes_count = 2;
   effect.keyframes[0] = keyframe(0, 255, 0, 0, 255, mesh_interop_MatrixInterpolation_LINEAR, 1, 0);
@@ -1496,6 +1565,7 @@ void test_shared_canvas_motion_and_gradient() {
       assert(pixel.r == 0 && pixel.b == 128);
 }
 int main() {
+  test_packet_router();
   test_transfer();
   test_schema_validation();
   test_scheduled_player();
@@ -1504,6 +1574,7 @@ int main() {
   test_preview_player();
   test_modulation_and_signal_buffer();
   test_signal_history_capacity_and_reuse();
+  test_polymorphic_signal_sources();
   test_dimming();
   test_entry_background_opacity();
   test_modes();

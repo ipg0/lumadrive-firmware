@@ -8,7 +8,8 @@
 namespace matrix {
 inline bool add_default_output(runtime_config& config, const uint8_t mac[6], uint32_t driver,
                                uint32_t pixels, uint32_t source_index = 0) {
-  if (!pixels || pixels > 65536 || !driver || driver > MAX_DRIVERS_PER_NODE || source_index > 1)
+  if (!pixels || pixels > 65536 || !driver || driver > MAX_DRIVERS_PER_NODE ||
+      source_index >= MAX_SOURCES_PER_NODE)
     return false;
   for (size_t i = 0; i < config.layout_count; ++i) {
     auto& row = config.layout[i];

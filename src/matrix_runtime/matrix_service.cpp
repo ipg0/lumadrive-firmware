@@ -1,7 +1,8 @@
 #include "matrix_service.hpp"
 #include "matrix_core.hpp"
 #include "matrix_wire.hpp"
-#include "signal_generator.hpp"
+#include "modulation.hpp"
+#include "../signal_source/source_factory.hpp"
 #include "signal_buffer.hpp"
 #include "memory_stress_test.hpp"
 #include "default_matrix.hpp"
@@ -436,6 +437,7 @@ public:
   std::vector<uint8_t> preview_bytes;
   bool preview_distributing = false;
   signal_buffer signal_values;
+  heap_object<signal_source::source_registry> signal_sources;
   bool signal_memory_error = false;
   uint64_t last_signal_batch = 0;
   uint64_t last_sensor_batch = 0;
@@ -567,7 +569,7 @@ public:
     std::vector<uint8_t> body;
     w::put(body, session, 8);
     w::put(body, 0, 1);
-    sensor_sample sample{};
+    signal_source::sample sample{};
     uint8_t count = 0;
     while (count < 14 && xQueueReceive(sensor_queue, &sample, 0) == pdTRUE) {
       const auto timestamp =
@@ -623,6 +625,42 @@ public:
         signal_memory_error = false;
     }
   }
+  static bool read_sensor_source(void* context, const uint8_t* owner, uint32_t id, uint64_t clock,
+                                 float& value) {
+    const auto& values = static_cast<service*>(context)->sensor_values;
+    const auto found = std::find_if(values.begin(), values.end(), [&](const auto& entry) {
+      return entry.id == id && !memcmp(entry.mac, owner, 6) && clock >= entry.time &&
+             clock - entry.time <= signal_buffer::STALE_US;
+    });
+    if (found == values.end())
+      return false;
+    value = found->value;
+    return true;
+  }
+  signal_source::source* find_signal_source(const mesh_interop_SignalGenerator& config,
+                                            uint64_t rev) {
+    if (!signal_sources)
+      signal_sources = make_heap_object<signal_source::source_registry>();
+    if (!signal_sources)
+      return nullptr;
+    if (auto* existing = signal_sources->find(rev, config.id))
+      return existing;
+    signal_source::source_config definition{};
+    if (config.kind == mesh_interop_SignalGenerator_Kind_SENSOR) {
+      definition.kind = signal_source::source_kind::REMOTE_SENSOR;
+      memcpy(definition.node_mac, config.node_mac, 6);
+      definition.sensor_id = config.sensor_id;
+    } else {
+      definition.kind = signal_source::source_kind::VIRTUAL;
+      definition.generator = {static_cast<signal_source::waveform>(
+                                  config.kind - mesh_interop_SignalGenerator_Kind_SINE),
+                              config.period_ms, config.amplitude, config.offset, config.phase};
+    }
+    auto source = signal_source::make_configured_source(definition, read_sensor_source, this);
+    if (!signal_sources->install(rev, config.id, std::move(source)))
+      return nullptr;
+    return signal_sources->find(rev, config.id);
+  }
   void send_signal_batches(const runtime_config& matrix, uint64_t rev, uint64_t clock) {
     const uint8_t broadcast[6] = {255, 255, 255, 255, 255, 255};
     size_t index = 0;
@@ -636,17 +674,15 @@ public:
       while (index < matrix.signals_count && count < 27) {
         const auto& signal = matrix.signals[index++];
         float value = 0;
-        if (signal.kind == mesh_interop_SignalGenerator_Kind_SENSOR) {
-          const auto found =
-              std::find_if(sensor_values.begin(), sensor_values.end(), [&](const auto& entry) {
-                return entry.id == signal.sensor_id && !memcmp(entry.mac, signal.node_mac, 6) &&
-                       clock >= entry.time && clock - entry.time <= signal_buffer::STALE_US;
-              });
-          if (found == sensor_values.end())
-            continue;
-          value = found->value;
-        } else
-          value = virtual_signal_value(signal, clock);
+        auto* source = find_signal_source(signal, rev);
+        if (!source) {
+          if (!signal_memory_error)
+            error("Unable to allocate signal source");
+          signal_memory_error = true;
+          continue;
+        }
+        if (!source->sample(clock, value))
+          continue;
         uint32_t bits;
         memcpy(&bits, &value, sizeof(bits));
         w::put(body, signal.id, 4);
@@ -1022,15 +1058,23 @@ public:
         o.known = true;
         o.source_index = source;
         o.max_pixel_count = driver->get_layout_max_pixel_count(source);
-        o.driver_kind = static_cast<mesh_interop_MatrixDriverKind>(driver->get_kind());
+        o.driver_kind =
+            static_cast<mesh_interop_MatrixDriverKind>(driver->get_layout_source_kind(source));
       }
     }
     return count;
   }
   void send_inventory(const uint8_t* destination) {
     size_t count = 0;
-    for (uint32_t id = 1; id <= MAX_DRIVERS_PER_NODE; ++id)
-      count += connected_lighting_drivers::find(id) != nullptr;
+    for (uint32_t id = 1; id <= MAX_DRIVERS_PER_NODE; ++id) {
+      const auto* driver = connected_lighting_drivers::find(id);
+      if (driver)
+        count += driver->get_layout_source_count();
+    }
+    if (count > MAX_SOURCES_PER_NODE) {
+      ESP_LOGE("matrix", "Too many local lighting outputs for inventory");
+      return;
+    }
     std::vector<uint8_t> body;
     w::put(body, session, 8);
     w::put(body, count, 1);
@@ -1038,18 +1082,16 @@ public:
       auto* driver = connected_lighting_drivers::find(id);
       if (!driver)
         continue;
-      const auto count = driver->get_kind() == lighting_driver_kind::LED_STRIP
-                             ? driver->get_layout_default_pixel_count(0)
-                             : driver->get_pixel_count();
-      w::put(body, id, 4);
-      w::put(body, count, 4);
-      w::put(body, driver->_is_ready(), 1);
-      w::put(body, static_cast<uint8_t>(driver->get_kind()), 1);
-      w::put(body, driver->get_layout_max_pixel_count(0), 4);
+      for (size_t source = 0; source < driver->get_layout_source_count(); ++source) {
+        w::put(body, id, 1);
+        w::put(body, source, 1);
+        w::put(body, static_cast<uint8_t>(driver->get_layout_source_kind(source)), 1);
+        w::put(body, driver->_is_ready(), 1);
+        w::put(body, driver->get_layout_default_pixel_count(source), 4);
+        w::put(body, driver->get_layout_max_pixel_count(source), 4);
+      }
     }
     w::put(body, input_mask(), 8);
-    // Older controllers require the original inventory length.
-    send(destination, w::INVENTORY, body);
     const auto* version = esp_app_get_description()->version;
     const auto length = strnlen(version, 31);
     w::put(body, length, 1);
@@ -1912,60 +1954,49 @@ public:
       }
       if (!available(p, now))
         p.gpio_known = 0;
-      if (type == w::INVENTORY && n >= 17 && w::get(b, 8) == session &&
-          b[8] <= MAX_DRIVERS_PER_NODE) {
-        const size_t base_size = 17 + b[8] * 14;
-        if (n < base_size)
+      if (type == w::INVENTORY && n >= 18 && w::get(b, 8) == session &&
+          b[8] <= MAX_SOURCES_PER_NODE) {
+        const size_t base_size = 17 + b[8] * 12;
+        if (n < base_size + 1)
           return;
-        size_t version_length = 0;
-        if (n > base_size) {
-          version_length = b[base_size];
-          if (version_length > 31 || n != base_size + 1 + version_length)
+        const size_t version_length = b[base_size];
+        if (version_length > 31 || n != base_size + 1 + version_length)
+          return;
+        for (size_t i = 0; i < version_length; ++i)
+          if (b[base_size + 1 + i] < 0x20 || b[base_size + 1 + i] > 0x7e)
             return;
-          for (size_t i = 0; i < version_length; ++i)
-            if (b[base_size + 1 + i] < 0x20 || b[base_size + 1 + i] > 0x7e)
-              return;
-        }
         std::array<mesh_interop_LayoutOutput, MAX_SOURCES_PER_NODE> outputs{};
-        std::array<uint32_t, MAX_DRIVERS_PER_NODE> ids{};
-        size_t output_count = 0;
         for (size_t i = 0; i < b[8]; ++i) {
-          const auto* item = b + 9 + i * 14;
-          const auto id = w::get(item, 4), count = w::get(item + 4, 4);
-          const auto maximum = w::get(item + 10, 4);
-          const auto kind = item[9];
-          if (!id || id > MAX_DRIVERS_PER_NODE || !count || count > 65536 || item[8] > 1 ||
-              (kind != 1 && kind != 2) || (kind == 2 && count > 2) || !maximum || maximum > 65536 ||
-              (kind == 1 && maximum < count) || (kind == 2 && maximum != 1) ||
-              std::find(ids.begin(), ids.begin() + i, id) != ids.begin() + i)
+          const auto* item = b + 9 + i * 12;
+          const auto id = item[0], source = item[1], kind = item[2];
+          const auto count = w::get(item + 4, 4), maximum = w::get(item + 8, 4);
+          if (!id || id > MAX_DRIVERS_PER_NODE || source >= MAX_SOURCES_PER_NODE || kind > 2 ||
+              item[3] > 1 || !count || count > 65536 || maximum < count || maximum > 65536)
             return;
-          ids[i] = id;
-          const size_t sources = kind == 2 ? count : 1;
-          for (size_t source = 0; source < sources; ++source) {
-            auto& o = outputs[output_count++];
-            memcpy(o.node_mac, p.mac, 6);
-            o.driver = static_cast<mesh_interop_MatrixDriver>(id);
-            o.pixel_count = kind == 2 ? 1 : count;
-            o.source_index = source;
-            o.driver_kind = static_cast<mesh_interop_MatrixDriverKind>(kind);
-            o.max_pixel_count = maximum;
-            o.ready = item[8] != 0;
-            o.known = true;
-            o.online = true;
-          }
+          for (size_t j = 0; j < i; ++j)
+            if (outputs[j].driver == id && outputs[j].source_index == source)
+              return;
+          auto& o = outputs[i];
+          memcpy(o.node_mac, p.mac, 6);
+          o.driver = static_cast<mesh_interop_MatrixDriver>(id);
+          o.pixel_count = count;
+          o.source_index = source;
+          o.driver_kind = static_cast<mesh_interop_MatrixDriverKind>(kind);
+          o.max_pixel_count = maximum;
+          o.ready = item[3] != 0;
+          o.known = true;
+          o.online = true;
         }
-        const auto mask = w::get(b + 9 + b[8] * 14, 8);
+        const auto mask = w::get(b + 9 + b[8] * 12, 8);
         if (mask >> 40)
           return;
-        if (n > base_size) {
-          if (version_length)
-            memcpy(p.firmware_version, b + base_size + 1, version_length);
-          p.firmware_version[version_length] = '\0';
-        }
+        if (version_length)
+          memcpy(p.firmware_version, b + base_size + 1, version_length);
+        p.firmware_version[version_length] = '\0';
         p.gpio_mask = mask;
         p.gpio_known &= mask;
         p.outputs = outputs;
-        p.outputs_count = output_count;
+        p.outputs_count = b[8];
         p.catalog_known = true;
         p.catalog_at = now;
         default_layout_dirty = true;
@@ -2454,6 +2485,9 @@ public:
       }
     }
     if (config && ledger && (!last_signal_batch || now - last_signal_batch >= 16667)) {
+      if (signal_sources)
+        signal_sources->retain(ledger->definitions().revision,
+                               retiring_ledger ? retiring_ledger->definitions().revision : 0);
       signal_values.retain(ledger->definitions().revision,
                            retiring_ledger ? retiring_ledger->definitions().revision : 0);
       send_signal_batches(*config, ledger->definitions().revision, clock);
@@ -2911,7 +2945,7 @@ public:
         source.clear();
         const uint64_t elapsed = 3000000 - (identify_until - now);
         const uint32_t length = all ? capacity : identify_length;
-        if (driver->get_kind() == lighting_driver_kind::RGB_LED_MODULE) {
+        if (driver->get_layout_source_kind(source_index) == lighting_driver_kind::RGB_LED_MODULE) {
           if (elapsed / 250000 % 2 == 0)
             source.set_pixel(0, alpha_color(color(0, 220, 233)));
         } else {
@@ -2948,6 +2982,8 @@ public:
 heap_object<service> instance;
 } // namespace
 
+static bool enqueue_sensor_sample(const signal_source::sample& sample);
+
 esp_err_t init() {
   if (instance)
     return ESP_ERR_INVALID_STATE;
@@ -2955,7 +2991,7 @@ esp_err_t init() {
   priority_queue = xQueueCreate(16, sizeof(packet));
   ble_queue = xQueueCreate(8, sizeof(packet));
   gpio_queue = xQueueCreate(64, sizeof(gpio_event));
-  sensor_queue = xQueueCreate(32, sizeof(sensor_sample));
+  sensor_queue = xQueueCreate(32, sizeof(signal_source::sample));
   signal_queue = xQueueCreate(4, sizeof(signal_packet));
   if (!radio_queue || !priority_queue || !ble_queue || !gpio_queue || !sensor_queue ||
       !signal_queue)
@@ -2967,6 +3003,7 @@ esp_err_t init() {
                               &worker_task, portNUM_PROCESSORS - 1) != pdPASS)
     return ESP_ERR_NO_MEM;
   initialized.store(true);
+  signal_source::set_sample_sink(enqueue_sensor_sample);
   return ESP_OK;
 }
 bool receive(const uint8_t mac[6], const uint8_t* data, size_t size) {
@@ -3005,11 +3042,11 @@ bool receive(const uint8_t mac[6], const uint8_t* data, size_t size) {
     xTaskNotifyGive(worker_task);
   return true;
 }
-bool submit_sensor_sample(const sensor_sample& sample) {
+static bool enqueue_sensor_sample(const signal_source::sample& sample) {
   if (!initialized.load() || !sample.sensor_id || !std::isfinite(sample.value))
     return false;
   if (xQueueSend(sensor_queue, &sample, 0) != pdTRUE) {
-    sensor_sample discarded{};
+    signal_source::sample discarded{};
     xQueueReceive(sensor_queue, &discarded, 0);
     if (xQueueSend(sensor_queue, &sample, 0) != pdTRUE)
       return false;

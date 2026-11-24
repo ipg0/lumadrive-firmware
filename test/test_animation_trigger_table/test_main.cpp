@@ -8,8 +8,7 @@
 #include <cstdio>
 #include <limits>
 
-using static_color =
-    animation_effect_descriptor<animation_effect_type::STATIC_COLOR>;
+using static_color = animation_effect_descriptor<animation_effect_type::STATIC_COLOR>;
 using default_source = trigger_source<trigger_source_type::DEFAULT_STATE>;
 using always_condition = trigger_condition<trigger_condition_type::ALWAYS>;
 
@@ -61,21 +60,17 @@ public:
 class gate_condition : public trigger_condition_base {
 public:
   bool allowed = true;
-  trigger_condition_type type() const override {
-    return trigger_condition_type::ALWAYS;
-  }
-  bool evaluate(const trigger_context &) const override { return allowed; }
+  trigger_condition_type type() const override { return trigger_condition_type::ALWAYS; }
+  bool evaluate(const trigger_context&) const override { return allowed; }
 };
 
 class manual_source : public trigger_source_base {
 public:
   bool fired = false;
   esp_err_t init_error = ESP_OK;
-  trigger_source_type type() const override {
-    return trigger_source_type::GPIO_EDGE;
-  }
+  trigger_source_type type() const override { return trigger_source_type::GPIO_EDGE; }
   esp_err_t init() override { return init_error; }
-  bool poll(const trigger_context &) override { return fired; }
+  bool poll(const trigger_context&) override { return fired; }
 };
 
 struct effect_metrics {
@@ -87,13 +82,9 @@ struct effect_metrics {
 
 class counted_instance : public animation_effect_instance_base {
 public:
-  explicit counted_instance(effect_metrics &metrics) : _metrics(metrics) {
-    ++_metrics.created;
-  }
+  explicit counted_instance(effect_metrics& metrics) : _metrics(metrics) { ++_metrics.created; }
   ~counted_instance() override { ++_metrics.destroyed; }
-  animation_effect_type type() const override {
-    return animation_effect_type::STATIC_COLOR;
-  }
+  animation_effect_type type() const override { return animation_effect_type::STATIC_COLOR; }
   void start(uint32_t now_ms) override {
     ++_metrics.starts;
     _metrics.started_at = now_ms;
@@ -103,32 +94,30 @@ public:
     _finished = static_cast<uint32_t>(now_ms - _metrics.started_at) >= 100;
   }
   bool is_finished() const override { return _finished; }
-  esp_err_t render(rgb_lighting_driver &driver) const override {
+  esp_err_t render(render_target& driver) const override {
     return driver.fill(alpha_color(color(255, 0, 0)));
   }
 
 private:
-  effect_metrics &_metrics;
+  effect_metrics& _metrics;
   bool _finished = false;
 };
 
 class counted_descriptor : public animation_effect_descriptor_base {
 public:
-  explicit counted_descriptor(effect_metrics &metrics) : _metrics(metrics) {}
+  explicit counted_descriptor(effect_metrics& metrics) : _metrics(metrics) {}
   bool fail_allocation = false;
-  animation_effect_type type() const override {
-    return animation_effect_type::STATIC_COLOR;
-  }
-  animation_effect_instance_base *create_instance() const override {
+  animation_effect_type type() const override { return animation_effect_type::STATIC_COLOR; }
+  animation_effect_instance_base* create_instance() const override {
     return fail_allocation ? nullptr : new counted_instance(_metrics);
   }
 
 private:
-  effect_metrics &_metrics;
+  effect_metrics& _metrics;
 };
 
-void expect_color(const fake_driver &driver, uint8_t r, uint8_t g, uint8_t b) {
-  for (const auto &pixel : driver.presented) {
+void expect_color(const fake_driver& driver, uint8_t r, uint8_t g, uint8_t b) {
+  for (const auto& pixel : driver.presented) {
     assert(pixel.r == r && pixel.g == g && pixel.b == b);
   }
 }
@@ -161,8 +150,7 @@ void test_equal_priorities_follow_registration_order() {
   animation_trigger_table table;
   assert(table.add_entry({&red, &source, &condition, &driver, 7}) == ESP_OK);
   assert(table.add_entry({&blue, &source, &condition, &driver, 7}) == ESP_OK);
-  assert(table.add_entry({&transparent, &source, &condition, &driver, 255}) ==
-         ESP_OK);
+  assert(table.add_entry({&transparent, &source, &condition, &driver, 255}) == ESP_OK);
   assert(table.tick({}) == ESP_OK);
   expect_color(driver, 0, 0, 255);
 }
@@ -246,8 +234,7 @@ void test_static_duration_and_clock_wrap() {
   animation_trigger_table table;
   assert(table.add_entry({&effect, &source, &condition, &driver}) == ESP_OK);
   source.fired = true;
-  assert(table.tick({.now_ms = std::numeric_limits<uint32_t>::max() - 9}) ==
-         ESP_OK);
+  assert(table.tick({.now_ms = std::numeric_limits<uint32_t>::max() - 9}) == ESP_OK);
   expect_color(driver, 0, 255, 0);
   source.fired = false;
   assert(table.tick({.now_ms = 9}) == ESP_OK);
@@ -288,28 +275,21 @@ void test_registration_errors_capacity_and_ownership() {
   counted_descriptor effect(metrics);
   {
     animation_trigger_table table;
-    assert(table.add_entry({nullptr, &source, &condition, &driver}) ==
-           ESP_ERR_INVALID_ARG);
-    assert(table.add_entry({&effect, nullptr, &condition, &driver}) ==
-           ESP_ERR_INVALID_ARG);
-    assert(table.add_entry({&effect, &source, nullptr, &driver}) ==
-           ESP_ERR_INVALID_ARG);
-    assert(table.add_entry({&effect, &source, &condition, nullptr}) ==
-           ESP_ERR_INVALID_ARG);
+    assert(table.add_entry({nullptr, &source, &condition, &driver}) == ESP_ERR_INVALID_ARG);
+    assert(table.add_entry({&effect, nullptr, &condition, &driver}) == ESP_ERR_INVALID_ARG);
+    assert(table.add_entry({&effect, &source, nullptr, &driver}) == ESP_ERR_INVALID_ARG);
+    assert(table.add_entry({&effect, &source, &condition, nullptr}) == ESP_ERR_INVALID_ARG);
     source.init_error = ESP_FAIL;
     assert(table.add_entry({&effect, &source, &condition, &driver}) == ESP_FAIL);
     source.init_error = ESP_OK;
     effect.fail_allocation = true;
-    assert(table.add_entry({&effect, &source, &condition, &driver}) ==
-           ESP_ERR_NO_MEM);
+    assert(table.add_entry({&effect, &source, &condition, &driver}) == ESP_ERR_NO_MEM);
     assert(table.size() == 0 && metrics.created == 0);
     effect.fail_allocation = false;
-    for (size_t i = 0;
-         i < animation_trigger_table::ANIMATION_TRIGGER_TABLE_MAX_ENTRIES; ++i) {
+    for (size_t i = 0; i < animation_trigger_table::ANIMATION_TRIGGER_TABLE_MAX_ENTRIES; ++i) {
       assert(table.add_entry({&effect, &source, &condition, &driver}) == ESP_OK);
     }
-    assert(table.add_entry({&effect, &source, &condition, &driver}) ==
-           ESP_ERR_NO_MEM);
+    assert(table.add_entry({&effect, &source, &condition, &driver}) == ESP_ERR_NO_MEM);
     assert(table.remove_entry(0) == ESP_OK);
     assert(metrics.destroyed == 1);
     assert(table.add_entry({&effect, &source, &condition, &driver}) == ESP_OK);

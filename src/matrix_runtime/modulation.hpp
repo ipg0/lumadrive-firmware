@@ -27,36 +27,6 @@ inline bool valid_modulation(const mesh_interop_AnimationModulation& modulation)
          modulation.curve <= mesh_interop_AnimationModulation_Curve_SMOOTH;
 }
 
-// The generator is anchored to the shared master session clock, not to entry start.
-inline float virtual_signal_value(const mesh_interop_SignalGenerator& signal, uint64_t clock_us) {
-  const uint64_t period = uint64_t(signal.period_ms) * 1000;
-  if (!period)
-    return signal.offset;
-  float phase = float(clock_us % period) / float(period) + signal.phase;
-  phase -= std::floor(phase);
-  float value = 0;
-  switch (signal.kind) {
-  case mesh_interop_SignalGenerator_Kind_SINE:
-    value = (std::sin(phase * 6.28318530718f - 1.57079632679f) + 1) * 0.5f;
-    break;
-  case mesh_interop_SignalGenerator_Kind_TRIANGLE:
-    value = phase < 0.5f ? phase * 2 : (1 - phase) * 2;
-    break;
-  case mesh_interop_SignalGenerator_Kind_SQUARE:
-    value = phase < 0.5f ? 0 : 1;
-    break;
-  case mesh_interop_SignalGenerator_Kind_SAWTOOTH:
-    value = phase;
-    break;
-  case mesh_interop_SignalGenerator_Kind_REVERSE_SAWTOOTH:
-    value = 1 - phase;
-    break;
-  default:
-    return signal.offset;
-  }
-  return signal.offset + signal.amplitude * value;
-}
-
 inline uint32_t map_signal(float value, const mesh_interop_AnimationModulation& modulation) {
   float x = std::clamp((value - modulation.minimum) / (modulation.maximum - modulation.minimum),
                        0.0f, 1.0f);

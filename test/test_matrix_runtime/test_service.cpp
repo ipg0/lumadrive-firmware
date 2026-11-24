@@ -208,6 +208,52 @@ void test_animation_preview_distribution() {
   assert(master.peers[0].ready && master.revision == revision && stored == saved);
   network.clear();
 }
+void test_signal_sources_share_broadcast_path() {
+  network.clear();
+  service master;
+  configure_node(master, true);
+  auto config = fixture();
+  config.signals_count = 2;
+  auto& generator = config.signals[0];
+  generator.id = 1;
+  strcpy(generator.name, "Virtual");
+  generator.kind = mesh_interop_SignalGenerator_Kind_TRIANGLE;
+  generator.period_ms = 1000;
+  generator.amplitude = 1;
+  auto& sensor = config.signals[1];
+  sensor.id = 2;
+  strcpy(sensor.name, "Sensor");
+  sensor.kind = mesh_interop_SignalGenerator_Kind_SENSOR;
+  sensor.sensor_id = 5;
+  memcpy(sensor.node_mac, master_mac, 6);
+  assert(!validate(config, master_mac));
+  runtime_config compact(config);
+  master.ledger = make_heap_object<player>();
+  assert(master.ledger && master.ledger->prepare(compact, nullptr, master.session, 7));
+  const uint64_t clock = 500000;
+  master.accept_sensor_value(master_mac, 5, clock, 0.4f, clock);
+  master.send_signal_batches(compact, 7, clock);
+  assert(network.size() == 1 && network.front().bytes[5] == w::SIGNAL_BATCH);
+  const auto& frame = network.front().bytes;
+  assert(frame.size() <= w::PACKET_LIMIT && frame[w::HEADER_SIZE + 24] == 2);
+  float virtual_value = 0, sensor_value = 0;
+  assert(master.signal_values.lookup(7, 1, clock + 30000, virtual_value));
+  assert(master.signal_values.lookup(7, 2, clock + 30000, sensor_value));
+  assert(virtual_value == 1 && sensor_value == 0.4f);
+  assert(master.signal_sources->find(7, 1) && master.signal_sources->find(7, 2));
+  network.clear();
+  memcpy(compact.signals[1].node_mac, slave_mac, 6);
+  assert(master.ledger->prepare(compact, nullptr, master.session, 8));
+  master.accept_sensor_value(slave_mac, 5, clock, 0.8f, clock);
+  master.send_signal_batches(compact, 8, clock);
+  assert(network.size() == 1 && network.front().bytes[w::HEADER_SIZE + 24] == 2);
+  assert(master.signal_values.lookup(8, 2, clock + 30000, sensor_value));
+  assert(sensor_value == 0.8f);
+  network.clear();
+  master.send_signal_batches(compact, 7, clock + signal_buffer::STALE_US + 1);
+  assert(network.size() == 1 && network.front().bytes[w::HEADER_SIZE + 24] == 1);
+  network.clear();
+}
 void test_deploy_recover_persist() {
   service master, slave;
   configure_node(master, true);
@@ -294,6 +340,12 @@ void test_deploy_recover_persist() {
 }
 void test_callback_queue_limits() {
   assert(matrix_service::init() == ESP_OK);
+  assert(!signal_source::submit_sample({0, 1.0f, 10}));
+  for (unsigned i = 0; i < 33; ++i)
+    assert(signal_source::submit_sample({1, float(i), 10}));
+  signal_source::sample oldest{};
+  assert(xQueueReceive(matrix_service::sensor_queue, &oldest, 0) == pdTRUE);
+  assert(oldest.value == 1.0f); // A full queue drops the oldest sample.
   const uint8_t bytes[] = {1};
   for (unsigned i = 0; i < 8; ++i)
     assert(matrix_service::upload(1, bytes, 1));
@@ -311,6 +363,9 @@ void test_callback_queue_limits() {
   delete matrix_service::radio_queue;
   delete matrix_service::priority_queue;
   delete matrix_service::gpio_queue;
+  delete matrix_service::sensor_queue;
+  delete matrix_service::signal_queue;
+  signal_source::set_sample_sink(nullptr);
 }
 void test_only_current_hello_format() {
   service master;
@@ -811,7 +866,7 @@ void test_provisioned_gpio_inventory() {
   assert(master.peer_count == 1 && master.peers[0].catalog_known);
   assert(master.peers[0].gpio_mask == ((1ULL << 13) | (1ULL << 35)));
   assert(!strcmp(master.peers[0].firmware_version, "test-version"));
-  // A legacy inventory arriving after the extended one must not erase its version.
+  // Repeated inventories are idempotent.
   slave.send_inventory(master_mac);
   const auto legacy = network.front().bytes;
   auto malformed = network.back().bytes;
@@ -823,7 +878,7 @@ void test_provisioned_gpio_inventory() {
   master.handle_radio(received, fake_now);
   assert(!strcmp(master.peers[0].firmware_version, "test-version"));
   // Invalid version length cannot replace a previously accepted catalog.
-  malformed[w::HEADER_SIZE + 17 + malformed[w::HEADER_SIZE + 8] * 14] = 32;
+  malformed[w::HEADER_SIZE + 17 + malformed[w::HEADER_SIZE + 8] * 12] = 32;
   received.size = malformed.size();
   memcpy(received.data, malformed.data(), malformed.size());
   master.handle_radio(received, fake_now + 1);
@@ -987,9 +1042,9 @@ void test_car_layout_distribution_and_recovery() {
   auto c = fixture();
   c.effects[0].duration_ms = 5000;
   c.layout_count = 3;
-  c.layout[0] = layout_row(slave_mac, mesh_interop_MatrixDriver_WS2812, 0, 1);
-  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_HC595, 1, 0);
-  c.layout[2] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 1, 2);
+  c.layout[0] = layout_row(slave_mac, mesh_interop_MatrixDriver_DRIVER_1, 0, 1);
+  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_DRIVER_2, 1, 0);
+  c.layout[2] = layout_row(master_mac, mesh_interop_MatrixDriver_DRIVER_1, 1, 2);
   upload(master, c, 80);
   cycles(master, slave, 200, true);
   assert(master.peers[0].ready && slave.local && master.local);
@@ -1234,7 +1289,7 @@ void test_preview_request_with_local_output() {
   auto config = fixture();
   config.effects[0].duration_ms = 0;
   config.sources[0].kind = mesh_interop_MatrixSource_Kind_DEFAULT_STATE;
-  config.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 0, 1);
+  config.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_DRIVER_1, 0, 1);
   upload(master, config, 899);
   cycles(master, slave, 250);
   assert(master.local && master.local->definitions().output_mappings_count == 1);
@@ -1264,9 +1319,9 @@ void test_layout_editor_service() {
   c.effects[0].duration_ms = 0;
   c.sources[0].kind = mesh_interop_MatrixSource_Kind_DEFAULT_STATE;
   c.layout_count = 3;
-  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 0, 1);
-  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_WS2812, 1, 2);
-  c.layout[2] = layout_row(slave_mac, mesh_interop_MatrixDriver_HC595, 2, 1);
+  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_DRIVER_1, 0, 1);
+  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_DRIVER_1, 1, 2);
+  c.layout[2] = layout_row(slave_mac, mesh_interop_MatrixDriver_DRIVER_2, 2, 1);
   for (auto& row : c.layout)
     snprintf(row.name, sizeof(row.name), "%0120d", 1);
   upload(master, c, 90);
@@ -1414,7 +1469,7 @@ void test_layout_editor_service() {
   configure_node(fresh, true);
   update->expected_revision = 0;
   update->layout_count = 1;
-  update->layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 0, 1);
+  update->layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_DRIVER_1, 0, 1);
   upload_layout(fresh, *update, 97);
   assert(fresh.revision == 1 && fresh.candidate && fresh.candidate->entries_count == 0);
   assert(fresh.candidate->schema_version == SCHEMA_VERSION && fresh.candidate->layout_count == 1);
@@ -1636,8 +1691,8 @@ void test_boot_and_default_start_together() {
   c.entries[1].effect_id = 5;
   c.entries[1].priority = 20;
   c.layout_count = 2;
-  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 0, 1);
-  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_WS2812, 1, 2);
+  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_DRIVER_1, 0, 1);
+  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_DRIVER_1, 1, 2);
   upload(master, c, 202);
   for (unsigned i = 0; i < 250 && (!master.local || !slave.local); ++i) {
     cycles(master, slave, 1);
@@ -1674,8 +1729,8 @@ void test_boot_waits_for_first_slave_heartbeat() {
   c.sources[0].kind = mesh_interop_MatrixSource_Kind_ON_BOOT;
   c.effects[0].duration_ms = 500;
   c.layout_count = 2;
-  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 0, 1);
-  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_WS2812, 1, 2);
+  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_DRIVER_1, 0, 1);
+  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_DRIVER_1, 1, 2);
   upload(master, c, 203);
   cycles(master, slave, 99);
   assert(master.deployment && !master.local && !slave.local);
@@ -1835,16 +1890,17 @@ void test_six_driver_inventory_and_independent_remote_leds() {
   assert(six_outputs[5].shown[1].g == 220 && six_outputs[5].shown[1].r == 0);
   network.clear();
   slave.send_inventory(master_mac);
-  assert(network.size() == 2 && network.front().bytes.size() == w::HEADER_SIZE + 101);
-  assert(network.back().bytes.size() ==
-         w::HEADER_SIZE + 102 + strlen(fake_app_description.version));
+  assert(network.size() == 1 &&
+         network.front().bytes.size() ==
+             w::HEADER_SIZE + 18 + 12 * 12 + strlen(fake_app_description.version));
   auto frame = network.front().bytes;
   network.clear();
   packet packet{};
   memcpy(packet.mac, slave_mac, 6);
   packet.size = frame.size();
-  // Duplicate physical slot IDs cannot partially replace the existing catalog.
-  frame[w::HEADER_SIZE + 9 + 14] = frame[w::HEADER_SIZE + 9];
+  // Duplicate logical outputs cannot partially replace the existing catalog.
+  frame[w::HEADER_SIZE + 9 + 12] = frame[w::HEADER_SIZE + 9];
+  frame[w::HEADER_SIZE + 10 + 12] = frame[w::HEADER_SIZE + 10];
   memcpy(packet.data, frame.data(), frame.size());
   const auto accepted_at = master.peers[0].catalog_at;
   master.handle_radio(packet, fake_now + 1);
@@ -1852,6 +1908,49 @@ void test_six_driver_inventory_and_independent_remote_leds() {
   connected_lighting_drivers::configured_resolver = resolve;
   network.clear();
 }
+class mixed_test_driver : public canvas_test_driver {
+public:
+  mixed_test_driver() : canvas_test_driver(6) {}
+  size_t get_layout_source_count() const override { return 3; }
+  size_t get_layout_pixel_count(uint32_t source) const override {
+    constexpr size_t lengths[] = {3, 1, 2};
+    return source < 3 ? lengths[source] : 0;
+  }
+  size_t get_layout_pixel_offset(uint32_t source) const override {
+    constexpr size_t offsets[] = {0, 3, 4};
+    return source < 3 ? offsets[source] : 0;
+  }
+  lighting_driver_kind get_layout_source_kind(uint32_t source) const override {
+    return source == 1 ? lighting_driver_kind::RGB_LED_MODULE : lighting_driver_kind::LED_STRIP;
+  }
+};
+mixed_test_driver mixed_output;
+rgb_lighting_driver* resolve_mixed(uint32_t id) { return id == 1 ? &mixed_output : nullptr; }
+
+void test_mixed_inventory_reports_each_logical_output() {
+  network.clear();
+  connected_lighting_drivers::configured_resolver = resolve_mixed;
+  service master, slave;
+  configure_node(master, true);
+  configure_node(slave, false);
+  slave.send_inventory(master_mac);
+  bool drop = false;
+  deliver(master, slave, drop);
+  assert(master.peer_count == 1 && master.peers[0].outputs_count == 3);
+  const auto& outputs = master.peers[0].outputs;
+  for (size_t i = 0; i < 3; ++i) {
+    assert(outputs[i].source_index == i && outputs[i].driver == mesh_interop_MatrixDriver_DRIVER_1);
+    assert(outputs[i].pixel_count == mixed_output.get_layout_pixel_count(i));
+    assert(outputs[i].driver_kind ==
+           static_cast<mesh_interop_MatrixDriverKind>(mixed_output.get_layout_source_kind(i)));
+  }
+  auto config = fixture();
+  config.layout[0].source_index = 2;
+  assert(!validate(config, master_mac));
+  connected_lighting_drivers::configured_resolver = resolve;
+  network.clear();
+}
+
 class growable_test_driver : public canvas_test_driver {
 public:
   growable_test_driver() : canvas_test_driver(4) {}
@@ -1959,7 +2058,7 @@ void test_configurable_strip_and_identify_preview() {
   assert(restored.candidate && restored.candidate->layout[0].to == 12);
   assert(restored.candidate->layout[0].car_position == mesh_interop_CarPosition_FRONT_LEFT_DOOR);
   // A local persisted strip also reserves its configured length during restore.
-  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 0, 12);
+  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_DRIVER_1, 0, 12);
   assert(restored.prepare_runtime(c, 2) && growing_output.get_pixel_count() == 12);
   connected_lighting_drivers::configured_resolver = resolve;
   network.clear();
@@ -1976,11 +2075,11 @@ void test_local_layout_validation_errors() {
   service master;
   configure_node(master, true);
   auto c = fixture();
-  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 0, 1);
+  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_DRIVER_1, 0, 1);
   assert(!master.platform_validate(c, true));
   c.layout[0].driver = mesh_interop_MatrixDriver_DRIVER_3;
   assert(!strcmp(master.platform_validate(c, true), "Layout references a missing local driver"));
-  c.layout[0].driver = mesh_interop_MatrixDriver_WS2812;
+  c.layout[0].driver = mesh_interop_MatrixDriver_DRIVER_1;
   c.layout[0].source_index = 1;
   assert(!strcmp(master.platform_validate(c, true),
                  "Layout references a missing local driver source"));
@@ -1992,8 +2091,8 @@ void test_local_layout_validation_errors() {
   assert(!master.platform_validate(c, true));
   connected_lighting_drivers::configured_resolver = resolve_layout_capacity;
   c.layout_count = 2;
-  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 0, 24);
-  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_WS2812, 24, 84);
+  c.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_DRIVER_1, 0, 24);
+  c.layout[1] = layout_row(slave_mac, mesh_interop_MatrixDriver_DRIVER_1, 24, 84);
   assert(!master.platform_validate(c, true));
   connected_lighting_drivers::configured_resolver = resolve;
 }
@@ -2012,6 +2111,7 @@ int main() {
   matrix_core_tests_main();
   matrix_service::gpio_queue = xQueueCreate(64, sizeof(matrix_service::gpio_event));
   test_animation_preview_distribution();
+  test_signal_sources_share_broadcast_path();
   test_deploy_recover_persist();
   test_old_matrix_evaluates_until_shared_boundary();
   test_command_retry_gap_and_snapshot_overflow();
@@ -2034,6 +2134,7 @@ int main() {
   test_standby_blanks_and_recovers();
   test_discovery_wakes_node_and_requires_fresh_sync();
   test_six_driver_inventory_and_independent_remote_leds();
+  test_mixed_inventory_reports_each_logical_output();
   test_configurable_strip_and_identify_preview();
   test_local_layout_validation_errors();
   test_missing_provisioning_reports_error();
