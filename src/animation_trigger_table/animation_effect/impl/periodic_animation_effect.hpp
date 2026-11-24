@@ -33,6 +33,15 @@ public:
   explicit animation_effect_instance(periodic_animation_options options)
       : timed_animation_effect_instance(options.duration_ms), _options(options) {}
   animation_effect_type type() const override { return effect_type; }
+  void seek(uint64_t elapsed_ms) override {
+    _sampling = false;
+    timed_animation_effect_instance::seek(elapsed_ms);
+  }
+  void seek_position(uint32_t position) override {
+    _sampling = true;
+    _elapsed_ms = uint64_t(_options.period_ms) * std::min(position, animation_math::SCALE) /
+                  animation_math::SCALE;
+  }
   esp_err_t render(rgb_lighting_driver& driver) const override {
     using namespace animation_math;
     if (_options.period_ms < 2 || !_options.duty_percent || _options.duty_percent > 100)
@@ -67,7 +76,7 @@ public:
       if (count > size_t(UINT16_MAX) + 1 || render_count > size_t(UINT16_MAX) + 1)
         return ESP_ERR_INVALID_ARG;
       const uint64_t elapsed =
-          _options.loop ? time : std::min<uint64_t>(_elapsed_ms, _options.period_ms);
+          _options.loop && !_sampling ? time : std::min<uint64_t>(_elapsed_ms, _options.period_ms);
       const size_t filled = (elapsed * count + _options.period_ms - 1) / _options.period_ms;
       const size_t center = std::min(driver.get_canvas_center(), count);
       const bool middle_pixel = count % 2 && center == count / 2;
@@ -124,6 +133,7 @@ public:
 
 private:
   periodic_animation_options _options;
+  bool _sampling = false;
 };
 
 template <animation_effect_type effect_type>

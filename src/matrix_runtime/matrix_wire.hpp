@@ -24,7 +24,9 @@ enum type : uint8_t {
   IDENTIFY_ACK,
   GPIO_STATE,
   GPIO_STATE_ACK,
-  GPIO_STATE_REQUEST
+  GPIO_STATE_REQUEST,
+  SIGNAL_BATCH,
+  SENSOR_BATCH
 };
 inline uint64_t get(const uint8_t* p, size_t n) {
   uint64_t v = 0;
@@ -50,6 +52,6 @@ inline std::vector<uint8_t> packet(type t, const std::vector<uint8_t>& body) {
 }
 inline bool valid(const uint8_t* p, size_t n) {
   return n >= HEADER_SIZE && n <= PACKET_LIMIT && get(p, 4) == MAGIC && p[4] == VERSION &&
-         get(p + 6, 2) == n - HEADER_SIZE && p[5] >= BEGIN && p[5] <= GPIO_STATE_REQUEST;
+         get(p + 6, 2) == n - HEADER_SIZE && p[5] >= BEGIN && p[5] <= SENSOR_BATCH;
 }
 } // namespace matrix::wire

@@ -1,5 +1,7 @@
 #include "matrix_runtime/matrix_core.hpp"
 #include "matrix_runtime/matrix_wire.hpp"
+#include "matrix_runtime/signal_generator.hpp"
+#include "matrix_runtime/signal_buffer.hpp"
 #include "animation_trigger_table/animation_effect/impl/keyframe_animation_effect.hpp"
 #include "animation_trigger_table/animation_effect/impl/periodic_animation_effect.hpp"
 #include <cassert>
@@ -494,6 +496,88 @@ void test_preview_player() {
   assert(output.shown.b == 255 && output.shown.r == 0);
   normal.tick(210000);
   assert(output.shown.r == 255 && output.shown.b == 0);
+}
+void test_modulation_and_signal_buffer() {
+  mesh_interop_SignalGenerator signal{};
+  signal.id = 1;
+  strcpy(signal.name, "Wave");
+  signal.kind = mesh_interop_SignalGenerator_Kind_TRIANGLE;
+  signal.period_ms = 1000;
+  signal.amplitude = 1;
+  assert(valid_signal(signal));
+  assert(virtual_signal_value(signal, 0) == 0 && virtual_signal_value(signal, 500000) == 1);
+  mesh_interop_AnimationModulation mapping{};
+  mapping.signal_id = 1;
+  mapping.maximum = 1;
+  assert(valid_modulation(mapping));
+  assert(map_signal(-1, mapping) == 0 && map_signal(2, mapping) == 65536);
+  mapping.curve = mesh_interop_AnimationModulation_Curve_EASE_IN;
+  assert(map_signal(0.5f, mapping) == 16384);
+  signal_buffer buffer;
+  assert(buffer.update(20, 1, 100000, 0));
+  assert(buffer.update(20, 1, 120000, 1));
+  float value = 0;
+  assert(buffer.lookup(20, 1, 110000, value) && value == 0.5f);
+  assert(!buffer.lookup(20, 1, 90000, value));
+  assert(!buffer.lookup(20, 1, 400001, value));
+  auto c = fixture();
+  c.signals_count = 1;
+  c.signals[0] = signal;
+  c.sources[0].kind = mesh_interop_MatrixSource_Kind_DEFAULT_STATE;
+  auto& effect = c.effects[0];
+  effect.kind = mesh_interop_MatrixEffect_Kind_BLINK;
+  effect.period_ms = 1000;
+  effect.duration_ms = 100;
+  effect.has_modulation = true;
+  effect.modulation = mapping;
+  effect.modulation.curve = mesh_interop_AnimationModulation_Curve_LINEAR;
+  assert(!validate(c, master_mac));
+  player p(resolve);
+  assert(p.prepare(c, slave_mac, 10, 20));
+  auto lookup = [](void* arg, uint64_t, uint32_t, uint64_t, float& out) {
+    out = *static_cast<float*>(arg);
+    return true;
+  };
+  value = 0.25f;
+  p.set_signal_lookup(lookup, &value);
+  assert(p.enqueue(start()));
+  p.tick(100000);
+  assert(output.shown.r == 255);
+  value = 0.75f;
+  p.tick(1000000);
+  assert(output.shown.r == 0);
+  value = 0.25f;
+  p.tick(2000000);
+  assert(output.shown.r == 255);
+  auto snapshot = p.snapshot(p.definitions(), 0, 0);
+  assert(snapshot.states[0].active);
+  evaluator rules;
+  rules.configure(&c, 10, 20);
+  std::vector<animation_command> commands;
+  auto sink = [](void* arg, const animation_command& command) {
+    static_cast<std::vector<animation_command>*>(arg)->push_back(command);
+    return true;
+  };
+  rules.tick(100000, nullptr, 0, 100000, sink, &commands);
+  rules.tick(1000000, nullptr, 0, 1000000, sink, &commands);
+  assert(commands.size() == 1);
+}
+void test_signal_history_capacity_and_reuse() {
+  signal_buffer buffer;
+  for (uint64_t revision = 1; revision <= 2; ++revision)
+    for (uint32_t id = 1; id <= 32; ++id)
+      assert(buffer.update(revision, id, 100000, float(id)));
+  assert(!buffer.update(3, 1, 100000, 1));
+  float value = 0;
+  assert(buffer.lookup(1, 32, 100000, value) && value == 32);
+  buffer.retain(2);
+  assert(!buffer.lookup(1, 32, 100000, value));
+  assert(buffer.lookup(2, 32, 100000, value) && value == 32);
+  for (uint32_t id = 1; id <= 32; ++id)
+    assert(buffer.update(3, id, 100000, float(id)));
+  assert(!buffer.update(4, 1, 100000, 1));
+  buffer.clear();
+  assert(buffer.update(4, 1, 100000, 1));
 }
 void test_layering() {
   auto config = fixture();
@@ -1378,6 +1462,8 @@ int main() {
   test_master_evaluation_and_recovery();
   test_layering();
   test_preview_player();
+  test_modulation_and_signal_buffer();
+  test_signal_history_capacity_and_reuse();
   test_dimming();
   test_entry_background_opacity();
   test_modes();

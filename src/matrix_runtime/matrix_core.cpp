@@ -1,4 +1,5 @@
 #include "matrix_core.hpp"
+#include "signal_generator.hpp"
 #include "../animation_trigger_table/animation_effect/impl/static_color_animation_effect.hpp"
 #include "../animation_trigger_table/animation_effect/impl/keyframe_animation_effect.hpp"
 #include "../animation_trigger_table/animation_effect/impl/periodic_animation_effect.hpp"
@@ -49,13 +50,13 @@ runtime_config::runtime_config(const matrix_config& c)
     : schema_version(c.schema_version), factory_default(c.factory_default),
       effects_count(c.effects_count), sources_count(c.sources_count),
       conditions_count(c.conditions_count), entries_count(c.entries_count),
-      layout_count(c.layout_count), modes_count(c.modes_count), active_mode_id(c.active_mode_id),
-      has_center_index(c.has_center_index), center_index(c.center_index),
-      effects(c.effects, c.effects + c.effects_count),
+      layout_count(c.layout_count), modes_count(c.modes_count), signals_count(c.signals_count),
+      active_mode_id(c.active_mode_id), has_center_index(c.has_center_index),
+      center_index(c.center_index), effects(c.effects, c.effects + c.effects_count),
       sources(c.sources, c.sources + c.sources_count),
       conditions(c.conditions, c.conditions + c.conditions_count),
       entries(c.entries, c.entries + c.entries_count), layout(c.layout, c.layout + c.layout_count),
-      modes(c.modes, c.modes + c.modes_count),
+      modes(c.modes, c.modes + c.modes_count), signals(c.signals, c.signals + c.signals_count),
       _encoded(encode(mesh_interop_MatrixConfig_fields, &c)) {}
 bool runtime_config::reencode() {
   auto write = [&](pb_ostream_t& stream) {
@@ -83,6 +84,8 @@ bool runtime_config::reencode() {
                     layout) &&
            scalar(mesh_interop_MatrixConfig_factory_default_tag, factory_default) &&
            messages(mesh_interop_MatrixConfig_modes_tag, mesh_interop_MatrixMode_fields, modes) &&
+           messages(mesh_interop_MatrixConfig_signals_tag, mesh_interop_SignalGenerator_fields,
+                    signals) &&
            scalar(mesh_interop_MatrixConfig_active_mode_id_tag, active_mode_id) &&
            (!has_center_index ||
             (pb_encode_tag(&stream, PB_WT_VARINT, mesh_interop_MatrixConfig_center_index_tag) &&
@@ -111,6 +114,7 @@ void runtime_config::copy_to(matrix_config& c) const {
   c.entries_count = entries_count;
   c.layout_count = layout_count;
   c.modes_count = modes_count;
+  c.signals_count = signals_count;
   c.active_mode_id = active_mode_id;
   c.has_center_index = has_center_index;
   c.center_index = center_index;
@@ -120,6 +124,7 @@ void runtime_config::copy_to(matrix_config& c) const {
   std::copy(entries.begin(), entries.end(), c.entries);
   std::copy(layout.begin(), layout.end(), c.layout);
   std::copy(modes.begin(), modes.end(), c.modes);
+  std::copy(signals.begin(), signals.end(), c.signals);
 }
 heap_object<matrix_config> runtime_config::to_wire() const {
   auto c = make_heap_object<matrix_config>();
@@ -214,6 +219,8 @@ std::array<animation_keyframe, MAX_ANIMATION_KEYFRAMES> effect_keyframes(const m
   return frames;
 }
 const char* validate_effect(const matrix_effect& e) {
+  if (e.has_modulation && !valid_modulation(e.modulation))
+    return "Invalid animation modulation";
   if (e.red > 255 || e.green > 255 || e.blue > 255 || e.alpha > 255)
     return "Invalid effect color";
   if (e.keyframes_count > MAX_ANIMATION_KEYFRAMES)
@@ -320,17 +327,25 @@ const char* validate_config(const config_type& c, const uint8_t master_mac[6]) {
   if (c.schema_version != SCHEMA_VERSION)
     return "Unsupported schema version (expected 0)";
   if (c.entries_count > 32 || c.effects_count > 32 || c.sources_count > 32 ||
-      c.conditions_count > 32 || c.modes_count > 32 || c.layout_count > MAX_LAYOUT_SOURCES)
+      c.conditions_count > 32 || c.modes_count > 32 || c.signals_count > 32 ||
+      c.layout_count > MAX_LAYOUT_SOURCES)
     return "Too many definitions";
   if (!unique(std::data(c.effects), c.effects_count) ||
       !unique(std::data(c.sources), c.sources_count) ||
       !unique(std::data(c.conditions), c.conditions_count) ||
-      !unique(std::data(c.entries), c.entries_count) || !unique(std::data(c.modes), c.modes_count))
+      !unique(std::data(c.entries), c.entries_count) ||
+      !unique(std::data(c.modes), c.modes_count) || !unique(std::data(c.signals), c.signals_count))
     return "Definition IDs must be nonzero and unique";
   for (size_t i = 0; i < c.effects_count; ++i) {
     if (auto error = validate_effect(c.effects[i]))
       return error;
+    if (c.effects[i].has_modulation &&
+        !lookup(std::data(c.signals), c.signals_count, c.effects[i].modulation.signal_id))
+      return "Animation modulation references an unknown signal";
   }
+  for (size_t i = 0; i < c.signals_count; ++i)
+    if (!valid_signal(c.signals[i]))
+      return "Invalid signal generator";
   for (size_t i = 0; i < c.sources_count; ++i) {
     const auto& s = c.sources[i];
     if (s.kind != mesh_interop_MatrixSource_Kind_DEFAULT_STATE &&
@@ -812,6 +827,9 @@ bool player::prepare(const playback_definitions& d,
     _layers[i].effect.reset(create_effect(*effects[i]));
     if (!_layers[i].effect)
       return false;
+    _layers[i].modulated = effects[i]->has_modulation;
+    if (effects[i]->has_modulation)
+      _layers[i].modulation = effects[i]->modulation;
   }
   return true;
 }
@@ -937,9 +955,18 @@ esp_err_t player::tick(uint64_t now, bool render, uint32_t excluded_driver,
       continue;
     const auto elapsed = now < l.started ? 0 : (now - l.started) / 1000;
     l.elapsed = std::max(l.elapsed, elapsed);
-    l.effect->seek(l.elapsed);
-    if (l.effect->is_finished())
-      l.active = false;
+    if (l.modulated) {
+      float value = 0;
+      l.signal_ready = _signal_lookup && _signal_lookup(_signal_arg, _definitions.revision,
+                                                        l.modulation.signal_id, now, value);
+      if (l.signal_ready)
+        l.effect->seek_position(map_signal(value, l.modulation));
+    } else {
+      l.signal_ready = true;
+      l.effect->seek(l.elapsed);
+      if (l.effect->is_finished())
+        l.active = false;
+    }
   }
   if (!render || !_resolver)
     return ESP_OK;
@@ -961,7 +988,7 @@ esp_err_t player::tick(uint64_t now, bool render, uint32_t excluded_driver,
   }
   for (size_t j = 0; j < _definitions.layers_count; ++j) {
     size_t i = order[j];
-    if (_layers[i].active && _layers[i].begun) {
+    if (_layers[i].active && _layers[i].begun && _layers[i].signal_ready) {
       for (size_t k = 0; k < _definitions.output_mappings_count; ++k) {
         const auto& mapping = _definitions.output_mappings[k];
         if (mapping.driver == excluded_driver && mapping.source_index == excluded_source)
@@ -1080,7 +1107,7 @@ void evaluator::tick(uint64_t now, const trigger_gpio_edge_t* edges, size_t coun
       }
       continue;
     }
-    if (_active[i] && effect.duration_ms && now >= _starts[i] &&
+    if (_active[i] && !effect.has_modulation && effect.duration_ms && now >= _starts[i] &&
         (now - _starts[i]) / 1000 >= effect.duration_ms)
       _active[i] = false;
     bool fired = source.kind == mesh_interop_MatrixSource_Kind_DEFAULT_STATE && !_active[i];

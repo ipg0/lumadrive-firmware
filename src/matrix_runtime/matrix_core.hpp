@@ -30,7 +30,8 @@ using driver_resolver = rgb_lighting_driver* (*)(uint32_t);
 struct runtime_config {
   runtime_config()
       : schema_version(SCHEMA_VERSION), factory_default(false), effects_count(0), sources_count(0),
-        conditions_count(0), entries_count(0), layout_count(0), modes_count(0), active_mode_id(0) {}
+        conditions_count(0), entries_count(0), layout_count(0), modes_count(0), signals_count(0),
+        active_mode_id(0) {}
   explicit runtime_config(const matrix_config& config);
   void copy_to(matrix_config& config) const;
   heap_object<matrix_config> to_wire() const;
@@ -38,7 +39,8 @@ struct runtime_config {
   bool reencode();
   uint32_t schema_version;
   bool factory_default;
-  size_t effects_count, sources_count, conditions_count, entries_count, layout_count, modes_count;
+  size_t effects_count, sources_count, conditions_count, entries_count, layout_count, modes_count,
+      signals_count;
   uint32_t active_mode_id;
   bool has_center_index = false;
   uint32_t center_index = 0;
@@ -48,6 +50,7 @@ struct runtime_config {
   std::vector<mesh_interop_MatrixEntry> entries;
   std::vector<mesh_interop_MatrixLayout> layout;
   std::vector<mesh_interop_MatrixMode> modes;
+  std::vector<mesh_interop_SignalGenerator> signals;
 
 private:
   std::vector<uint8_t> _encoded;
@@ -125,6 +128,10 @@ public:
   bool prepare(const player& source);
   // Prepare a single temporary layer against an existing node's layout.
   bool prepare_preview(const playback_definitions& layout, const matrix_effect& effect);
+  void set_signal_lookup(bool (*lookup)(void*, uint64_t, uint32_t, uint64_t, float&), void* arg) {
+    _signal_lookup = lookup;
+    _signal_arg = arg;
+  }
   bool enqueue(const animation_command& command);
   bool restore(const animation_snapshot& snapshot);
   animation_snapshot snapshot(const playback_definitions& subset, uint32_t sequence,
@@ -142,8 +149,12 @@ private:
     bool begun = false;
     uint64_t started = 0;
     uint64_t elapsed = 0;
+    bool modulated = false, signal_ready = false;
+    mesh_interop_AnimationModulation modulation{};
   };
   int find(uint32_t id) const;
+  bool (*_signal_lookup)(void*, uint64_t, uint32_t, uint64_t, float&) = nullptr;
+  void* _signal_arg = nullptr;
   bool prepare(const playback_definitions& definitions,
                const std::array<const matrix_effect*, 32>& effects);
   playback_definitions _definitions{};

@@ -1,6 +1,9 @@
 #include "matrix_service.hpp"
 #include "matrix_core.hpp"
 #include "matrix_wire.hpp"
+#include "signal_generator.hpp"
+#include "signal_buffer.hpp"
+#include "memory_stress_test.hpp"
 #include "default_matrix.hpp"
 #include "../lighting_driver/impl/linear_lighting_driver_view.hpp"
 #include "../connected_lighting_drivers/connected_lighting_drivers.hpp"
@@ -56,6 +59,7 @@ constexpr uint32_t IDENTIFY_ALL_DRIVERS = UINT32_MAX;
     config.effects_count = config.sources_count = config.conditions_count = config.entries_count =
         0;
     config.modes_count = 0;
+    config.signals_count = 0;
     config.active_mode_id = 0;
   }
   auto stream = pb_istream_from_buffer(bytes.data(), bytes.size());
@@ -117,6 +121,9 @@ constexpr uint32_t IDENTIFY_ALL_DRIVERS = UINT32_MAX;
     } else if (!layout && tag == mesh_interop_MatrixUpdate_modes_tag) {
       if (!repeated(mesh_interop_MatrixMode_fields, config.modes, config.modes_count))
         return false;
+    } else if (!layout && tag == mesh_interop_MatrixUpdate_signals_tag) {
+      if (!repeated(mesh_interop_SignalGenerator_fields, config.signals, config.signals_count))
+        return false;
     } else if (!pb_skip_field(&stream, wire))
       return false;
   }
@@ -140,6 +147,7 @@ bool decode_compact_editor_update(const std::vector<uint8_t>& bytes, bool layout
     config.conditions.clear();
     config.entries.clear();
     config.modes.clear();
+    config.signals.clear();
     config.active_mode_id = 0;
   }
   auto stream = pb_istream_from_buffer(bytes.data(), bytes.size());
@@ -199,6 +207,9 @@ bool decode_compact_editor_update(const std::vector<uint8_t>& bytes, bool layout
     } else if (!layout && tag == mesh_interop_MatrixUpdate_modes_tag) {
       if (!repeated(mesh_interop_MatrixMode_fields, config.modes, 32))
         return false;
+    } else if (!layout && tag == mesh_interop_MatrixUpdate_signals_tag) {
+      if (!repeated(mesh_interop_SignalGenerator_fields, config.signals, 32))
+        return false;
     } else if (!pb_skip_field(&stream, wire))
       return false;
   }
@@ -208,6 +219,7 @@ bool decode_compact_editor_update(const std::vector<uint8_t>& bytes, bool layout
   config.entries_count = config.entries.size();
   config.layout_count = config.layout.size();
   config.modes_count = config.modes.size();
+  config.signals_count = config.signals.size();
   return true;
 }
 bool decode_compact_config(const std::vector<uint8_t>& bytes, runtime_config& config) {
@@ -267,6 +279,9 @@ bool decode_compact_config(const std::vector<uint8_t>& bytes, runtime_config& co
     } else if (tag == mesh_interop_MatrixConfig_modes_tag) {
       if (!repeated(mesh_interop_MatrixMode_fields, config.modes, 32))
         return false;
+    } else if (tag == mesh_interop_MatrixConfig_signals_tag) {
+      if (!repeated(mesh_interop_SignalGenerator_fields, config.signals, 32))
+        return false;
     } else if (!pb_skip_field(&stream, wire))
       return false;
   }
@@ -276,6 +291,7 @@ bool decode_compact_config(const std::vector<uint8_t>& bytes, runtime_config& co
   config.entries_count = config.entries.size();
   config.layout_count = config.layout.size();
   config.modes_count = config.modes.size();
+  config.signals_count = config.signals.size();
   return true;
 }
 constexpr auto STAGE_RECEIVING = mesh_interop_MatrixStatus_Stage_RECEIVING;
@@ -292,6 +308,11 @@ struct packet {
   uint32_t generation = 0;
   uint8_t data[512]{};
 };
+struct signal_packet {
+  uint8_t mac[6]{};
+  uint16_t size = 0;
+  uint8_t data[w::PACKET_LIMIT]{};
+};
 struct gpio_event {
   uint64_t at;
   uint32_t pin;
@@ -304,6 +325,8 @@ struct pending_gpio_event {
 };
 QueueHandle_t radio_queue = nullptr, priority_queue = nullptr, ble_queue = nullptr,
               gpio_queue = nullptr;
+QueueHandle_t sensor_queue = nullptr;
+QueueHandle_t signal_queue = nullptr;
 TaskHandle_t worker_task = nullptr;
 std::atomic<uint32_t> ble_generation{0};
 std::atomic<bool> overflow{false};
@@ -408,6 +431,17 @@ public:
   uint64_t preview_start = 0, preview_end = 0;
   std::vector<uint8_t> preview_bytes;
   bool preview_distributing = false;
+  signal_buffer signal_values;
+  bool signal_memory_error = false;
+  uint64_t last_signal_batch = 0;
+  uint64_t last_sensor_batch = 0;
+  struct sensor_value {
+    uint8_t mac[6]{};
+    uint32_t id = 0;
+    uint64_t time = 0;
+    float value = 0;
+  };
+  std::array<sensor_value, 32> sensor_values{};
   heap_object<player> prepared_ledger, prepared_local;
   heap_object<player> retiring_ledger;
   heap_object<animation_snapshot> pending_snapshot;
@@ -435,10 +469,12 @@ public:
   void log_memory() const {
 #ifdef ESP_PLATFORM
     ESP_LOGI("matrix",
-             "Free heap: %u largest: %u; matrix stack headroom: %u bytes; player: %u bytes",
+             "Free heap: %u largest: %u; matrix stack headroom: %u; player: %u; service: %u; "
+             "config: %u bytes",
              unsigned(heap_caps_get_free_size(MALLOC_CAP_8BIT)),
              unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
-             unsigned(uxTaskGetStackHighWaterMark(nullptr)), unsigned(sizeof(player)));
+             unsigned(uxTaskGetStackHighWaterMark(nullptr)), unsigned(sizeof(player)),
+             unsigned(sizeof(service)), unsigned(sizeof(matrix_config)));
 #endif
   }
   void publish() {
@@ -477,6 +513,148 @@ public:
   }
   bool available(const peer& p, uint64_t now) const {
     return p.seen && (now <= p.seen || now - p.seen < 4000000);
+  }
+  static bool lookup_signal(void* arg, uint64_t rev, uint32_t id, uint64_t clock, float& value) {
+    return static_cast<service*>(arg)->signal_values.lookup(rev, id, clock, value);
+  }
+  void accept_sensor_value(const uint8_t* owner, uint32_t id, uint64_t time, float value,
+                           uint64_t clock) {
+    if (!id || !std::isfinite(value) || time > clock + 100000 ||
+        (clock > time && clock - time > 250000))
+      return;
+    sensor_value* entry = nullptr;
+    for (auto& candidate : sensor_values)
+      if (candidate.id == id && !memcmp(candidate.mac, owner, 6)) {
+        entry = &candidate;
+        break;
+      }
+    if (!entry)
+      for (auto& candidate : sensor_values)
+        if (!candidate.id) {
+          entry = &candidate;
+          break;
+        }
+    if (!entry || (entry->id && time <= entry->time))
+      return;
+    memcpy(entry->mac, owner, 6);
+    entry->id = id;
+    entry->time = time;
+    entry->value = value;
+  }
+  void accept_sensor_batch(const uint8_t* owner, const uint8_t* body, size_t size, uint64_t clock) {
+    if (size < 9 || w::get(body, 8) != session || !body[8] || body[8] > 14 ||
+        size != 9 + size_t(body[8]) * 16)
+      return;
+    for (size_t i = 0; i < body[8]; ++i) {
+      const auto* item = body + 9 + i * 16;
+      const auto id = uint32_t(w::get(item, 4)), bits = uint32_t(w::get(item + 12, 4));
+      float value;
+      memcpy(&value, &bits, sizeof(value));
+      accept_sensor_value(owner, id, w::get(item + 4, 8), value, clock);
+    }
+  }
+  void collect_sensor_samples(uint64_t clock) {
+    if (!sensor_queue || !master_clock_manager::instance().is_synchronized())
+      return;
+    const auto now = uint64_t(esp_timer_get_time());
+    if (last_sensor_batch && now - last_sensor_batch < 16667)
+      return;
+    last_sensor_batch = now;
+    std::vector<uint8_t> body;
+    w::put(body, session, 8);
+    w::put(body, 0, 1);
+    sensor_sample sample{};
+    uint8_t count = 0;
+    while (count < 14 && xQueueReceive(sensor_queue, &sample, 0) == pdTRUE) {
+      const auto timestamp =
+          master_clock_manager::instance().get_master_time_at(sample.captured_local_us);
+      if (timestamp < 0)
+        continue;
+      if (master)
+        accept_sensor_value(mac, sample.sensor_id, timestamp, sample.value, clock);
+      else {
+        uint32_t bits;
+        memcpy(&bits, &sample.value, sizeof(bits));
+        w::put(body, sample.sensor_id, 4);
+        w::put(body, timestamp, 8);
+        w::put(body, bits, 4);
+        ++count;
+      }
+    }
+    if (!master && count) {
+      const auto mesh = mesh_interop::instance().get_state();
+      if (mesh.nodes_count) {
+        body[8] = count;
+        send(mesh.nodes[0].mac, w::SENSOR_BATCH, body);
+      }
+    }
+  }
+  void accept_signal_batch(const uint8_t* body, size_t size, uint64_t clock) {
+    if (size < 25 || w::get(body, 8) != session)
+      return;
+    const auto rev = w::get(body + 8, 8), timestamp = w::get(body + 16, 8);
+    const auto count = body[24];
+    if (!count || count > 27 || size != 25 + size_t(count) * 8 || timestamp > clock + 150000 ||
+        (clock > timestamp && clock - timestamp > 250000))
+      return;
+    const bool valid_revision =
+        (local && rev == local->definitions().revision) ||
+        (pending_player && rev == pending_player->definitions().revision) ||
+        (master && ledger && rev == ledger->definitions().revision) ||
+        (master && retiring_ledger && rev == retiring_ledger->definitions().revision);
+    if (!valid_revision)
+      return;
+    for (size_t i = 0; i < count; ++i) {
+      const auto id = uint32_t(w::get(body + 25 + i * 8, 4));
+      const auto bits = uint32_t(w::get(body + 29 + i * 8, 4));
+      float value;
+      memcpy(&value, &bits, sizeof(value));
+      if (!id || !std::isfinite(value))
+        continue;
+      if (!signal_values.update(rev, id, timestamp, value)) {
+        if (!signal_memory_error)
+          error("Unable to allocate signal buffer");
+        signal_memory_error = true;
+      } else
+        signal_memory_error = false;
+    }
+  }
+  void send_signal_batches(const runtime_config& matrix, uint64_t rev, uint64_t clock) {
+    const uint8_t broadcast[6] = {255, 255, 255, 255, 255, 255};
+    size_t index = 0;
+    while (index < matrix.signals_count) {
+      std::vector<uint8_t> body;
+      w::put(body, session, 8);
+      w::put(body, rev, 8);
+      w::put(body, clock + 30000, 8);
+      w::put(body, 0, 1);
+      uint8_t count = 0;
+      while (index < matrix.signals_count && count < 27) {
+        const auto& signal = matrix.signals[index++];
+        float value = 0;
+        if (signal.kind == mesh_interop_SignalGenerator_Kind_SENSOR) {
+          const auto found =
+              std::find_if(sensor_values.begin(), sensor_values.end(), [&](const auto& entry) {
+                return entry.id == signal.sensor_id && !memcmp(entry.mac, signal.node_mac, 6) &&
+                       clock >= entry.time && clock - entry.time <= signal_buffer::STALE_US;
+              });
+          if (found == sensor_values.end())
+            continue;
+          value = found->value;
+        } else
+          value = virtual_signal_value(signal, clock);
+        uint32_t bits;
+        memcpy(&bits, &value, sizeof(bits));
+        w::put(body, signal.id, 4);
+        w::put(body, bits, 4);
+        ++count;
+      }
+      if (!count)
+        continue;
+      body[24] = count;
+      accept_signal_batch(body.data(), body.size(), clock);
+      send(broadcast, w::SIGNAL_BATCH, body);
+    }
   }
   template <typename config_type>
   const char* platform_validate(const config_type& c, bool check_peers) {
@@ -544,6 +722,13 @@ public:
       if (owner >= 0 && peers[owner].catalog_known &&
           !(peers[owner].gpio_mask & (1ULL << condition.gpio)))
         return "GPIO input is not provisioned on the condition node";
+    }
+    for (size_t i = 0; i < c.signals_count; ++i) {
+      const auto& signal = c.signals[i];
+      if (signal.kind == mesh_interop_SignalGenerator_Kind_SENSOR && check_peers &&
+          memcmp(signal.node_mac, mac, 6) &&
+          !mesh_interop::instance().slave_node_exists(signal.node_mac))
+        return "Sensor node is not paired";
     }
     return nullptr;
   }
@@ -1094,8 +1279,9 @@ public:
     message->master_session = session;
     message->revision = revision;
     message->start_at_us = clock + 500000 + peer_count * 500000;
-    const uint64_t duration =
-        it->duration_ms ? std::min<uint64_t>(it->duration_ms * 1000ULL, 10000000) : 10000000;
+    const uint64_t duration = !it->has_modulation && it->duration_ms
+                                  ? std::min<uint64_t>(it->duration_ms * 1000ULL, 10000000)
+                                  : 10000000;
     message->end_at_us = message->start_at_us + duration;
     message->has_effect = true;
     message->effect = *it;
@@ -1692,6 +1878,11 @@ public:
       if (index < 0)
         return;
       auto& p = peers[index];
+      if (type == w::SENSOR_BATCH) {
+        accept_sensor_batch(packet.mac, b, n,
+                            uint64_t(master_clock_manager::instance().get_master_time()));
+        return;
+      }
       if (!available(p, now))
         p.gpio_known = 0;
       if (type == w::INVENTORY && n >= 17 && w::get(b, 8) == session &&
@@ -1832,7 +2023,9 @@ public:
     if (!mesh_interop::instance().master_node_matches(packet.mac) ||
         !master_clock_manager::instance().is_synchronized())
       return;
-    if (type == w::GPIO_STATE_REQUEST && n == 8 && w::get(b, 8) == session) {
+    if (type == w::SIGNAL_BATCH) {
+      accept_signal_batch(b, n, uint64_t(master_clock_manager::instance().get_master_time()));
+    } else if (type == w::GPIO_STATE_REQUEST && n == 8 && w::get(b, 8) == session) {
       gpio_snapshot.clear();
       gpio_snapshot_acked = 0;
       gpio_snapshot_last_send = 0;
@@ -2233,6 +2426,14 @@ public:
           activate(clock);
       }
     }
+    if (config && ledger && (!last_signal_batch || now - last_signal_batch >= 16667)) {
+      signal_values.retain(ledger->definitions().revision,
+                           retiring_ledger ? retiring_ledger->definitions().revision : 0);
+      send_signal_batches(*config, ledger->definitions().revision, clock);
+      if (retiring_config && retiring_ledger && clock < activate_at)
+        send_signal_batches(*retiring_config, retiring_ledger->definitions().revision, clock);
+      last_signal_batch = now;
+    }
     collect_gpio(clock);
     local_gpio_high = read_input_levels(local_gpio_known);
     if (config && ledger) {
@@ -2410,6 +2611,7 @@ public:
     const auto observed = clock.session();
     if (session != observed) {
       preview_player.reset();
+      signal_values.clear();
       if (local)
         local->blank();
       session = observed;
@@ -2501,8 +2703,18 @@ public:
     initialize_configuration();
     log_memory();
     TickType_t next_frame = xTaskGetTickCount();
+#ifdef MATRIX_MEMORY_STRESS_TEST
+    bool memory_test_done = false;
+#endif
     for (;;) {
       uint64_t now = esp_timer_get_time();
+#ifdef MATRIX_MEMORY_STRESS_TEST
+      if (master && !memory_test_done && now - startup_at >= 10000000 &&
+          (config || now - startup_at >= 20000000)) {
+        memory_test_done = true;
+        run_memory_stress_test(config.get(), mac, connected_lighting_drivers::find);
+      }
+#endif
       if (!master)
         slave_step(now);
       packet p;
@@ -2512,6 +2724,15 @@ public:
       for (unsigned i = 0; i < 8 && xQueueReceive(radio_queue, &p, 0) == pdTRUE; ++i)
         if (!standby && !discovering && !waiting_for_discovery_sync)
           handle_radio(p, now);
+      signal_packet signal_frame{};
+      for (unsigned i = 0; i < 4 && xQueueReceive(signal_queue, &signal_frame, 0) == pdTRUE; ++i) {
+        if (!standby && !discovering && !waiting_for_discovery_sync) {
+          memcpy(p.mac, signal_frame.mac, 6);
+          p.size = signal_frame.size;
+          memcpy(p.data, signal_frame.data, p.size);
+          handle_radio(p, now);
+        }
+      }
       if (ble_rx.id() && upload_generation != ble_generation.load()) {
         ble_rx.reset();
         error("Upload connection closed", true);
@@ -2524,6 +2745,8 @@ public:
       if (old_id && !ble_rx.id())
         error("Upload timed out", true);
       auto clock = static_cast<uint64_t>(master_clock_manager::instance().get_master_time());
+      if (!standby && !discovering && !waiting_for_discovery_sync)
+        collect_sensor_samples(clock);
       if (master)
         master_step(now, clock);
       transfer_step(now);
@@ -2558,6 +2781,8 @@ public:
   void playback_step(uint64_t clock) {
     if (standby || discovering || waiting_for_discovery_sync)
       return;
+    signal_values.retain(local ? local->definitions().revision : 0,
+                         pending_player ? pending_player->definitions().revision : 0);
     if (pending_snapshot && pending_player && clock >= pending_snapshot->activate_at_us) {
       if (local)
         local->blank();
@@ -2596,14 +2821,17 @@ public:
       preview_player.reset();
     const bool previewing = preview_player && clock >= preview_start && clock < preview_end;
     if (local && synchronized) {
+      local->set_signal_lookup(lookup_signal, this);
       auto err = local->tick(clock, !previewing && identify_driver != IDENTIFY_ALL_DRIVERS,
                              identify_driver, identify_source);
       if (err != ESP_OK && !state.error[0])
         error("Animation driver failed");
     }
-    if (previewing && synchronized)
+    if (previewing && synchronized) {
+      preview_player->set_signal_lookup(lookup_signal, this);
       preview_player->tick(clock, identify_driver != IDENTIFY_ALL_DRIVERS, identify_driver,
                            identify_source);
+    }
     if (identify_driver) {
       const auto draw = [&](rgb_lighting_driver* driver, uint32_t source_index, bool all) {
         const auto capacity = driver->get_layout_pixel_count(source_index);
@@ -2657,7 +2885,10 @@ esp_err_t init() {
   priority_queue = xQueueCreate(16, sizeof(packet));
   ble_queue = xQueueCreate(8, sizeof(packet));
   gpio_queue = xQueueCreate(64, sizeof(gpio_event));
-  if (!radio_queue || !priority_queue || !ble_queue || !gpio_queue)
+  sensor_queue = xQueueCreate(32, sizeof(sensor_sample));
+  signal_queue = xQueueCreate(4, sizeof(signal_packet));
+  if (!radio_queue || !priority_queue || !ble_queue || !gpio_queue || !sensor_queue ||
+      !signal_queue)
     return ESP_ERR_NO_MEM;
   instance = make_heap_object<service>();
   if (!instance)
@@ -2673,6 +2904,20 @@ bool receive(const uint8_t mac[6], const uint8_t* data, size_t size) {
     return false;
   if (!initialized.load() || !matrix::wire::valid(data, size))
     return true;
+  if (data[5] == w::SIGNAL_BATCH || data[5] == w::SENSOR_BATCH) {
+    signal_packet frame{};
+    memcpy(frame.mac, mac, 6);
+    frame.size = size;
+    memcpy(frame.data, data, size);
+    if (xQueueSend(signal_queue, &frame, 0) != pdTRUE) {
+      signal_packet discarded;
+      xQueueReceive(signal_queue, &discarded, 0);
+      xQueueSend(signal_queue, &frame, 0);
+    }
+    if (worker_task)
+      xTaskNotifyGive(worker_task);
+    return true;
+  }
   packet p;
   memcpy(p.mac, mac, 6);
   memcpy(p.data, data, size);
@@ -2686,6 +2931,19 @@ bool receive(const uint8_t mac[6], const uint8_t* data, size_t size) {
                    : radio_queue;
   if (xQueueSend(queue, &p, 0) != pdTRUE)
     overflow.store(true);
+  if (worker_task)
+    xTaskNotifyGive(worker_task);
+  return true;
+}
+bool submit_sensor_sample(const sensor_sample& sample) {
+  if (!initialized.load() || !sample.sensor_id || !std::isfinite(sample.value))
+    return false;
+  if (xQueueSend(sensor_queue, &sample, 0) != pdTRUE) {
+    sensor_sample discarded{};
+    xQueueReceive(sensor_queue, &discarded, 0);
+    if (xQueueSend(sensor_queue, &sample, 0) != pdTRUE)
+      return false;
+  }
   if (worker_task)
     xTaskNotifyGive(worker_task);
   return true;

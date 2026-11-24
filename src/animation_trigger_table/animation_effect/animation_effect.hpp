@@ -20,7 +20,7 @@ public:
   virtual ~animation_effect_descriptor_base() = default;
   virtual animation_effect_type type() const = 0;
   // Return a new instance owned by the caller, or nullptr on allocation failure.
-  virtual animation_effect_instance_base *create_instance() const = 0;
+  virtual animation_effect_instance_base* create_instance() const = 0;
 };
 
 class animation_effect_instance_base {
@@ -33,9 +33,13 @@ public:
   virtual void seek(uint64_t elapsed_ms) {
     update(elapsed_ms > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(elapsed_ms));
   }
+  virtual void seek_position(uint32_t position) {
+    (void)position;
+    seek(0);
+  }
   virtual bool is_finished() const = 0;
   // Draw into the driver's frame buffer. The table clears and presents it.
-  virtual esp_err_t render(rgb_lighting_driver &driver) const = 0;
+  virtual esp_err_t render(rgb_lighting_driver& driver) const = 0;
 };
 
 template <animation_effect_type effect_type> class animation_effect_descriptor;
