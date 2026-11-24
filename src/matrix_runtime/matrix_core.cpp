@@ -218,8 +218,11 @@ std::array<animation_keyframe, MAX_ANIMATION_KEYFRAMES> effect_keyframes(const m
   }
   return frames;
 }
+bool uses_modulation(const matrix_effect& effect) {
+  return effect.kind != mesh_interop_MatrixEffect_Kind_STATIC_COLOR && effect.has_modulation;
+}
 const char* validate_effect(const matrix_effect& e) {
-  if (e.has_modulation && !valid_modulation(e.modulation))
+  if (uses_modulation(e) && !valid_modulation(e.modulation))
     return "Invalid animation modulation";
   if (e.red > 255 || e.green > 255 || e.blue > 255 || e.alpha > 255)
     return "Invalid effect color";
@@ -304,6 +307,7 @@ animation_effect_instance_base* create_effect(const matrix_effect& e) {
   options.wavelength_pixels = e.wavelength_pixels;
   options.reverse = e.reverse;
   options.fill_from_center = e.fill_from_center;
+  options.breathe_stop_at_last = e.breathe_stop_at_last;
   switch (e.kind) {
   case mesh_interop_MatrixEffect_Kind_BLINK:
     return animation_effect_descriptor<animation_effect_type::BLINK>(options).create_instance();
@@ -339,7 +343,7 @@ const char* validate_config(const config_type& c, const uint8_t master_mac[6]) {
   for (size_t i = 0; i < c.effects_count; ++i) {
     if (auto error = validate_effect(c.effects[i]))
       return error;
-    if (c.effects[i].has_modulation &&
+    if (uses_modulation(c.effects[i]) &&
         !lookup(std::data(c.signals), c.signals_count, c.effects[i].modulation.signal_id))
       return "Animation modulation references an unknown signal";
   }
@@ -827,8 +831,8 @@ bool player::prepare(const playback_definitions& d,
     _layers[i].effect.reset(create_effect(*effects[i]));
     if (!_layers[i].effect)
       return false;
-    _layers[i].modulated = effects[i]->has_modulation;
-    if (effects[i]->has_modulation)
+    _layers[i].modulated = uses_modulation(*effects[i]);
+    if (_layers[i].modulated)
       _layers[i].modulation = effects[i]->modulation;
   }
   return true;
@@ -1107,7 +1111,7 @@ void evaluator::tick(uint64_t now, const trigger_gpio_edge_t* edges, size_t coun
       }
       continue;
     }
-    if (_active[i] && !effect.has_modulation && effect.duration_ms && now >= _starts[i] &&
+    if (_active[i] && !uses_modulation(effect) && effect.duration_ms && now >= _starts[i] &&
         (now - _starts[i]) / 1000 >= effect.duration_ms)
       _active[i] = false;
     bool fired = source.kind == mesh_interop_MatrixSource_Kind_DEFAULT_STATE && !_active[i];

@@ -935,7 +935,9 @@ public:
     start_deployment(std::move(c));
     return true;
   }
-  void initialize_configuration() {
+  // Keeping these worker stages out of run() avoids reserving every stage's
+  // temporary stack space while nested BLE preview requests are processed.
+  [[gnu::noinline]] void initialize_configuration() {
     if (connected_lighting_drivers::status() != ESP_OK) {
       error("Hardware configuration missing or invalid; lighting disabled", true);
       return;
@@ -1599,7 +1601,7 @@ public:
     peers[index].snapshotting = kind == 2;
     peers[index].last_recover = esp_timer_get_time();
   }
-  void transfer_step(uint64_t now) {
+  [[gnu::noinline]] void transfer_step(uint64_t now) {
     if (tx.peer_index < 0 || (tx.last_send && now - tx.last_send < 100000))
       return;
     auto& p = peers[tx.peer_index];
@@ -2335,7 +2337,7 @@ public:
     send(dest, w::GPIO_EVENT, b);
     gpio_last_send = now;
   }
-  void master_step(uint64_t now, uint64_t clock) {
+  [[gnu::noinline]] void master_step(uint64_t now, uint64_t clock) {
     local_gpio_known = initialized_input_mask();
     local_gpio_high = read_input_levels(local_gpio_known);
     auto mesh = mesh_interop::instance().get_state();
@@ -2560,7 +2562,7 @@ public:
     gpio_events.clear();
     last_hello = 0;
   }
-  void slave_step(uint64_t now) {
+  [[gnu::noinline]] void slave_step(uint64_t now) {
     auto& clock = master_clock_manager::instance();
     if (!slave_started_at)
       slave_started_at = now;
@@ -2711,6 +2713,52 @@ public:
       last_hello = now;
     }
   }
+#ifdef MATRIX_MEMORY_STRESS_TEST
+  [[gnu::noinline]] void test_preview_stack() {
+    if (!config || config->effects.empty() || !local ||
+        !local->definitions().output_mappings_count) {
+      ESP_LOGW("stack_test", "SKIP: no active effect with a local output");
+      return;
+    }
+    auto request = make_heap_object<mesh_interop_MatrixUpload>();
+    auto input = make_heap_object<packet>();
+    if (!request || !input) {
+      ESP_LOGE("stack_test", "FAIL: unable to allocate preview request");
+      return;
+    }
+    request->which_operation = mesh_interop_MatrixUpload_layout_request_tag;
+    request->operation.layout_request.request_id = 1;
+    request->operation.layout_request.operation = mesh_interop_LayoutRequest_Operation_PREVIEW;
+    request->operation.layout_request.has_identify_options = true;
+    request->operation.layout_request.identify_options = config->effects[0].id;
+    const auto bytes = encode(mesh_interop_MatrixUpload_fields, request.get());
+    if (bytes.empty() || bytes.size() > sizeof(input->data)) {
+      ESP_LOGE("stack_test", "FAIL: unable to encode preview request");
+      return;
+    }
+    input->connection = 1;
+    input->generation = ble_generation.load();
+    input->size = bytes.size();
+    memcpy(input->data, bytes.data(), bytes.size());
+    handle_upload(*input, esp_timer_get_time());
+    const auto headroom = uxTaskGetStackHighWaterMark(nullptr);
+    if (!preview_player || headroom < 1024) {
+      ESP_LOGE("stack_test", "FAIL: preview=%u stack headroom=%u bytes",
+               unsigned(bool(preview_player)), unsigned(headroom));
+      return;
+    }
+    ESP_LOGI("stack_test", "PASS: preview request, matrix stack headroom=%u bytes",
+             unsigned(headroom));
+  }
+#endif
+  [[gnu::noinline]] void initialize_provisioned_gpio() {
+    playback_definitions provisioned;
+    for (uint32_t pin = 0; pin < 40; ++pin)
+      if (valid_input(pin))
+        provisioned.gpio_inputs[provisioned.gpio_inputs_count++] = pin;
+    if (!prepare_gpio(provisioned))
+      error("Unable to initialize provisioned GPIO inputs");
+  }
   void run() {
     master = global_config::instance().is_master_node();
     memcpy(mac, global_config::instance().get_mesh_mac(), 6);
@@ -2718,12 +2766,7 @@ public:
     state.master_session = session;
     memcpy(state.master_mac, mac, 6);
     startup_at = esp_timer_get_time();
-    playback_definitions provisioned;
-    for (uint32_t pin = 0; pin < 40; ++pin)
-      if (valid_input(pin))
-        provisioned.gpio_inputs[provisioned.gpio_inputs_count++] = pin;
-    if (!prepare_gpio(provisioned))
-      error("Unable to initialize provisioned GPIO inputs");
+    initialize_provisioned_gpio();
     rules.set_gpio_lookup(lookup_gpio, this);
     initialize_configuration();
     log_memory();
@@ -2739,6 +2782,7 @@ public:
         memory_test_done = true;
         run_memory_stress_test(config.get(), mac, connected_lighting_drivers::find,
                                decode_compact_config);
+        test_preview_stack();
       }
 #endif
       if (!master)
@@ -2804,7 +2848,7 @@ public:
       ulTaskNotifyTake(pdTRUE, remaining > 0 ? remaining : 0);
     }
   }
-  void playback_step(uint64_t clock) {
+  [[gnu::noinline]] void playback_step(uint64_t clock) {
     if (standby || discovering || waiting_for_discovery_sync)
       return;
     signal_values.retain(local ? local->definitions().revision : 0,

@@ -19,6 +19,7 @@ struct periodic_animation_options {
   bool reverse = false;
   bool loop = false;
   bool fill_from_center = false;
+  bool breathe_stop_at_last = false;
 };
 
 template <animation_effect_type effect_type>
@@ -51,7 +52,11 @@ public:
       if (_options.gradient_color_count == 1 || _options.gradient_color_count > MAX_GRADIENT_COLORS)
         return ESP_ERR_INVALID_ARG;
     }
-    const uint64_t time = _elapsed_ms % _options.period_ms;
+    // A modulated position of 100% is the end of this cycle, not the start
+    // of a second cycle. Non-modulated playback continues to wrap normally.
+    const uint64_t time = _sampling && _elapsed_ms >= _options.period_ms
+                              ? _options.period_ms - 1
+                              : _elapsed_ms % _options.period_ms;
     if constexpr (effect_type == animation_effect_type::BLINK) {
       auto value = _options.primary;
       if (time * 100 >= uint64_t(_options.period_ms) * _options.duty_percent)
@@ -59,6 +64,16 @@ public:
       return driver.fill(value);
     } else if constexpr (effect_type == animation_effect_type::BREATHE) {
       if (_options.gradient_color_count) {
+        if (_options.breathe_stop_at_last) {
+          const auto elapsed = std::min<uint64_t>(_elapsed_ms, _options.period_ms);
+          const uint64_t scaled =
+              elapsed * (_options.gradient_color_count - 1) * SCALE / _options.period_ms;
+          const size_t index = scaled / SCALE;
+          if (index >= _options.gradient_color_count - 1)
+            return driver.fill(_options.gradient_colors[_options.gradient_color_count - 1]);
+          return driver.fill(mix(_options.gradient_colors[index],
+                                 _options.gradient_colors[index + 1], smooth(scaled % SCALE)));
+        }
         const uint64_t scaled = time * _options.gradient_color_count * SCALE / _options.period_ms;
         const size_t index = scaled / SCALE;
         return driver.fill(

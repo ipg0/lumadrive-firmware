@@ -192,6 +192,21 @@ void test_blink_and_breathe() {
   breathe->seek(1200);
   breathe->render(driver);
   assert(driver.values[0].base_color.r == 255);
+  options.breathe_stop_at_last = true;
+  breathe.reset(
+      animation_effect_descriptor<animation_effect_type::BREATHE>(options).create_instance());
+  breathe->seek(600);
+  breathe->render(driver);
+  assert(driver.values[0].base_color.g == 255 && driver.values[0].alpha == 127);
+  breathe->seek(1200);
+  breathe->render(driver);
+  assert(driver.values[0].base_color.b == 255);
+  breathe->seek(3600);
+  breathe->render(driver);
+  assert(driver.values[0].base_color.b == 255);
+  breathe->seek_position(65536);
+  breathe->render(driver);
+  assert(driver.values[0].base_color.b == 255);
   options.gradient_color_count = 1;
   assert(!animation_effect_descriptor<animation_effect_type::BREATHE>(options).create_instance());
   options.gradient_color_count = 0;

@@ -1224,6 +1224,38 @@ mesh_interop_LayoutResponse layout_response() {
   assert(size && decode(mesh_interop_LayoutResponse_fields, &response, bytes, size));
   return response;
 }
+void test_preview_request_with_local_output() {
+  stored.clear();
+  staged.clear();
+  network.clear();
+  service master, slave;
+  configure_node(master, true);
+  configure_node(slave, false);
+  auto config = fixture();
+  config.effects[0].duration_ms = 0;
+  config.sources[0].kind = mesh_interop_MatrixSource_Kind_DEFAULT_STATE;
+  config.layout[0] = layout_row(master_mac, mesh_interop_MatrixDriver_WS2812, 0, 1);
+  upload(master, config, 899);
+  cycles(master, slave, 250);
+  assert(master.local && master.local->definitions().output_mappings_count == 1);
+  mesh_interop_MatrixUpload request{};
+  request.which_operation = mesh_interop_MatrixUpload_layout_request_tag;
+  request.operation.layout_request.request_id = 900;
+  request.operation.layout_request.operation = mesh_interop_LayoutRequest_Operation_PREVIEW;
+  request.operation.layout_request.has_identify_options = true;
+  request.operation.layout_request.identify_options = config.effects[0].id;
+  const auto bytes = encode(mesh_interop_MatrixUpload_fields, &request);
+  packet p{};
+  p.connection = 1;
+  p.generation = matrix_service::ble_generation.load();
+  p.size = bytes.size();
+  memcpy(p.data, bytes.data(), bytes.size());
+  master.handle_upload(p, fake_now);
+  const auto response = layout_response();
+  assert(response.request_id == 900 && response.complete && !response.error[0]);
+  assert(master.preview_player && master.preview_distributing);
+  network.clear();
+}
 void test_layout_editor_service() {
   service master, slave;
   configure_node(master, true);
@@ -1993,6 +2025,7 @@ int main() {
   test_remote_gpio_time_queues_and_sessions();
   test_car_layout_distribution_and_recovery();
   test_editor_patch_decoding();
+  test_preview_request_with_local_output();
   test_layout_editor_service();
   test_matrix_editor_service();
   test_preconfigured_rainbow_and_current_read();

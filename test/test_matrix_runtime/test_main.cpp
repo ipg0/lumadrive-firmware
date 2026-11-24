@@ -549,6 +549,9 @@ void test_modulation_and_signal_buffer() {
   value = 0.25f;
   p.tick(2000000);
   assert(output.shown.r == 255);
+  value = 1.0f;
+  p.tick(2100000);
+  assert(output.shown.r == 0); // 100% stays at the end of the blink cycle.
   auto snapshot = p.snapshot(p.definitions(), 0, 0);
   assert(snapshot.states[0].active);
   evaluator rules;
@@ -561,6 +564,41 @@ void test_modulation_and_signal_buffer() {
   rules.tick(100000, nullptr, 0, 100000, sink, &commands);
   rules.tick(1000000, nullptr, 0, 1000000, sink, &commands);
   assert(commands.size() == 1);
+
+  effect.kind = mesh_interop_MatrixEffect_Kind_FILL;
+  effect.loop = false;
+  effect.duration_ms = 1000;
+  effect.period_ms = 0;
+  assert(!validate(c, master_mac));
+  player fill_player(resolve);
+  assert(fill_player.prepare(c, slave_mac, 10, 20));
+  fill_player.set_signal_lookup(lookup, &value);
+  assert(fill_player.enqueue(start()));
+  value = 0;
+  fill_player.tick(100000);
+  assert(output.shown.r == 0);
+  value = 1;
+  fill_player.tick(1200000);
+  assert(output.shown.r == 255); // End of the span remains filled.
+
+  // Old saved static-color effects can contain modulation. They must play
+  // without a signal and retain their finite duration and retrigger behavior.
+  effect.kind = mesh_interop_MatrixEffect_Kind_STATIC_COLOR;
+  effect.duration_ms = 100;
+  effect.modulation.signal_id = 999;
+  assert(!validate(c, master_mac));
+  player static_player(resolve);
+  assert(static_player.prepare(c, slave_mac, 10, 20));
+  assert(static_player.enqueue(start()));
+  static_player.tick(100000);
+  assert(output.shown.r == 255);
+  static_player.tick(201000);
+  assert(output.shown.r == 0);
+  commands.clear();
+  rules.configure(&c, 10, 20);
+  rules.tick(100000, nullptr, 0, 100000, sink, &commands);
+  rules.tick(350000, nullptr, 0, 350000, sink, &commands);
+  assert(commands.size() == 2);
 }
 void test_signal_history_capacity_and_reuse() {
   signal_buffer buffer;
@@ -843,6 +881,7 @@ void test_effect_validation_and_roundtrip() {
   c.effects[0].gradient_colors[0] = {255, 0, 0, 255};
   c.effects[0].gradient_colors[1] = {0, 255, 0, 200};
   c.effects[0].gradient_colors[2] = {0, 0, 255, 255};
+  c.effects[0].breathe_stop_at_last = true;
   assert(!validate(c, master_mac));
   auto breathe_definitions = definitions_for(c, slave_mac, 10, 20);
   auto breathe_bytes = encode(mesh_interop_AnimationDefinitions_fields, &breathe_definitions);
@@ -850,6 +889,7 @@ void test_effect_validation_and_roundtrip() {
   assert(decode(mesh_interop_AnimationDefinitions_fields, &breathe_received, breathe_bytes.data(),
                 breathe_bytes.size()));
   assert(breathe_received.layers[0].effect.gradient_colors_count == 3);
+  assert(breathe_received.layers[0].effect.breathe_stop_at_last);
   player breathe_player(resolve);
   assert(breathe_player.prepare(breathe_received));
   c = fixture();

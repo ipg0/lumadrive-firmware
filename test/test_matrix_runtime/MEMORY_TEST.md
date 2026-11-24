@@ -16,7 +16,11 @@ the staging buffers and prepares two replacement players while the existing
 runtime and signal history remain allocated. Each stage reports total free heap,
 largest contiguous block, and the system's minimum free heap. `FAIL` identifies
 the first allocation or preparation that failed; `PASS` means these specific
-operations succeeded. Restore the normal firmware afterwards:
+operations succeeded. The test also sends a preview request for the first
+configured effect to the local output and reports the matrix task's minimum
+stack headroom as `stack_test`. This temporarily previews on the lights; it
+reports `SKIP` if no local output or effect is configured. Restore the normal
+firmware afterwards:
 
 ```sh
 pio run -e esp32dev -t upload
